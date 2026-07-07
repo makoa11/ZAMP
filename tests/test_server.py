@@ -79,6 +79,63 @@ class ServerRouteTests(unittest.TestCase):
         self.assertIn("Allow: POST\r\n", response)
         self.assertNotIn("Set-Cookie:", response)
 
+    def test_invoice_samples_api_returns_generated_models(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = (
+            b"GET /api/invoices/samples?paper=a4&count=2&seed=10 HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"\r\n"
+        )
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
+        _, body = response.split("\r\n\r\n", 1)
+        payload = json.loads(body)
+
+        self.assertIn(" 200 ", response.splitlines()[0])
+        self.assertEqual(len(payload["samples"]), 2)
+        self.assertEqual(payload["samples"][0]["paper"]["slug"], "a4")
+        self.assertIn("components", payload["samples"][0])
+
+    def test_invoice_samples_api_rejects_invalid_count(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = (
+            b"GET /api/invoices/samples?count=100 HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"\r\n"
+        )
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn(" 400 ", response.splitlines()[0])
+
+    def test_invoice_samples_pdf_returns_pdf(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = (
+            b"GET /api/invoices/samples.pdf?paper=a4&count=1&seed=10 HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"\r\n"
+        )
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue()
+        header, body = response.split(b"\r\n\r\n", 1)
+
+        self.assertIn(b" 200 ", header.splitlines()[0])
+        self.assertIn(b"Content-Type: application/pdf", header)
+        self.assertTrue(body.startswith(b"%PDF-1.4"))
+        self.assertTrue(body.rstrip().endswith(b"%%EOF"))
+
     def test_gmail_webhook_accepts_header_secret(self) -> None:
         class MailIntegration:
             def __init__(self) -> None:

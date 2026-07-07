@@ -18,10 +18,17 @@ from workos.session import (
 
 from .config import AppConfig, ConfigError
 from .cookies import build_cookie, clear_cookie, parse_cookie_header
+from .invoice_generator import (
+    generate_invoice,
+    generate_invoice_samples,
+    paper_options,
+    template_options,
+)
+from .invoice_pdf import render_invoice_pdf
 from .mail_service import MailIntegration
 from .mail_store import MailIntegrationError
 from .security import generate_csrf_token, sign_value, unsign_value, valid_signed_pair
-from .templates import dashboard_page, error_page, login_page, signup_page
+from .templates import dashboard_page, error_page, invoice_samples_page, login_page, signup_page
 from .workos_auth import (
     RequestMeta,
     WorkOSAuthService,
@@ -44,8 +51,8 @@ class ZampHTTPServer(ThreadingHTTPServer):
         handler_class: type[BaseHTTPRequestHandler],
         mail_integration: MailIntegration,
     ) -> None:
-        super().__init__(server_address, handler_class)
         self.mail_integration = mail_integration
+        super().__init__(server_address, handler_class)
 
     def server_close(self) -> None:
         try:
@@ -86,8 +93,20 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/dashboard":
             self._handle_dashboard_get(parsed.query)
             return
+        if parsed.path == "/invoice-samples":
+            self._handle_invoice_samples_get(parsed.query)
+            return
+        if parsed.path == "/invoice-samples.pdf":
+            self._handle_invoice_samples_pdf_get(parsed.query)
+            return
         if parsed.path == "/api/session":
             self._handle_api_session()
+            return
+        if parsed.path == "/api/invoices/samples":
+            self._handle_invoice_samples_api_get(parsed.query)
+            return
+        if parsed.path == "/api/invoices/samples.pdf":
+            self._handle_invoice_samples_pdf_get(parsed.query)
             return
         if parsed.path == "/api/mail/accounts":
             self._handle_mail_accounts_get()
@@ -268,6 +287,97 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             {"authenticated": True, **self._session_payload(session)},
             cookies=[set_session_cookie] if set_session_cookie else None,
+        )
+
+    def _handle_invoice_samples_get(self, query: str) -> None:
+        try:
+            params = self._invoice_sample_params(query)
+            samples = self._invoice_samples_from_params(params)
+        except ValueError as exc:
+            self._send_html(HTTPStatus.BAD_REQUEST, error_page(400, str(exc)))
+            return
+        self._send_html(
+            HTTPStatus.OK,
+            invoice_samples_page(
+                samples=samples,
+                papers=paper_options(),
+                templates=template_options(),
+                active_paper=params["paper"],
+                active_template=params["template"],
+                seed=params["seed"],
+                count=params["count"],
+            ),
+        )
+
+    def _handle_invoice_samples_api_get(self, query: str) -> None:
+        try:
+            params = self._invoice_sample_params(query)
+            samples = self._invoice_samples_from_params(params)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "samples": samples,
+                "paper_options": paper_options(),
+                "template_options": template_options(),
+            },
+        )
+
+    def _handle_invoice_samples_pdf_get(self, query: str) -> None:
+        try:
+            params = self._invoice_sample_params(query)
+            samples = self._invoice_samples_from_params(params)
+            content = render_invoice_pdf(samples)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        self._send_binary(
+            HTTPStatus.OK,
+            content,
+            content_type="application/pdf",
+            headers={
+                "Content-Disposition": 'inline; filename="invoice-samples.pdf"',
+            },
+        )
+
+    def _invoice_sample_params(self, query: str) -> dict[str, Any]:
+        params = parse_qs(query)
+        paper = params.get("paper", ["a4"])[0] or "a4"
+        template = params.get("template", [""])[0] or None
+        try:
+            count = int(params.get("count", ["1" if template else "15"])[0])
+            seed = int(params.get("seed", ["1000"])[0])
+        except ValueError as exc:
+            raise ValueError("count and seed must be integers.") from exc
+        if count < 1 or count > 60:
+            raise ValueError("count must be between 1 and 60.")
+        if seed < 1:
+            raise ValueError("seed must be greater than 0.")
+        return {
+            "paper": paper,
+            "template": template,
+            "count": count,
+            "seed": seed,
+        }
+
+    def _invoice_samples_from_params(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        template = params["template"]
+        if template:
+            return [
+                generate_invoice(
+                    template_slug=template,
+                    paper_slug=params["paper"],
+                    seed=params["seed"] + (index * 97),
+                    variation_index=index,
+                )
+                for index in range(params["count"])
+            ]
+        return generate_invoice_samples(
+            paper_slug=params["paper"],
+            count=params["count"],
+            seed=params["seed"],
         )
 
     def _handle_mail_oauth_start(self, parsed: Any) -> None:
@@ -1213,6 +1323,22 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _send_binary(
+        self,
+        status: HTTPStatus,
+        content: bytes,
+        *,
+        content_type: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(content)
 
     def _send_text(
         self,

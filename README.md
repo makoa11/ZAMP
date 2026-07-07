@@ -40,6 +40,28 @@ Open `http://127.0.0.1:8000/login`.
 
 Signup is available at `http://127.0.0.1:8000/signup`.
 
+Synthetic invoice layout samples are available at `http://127.0.0.1:8000/invoice-samples`.
+The generator exposes full A4, A4/2 horizontal, and A4/3 horizontal paper formats, with 15 base templates and seeded JSON output at `/api/invoices/samples`.
+PDF output is available at `/api/invoices/samples.pdf` with the same `paper`, `template`, `count`, and `seed` query parameters.
+To save all three paper variations as local test files, run:
+
+```bash
+.venv/bin/python -m app.generate_test_pdfs
+```
+
+This writes `invoice-samples-a4.pdf`, `invoice-samples-a4-half-horizontal.pdf`, and `invoice-samples-a4-third-horizontal.pdf` to `storage/test_pdfs`.
+To save a specific number of individual one-invoice PDFs, use `--pdf-count`; files rotate through all three paper variations:
+
+```bash
+.venv/bin/python -m app.generate_test_pdfs --pdf-count 50
+.venv/bin/python -m app.generate_test_pdfs --pdf-count 200
+```
+
+Each generated model includes positioned invoice components such as `company-header`, `invoice-meta`, `items-table`, `totals`, and optional payment or footer blocks. The `company-header` component carries a header variant such as centered, no-line, boxed, banded, receipt, rail, or minimal.
+Generated samples also vary capture-sensitive content: compact date strings such as `DDMMYYYY`, `DDMMYY`, and `MMDDYYYY`; invoice number styles; currencies including USD, INR, EUR, GBP, AED, SGD, and others; decimal/no-decimal amount rendering; table schemas; and alternate labels such as left balance, remaining payment, billed amount, pay by, settle by, and amount open.
+Some full A4 layouts place the payable total as the last row of the item table, with total quantity populated, the rate cell intentionally blank, and the amount cell using the final payable value. Currency can render as a code or a symbol such as `$`, `₹`, `€`, `£`, `¥`, `A$`, or `S$`.
+Template metadata also includes `font_style`, and rendered samples rotate through system, serif, slab, mono, condensed, rounded, formal, industrial, humanist, geometric, courier, book, narrow, typewriter, and neo-grotesque font stacks.
+
 ## WorkOS Configuration
 
 Enable User Management authentication methods in the WorkOS dashboard:

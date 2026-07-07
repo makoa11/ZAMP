@@ -220,10 +220,13 @@ def dashboard_page(
       <p class="eyebrow">ZAMP</p>
       <h1>Dashboard</h1>
     </div>
-    <form method="post" action="/logout">
-      <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
-      <button class="secondary" type="submit">Log out</button>
-    </form>
+    <div class="topbar-actions">
+      <a class="button-link secondary-link" href="/invoice-samples">Invoice samples</a>
+      <form method="post" action="/logout">
+        <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
+        <button class="secondary" type="submit">Log out</button>
+      </form>
+    </div>
   </header>
 
   <section class="summary">
@@ -575,6 +578,449 @@ def dashboard_page(
 </script>{expiry_script}
 """
     return page("Dashboard - ZAMP", body)
+
+
+def invoice_samples_page(
+    *,
+    samples: list[dict[str, Any]],
+    papers: list[dict[str, Any]],
+    templates: list[dict[str, str]],
+    active_paper: str,
+    active_template: str | None,
+    seed: int,
+    count: int,
+) -> str:
+    paper_links = " ".join(
+        f'<a class="tab{" active" if paper["slug"] == active_paper else ""}" '
+        f'href="/invoice-samples?paper={_e(str(paper["slug"]))}&seed={seed}&count={count}">'
+        f'{_e(str(paper["label"]))}</a>'
+        for paper in papers
+    )
+    template_options_html = "\n".join(
+        f'<option value="{_e(template["slug"])}"'
+        f'{" selected" if template["slug"] == active_template else ""}>'
+        f'{_e(template["name"])} - {_e(template["industry"])}</option>'
+        for template in templates
+    )
+    invoices = "\n".join(_invoice_preview(sample) for sample in samples)
+    body = f"""
+<main class="invoice-gallery-shell">
+  <header class="topbar invoice-gallery-topbar">
+    <div>
+      <p class="eyebrow">Synthetic invoice generation</p>
+      <h1>Invoice variations</h1>
+    </div>
+    <a class="button-link secondary-link" href="/dashboard">Dashboard</a>
+  </header>
+
+  <section class="invoice-controls" aria-label="Invoice generation controls">
+    <div class="tabs invoice-paper-tabs">
+      {paper_links}
+    </div>
+    <form class="invoice-filter" method="get" action="/invoice-samples">
+      <input type="hidden" name="paper" value="{_e(active_paper)}">
+      <label for="invoice-template">Template
+        <select id="invoice-template" name="template">
+          <option value=""{" selected" if not active_template else ""}>All 15 base templates</option>
+          {template_options_html}
+        </select>
+      </label>
+      <label for="invoice-count">Count
+        <input id="invoice-count" name="count" type="number" min="1" max="60" value="{count}">
+      </label>
+      <label for="invoice-seed">Seed
+        <input id="invoice-seed" name="seed" type="number" min="1" value="{seed}">
+      </label>
+      <button type="submit">Generate</button>
+      <a class="button-link secondary-link" href="/api/invoices/samples?paper={_e(active_paper)}&seed={seed}&count={count}{'&template=' + _e(active_template) if active_template else ''}">JSON</a>
+      <a class="button-link secondary-link" href="/api/invoices/samples.pdf?paper={_e(active_paper)}&seed={seed}&count={count}{'&template=' + _e(active_template) if active_template else ''}">PDF</a>
+    </form>
+  </section>
+
+  <section class="invoice-gallery" aria-label="Generated invoice samples">
+    {invoices}
+  </section>
+</main>
+"""
+    return page("Invoice variations - ZAMP", body)
+
+
+def _invoice_preview(sample: dict[str, Any]) -> str:
+    template = sample["template"]
+    paper = sample["paper"]
+    data = sample["data"]
+    scale = "0.54"
+    if paper["slug"] == "a4-half-horizontal":
+        scale = "0.62"
+    elif paper["slug"] == "a4-third-horizontal":
+        scale = "0.68"
+    style = (
+        f'--paper-width:{paper["width_mm"]}mm;'
+        f'--paper-height:{paper["height_mm"]}mm;'
+        f'--preview-scale:{scale};'
+        f'--accent:{template["accent"]};'
+        f'--invoice-secondary:{template["secondary"]};'
+        f'--invoice-ink:{template["ink"]};'
+    )
+    components = "\n".join(_invoice_component(component, sample) for component in sample["components"])
+    score = sample.get("layout_score") or {}
+    return f"""
+<article class="invoice-sample">
+  <div class="invoice-sample-heading">
+    <div>
+      <p class="label">{_e(template["industry"])}</p>
+      <h2>{_e(template["name"])}</h2>
+    </div>
+    <span class="status-badge">{_e(paper["label"])}</span>
+  </div>
+  <div class="invoice-frame" style="{style}">
+    <div class="invoice-paper paper-{_e(paper["slug"])} family-{_e(template["layout_family"])} table-{_e(template["table_style"])} logo-{_e(template["logo_shape"])} font-{_e(str(template.get("font_style", "system")))}" style="{style}">
+      {components}
+    </div>
+  </div>
+  <dl class="invoice-layout-meta">
+    <div><dt>Components</dt><dd>{len(sample["components"])}</dd></div>
+    <div><dt>Rows</dt><dd>{_e(str(score.get("line_item_count", len(data["items"]))))}</dd></div>
+    <div><dt>Density</dt><dd>{_e(str(score.get("density", "")))}</dd></div>
+  </dl>
+</article>
+"""
+
+
+def _invoice_component(component: dict[str, Any], sample: dict[str, Any]) -> str:
+    kind = component["kind"]
+    variant = component.get("variant")
+    variant_class = f' variant-{_e(str(variant))}' if isinstance(variant, str) and variant else ""
+    style = (
+        f'left:{component["x_mm"]}mm;'
+        f'top:{component["y_mm"]}mm;'
+        f'width:{component["width_mm"]}mm;'
+        f'height:{component["height_mm"]}mm;'
+    )
+    return (
+        f'<section class="invoice-component invoice-{_e(kind)}{variant_class}" '
+        f'data-component="{_e(kind)}" style="{style}">'
+        f'{_invoice_component_body(kind, sample)}'
+        "</section>"
+    )
+
+
+def _invoice_component_body(kind: str, sample: dict[str, Any]) -> str:
+    data = sample["data"]
+    labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
+    seller = data["seller"]
+    buyer = data["buyer"]
+    template = sample["template"]
+    if kind in {"accent-band", "accent-rail"}:
+        return ""
+    if kind == "watermark":
+        return f'<span>{_e(_initials(seller["name"]))}</span>'
+    if kind == "company-header":
+        return f"""
+<div class="invoice-company-header-mark">{_e(_initials(seller["name"]))}</div>
+<div class="invoice-company-header-main">
+  <strong>{_e(seller["name"])}</strong>
+  <span>{_e(seller["line1"])} / {_e(seller["city"])}</span>
+</div>
+<div class="invoice-company-header-meta">
+  <span>{_e(seller["email"])}</span>
+  <span>{_e(seller.get("tax_id"))}</span>
+</div>
+"""
+    if kind == "logo":
+        return (
+            f'<div class="invoice-logo-mark">{_e(_initials(seller["name"]))}</div>'
+            f'<div class="invoice-logo-text">{_e(seller["name"])}</div>'
+        )
+    if kind == "title":
+        return (
+            f'<div class="invoice-title-word">{_e(labels.get("document_title", "Invoice"))}</div>'
+            f'<div class="invoice-title-sub">{_e(template["name"])}</div>'
+        )
+    if kind == "seller":
+        return _address_block(str(labels.get("seller", "From")), seller, tax_id=seller.get("tax_id"))
+    if kind == "buyer":
+        return _address_block(str(labels.get("buyer", "Bill to")), buyer)
+    if kind == "invoice-meta":
+        return f"""
+<dl class="invoice-facts">
+  <div><dt>{_e(labels.get("invoice_number", "No."))}</dt><dd>{_e(data["invoice_number"])}</dd></div>
+  <div><dt>{_e(labels.get("purchase_order", "PO"))}</dt><dd>{_e(data["purchase_order"])}</dd></div>
+  <div><dt>{_e(labels.get("status", "Status"))}</dt><dd>{_e(data["status"])}</dd></div>
+</dl>
+"""
+    if kind == "dates":
+        return f"""
+<dl class="invoice-facts invoice-date-facts">
+  <div><dt>{_e(labels.get("issue_date", "Issued"))}</dt><dd>{_e(data.get("issue_date_display", data["issue_date"]))}</dd></div>
+  <div><dt>{_e(labels.get("due_date", "Due"))}</dt><dd>{_e(data.get("due_date_display", data["due_date"]))}</dd></div>
+  <div><dt>{_e(labels.get("terms", "Terms"))}</dt><dd>{_e(data["terms"])}</dd></div>
+</dl>
+"""
+    if kind == "items-table":
+        return _items_table(data)
+    if kind == "totals":
+        return _totals(data)
+    if kind == "payment":
+        payment = data["payment"]
+        return f"""
+<h3>{_e(labels.get("payment", "Payment"))}</h3>
+<p>{_e(payment["method"])} {_e(payment["account"])}</p>
+<p>{_e(payment["reference"])}</p>
+<p>{_e(payment["remit_to"])}</p>
+"""
+    if kind in {"terms", "footer"}:
+        return f"<p>{_e(data['notes'])}</p>"
+    if kind == "stamp":
+        return "<div class=\"invoice-stamp-text\">Approved</div>"
+    if kind == "barcode":
+        return "<div class=\"invoice-bars\" aria-hidden=\"true\"><span></span><span></span><span></span><span></span><span></span><span></span></div>"
+    if kind == "timeline":
+        return "<h3>Milestones</h3><p>Issued / Approved / Payable</p>"
+    if kind == "remittance":
+        return f"<h3>{_e(labels.get('payment', 'Remittance'))}</h3><p>{_e(data['payment']['remit_to'])} / {_e(labels.get('invoice_number', 'Ref'))} {_e(data['invoice_number'])}</p>"
+    if kind in {
+        "signature",
+        "approver",
+        "insurance",
+        "work-order",
+        "tax-summary",
+        "packing",
+        "quality",
+        "schedule",
+        "deposit",
+        "itinerary",
+        "sla",
+    }:
+        label = kind.replace("-", " ").title()
+        return f"<h3>{_e(label)}</h3><p>{_e(data['purchase_order'])} / {_e(data['terms'])}</p>"
+    return ""
+
+
+def _address_block(label: str, entity: dict[str, str], *, tax_id: str | None = None) -> str:
+    tax_line = f"<p>{_e(tax_id)}</p>" if tax_id else ""
+    return f"""
+<h3>{_e(label)}</h3>
+<p class="invoice-entity-name">{_e(entity["name"])}</p>
+<p>{_e(entity["line1"])}</p>
+<p>{_e(entity["city"])}</p>
+<p>{_e(entity["email"])}</p>
+{tax_line}
+"""
+
+
+def _items_table(data: dict[str, Any]) -> str:
+    table = data.get("table") if isinstance(data.get("table"), dict) else {}
+    columns = table.get("columns") if isinstance(table.get("columns"), list) else []
+    if not columns:
+        columns = [
+            {"key": "item", "label": "Item"},
+            {"key": "quantity", "label": "Qty", "numeric": True},
+            {"key": "unit_price", "label": "Rate", "numeric": True},
+            {"key": "amount", "label": "Amount", "numeric": True},
+        ]
+    variant = str(table.get("variant") or "standard-desc")
+    rows = "\n".join(
+        f"""
+    <tr>
+      {_table_cells(item, columns, data)}
+    </tr>
+"""
+        for item in data["items"]
+    )
+    summary_row = _table_total_row(columns, data) if bool(table.get("total_in_table")) else ""
+    headings = "\n".join(
+        f'<th class="{_column_class(column)}">{_e(str(column.get("label", "")))}</th>'
+        for column in columns
+    )
+    return f"""
+<table class="invoice-table schema-{_e(variant)}">
+  <thead>
+    <tr>
+      {headings}
+    </tr>
+  </thead>
+  <tbody>
+    {rows}
+    {summary_row}
+  </tbody>
+</table>
+"""
+
+
+def _table_total_row(columns: list[dict[str, Any]], data: dict[str, Any]) -> str:
+    cells = "\n".join(
+        f'<td class="{_column_class(column)}">'
+        f'{_table_total_cell_value(columns, index, str(column.get("key", "")), data)}'
+        "</td>"
+        for index, column in enumerate(columns)
+    )
+    return f"""
+    <tr class="invoice-table-total-row">
+      {cells}
+    </tr>
+"""
+
+
+def _table_total_cell_value(
+    columns: list[dict[str, Any]],
+    index: int,
+    key: str,
+    data: dict[str, Any],
+) -> str:
+    labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
+    label_column_index = _total_label_column_index(columns)
+    amount_column_index = _last_column_index(columns, {"amount", "taxable"})
+    quantity_column_index = _first_column_index(columns, {"quantity", "quantity_unit"})
+    if index == label_column_index:
+        total_label = labels.get("balance_due") or labels.get("subtotal") or "TOTAL"
+        return f'<strong>{_e(str(total_label).upper())}</strong><span>{_e(labels.get("subtotal", "Total Sum"))}</span>'
+    if index == quantity_column_index:
+        return _e(str(data.get("total_quantity", "")))
+    if index == amount_column_index:
+        return f'<strong>{_money(float(data.get("balance_due", 0)), data)}</strong>'
+    return ""
+
+
+def _total_label_column_index(columns: list[dict[str, Any]]) -> int:
+    preferred = {
+        "item",
+        "item_plain",
+        "description",
+        "service_date",
+    }
+    for index, column in enumerate(columns):
+        if column.get("key") in preferred and not column.get("numeric"):
+            return index
+    for index, column in enumerate(columns):
+        if not column.get("numeric"):
+            return index
+    return 0
+
+
+def _first_column_index(columns: list[dict[str, Any]], keys: set[str]) -> int | None:
+    for index, column in enumerate(columns):
+        if column.get("key") in keys:
+            return index
+    return None
+
+
+def _last_column_index(columns: list[dict[str, Any]], keys: set[str]) -> int | None:
+    for index in range(len(columns) - 1, -1, -1):
+        if columns[index].get("key") in keys:
+            return index
+    return None
+
+
+def _table_cells(item: dict[str, Any], columns: list[dict[str, Any]], data: dict[str, Any]) -> str:
+    return "\n".join(
+        f'<td class="{_column_class(column)}">'
+        f'{_table_cell_value(item, str(column.get("key", "")), data)}'
+        "</td>"
+        for column in columns
+    )
+
+
+def _column_class(column: dict[str, Any]) -> str:
+    prefix = "number " if column.get("numeric") else ""
+    return f'{prefix}invoice-col-{_e(str(column.get("key", "value")))}'
+
+
+def _table_cell_value(item: dict[str, Any], key: str, data: dict[str, Any]) -> str:
+    table = data.get("table") if isinstance(data.get("table"), dict) else {}
+    show_description = bool(table.get("show_description", True))
+    if key == "item":
+        description = (
+            f'<span>{_e(str(item.get("description", "")))}</span>'
+            if show_description and item.get("description")
+            else ""
+        )
+        return f'<strong>{_e(str(item.get("name", "")))}</strong>{description}'
+    if key == "item_plain":
+        return f'<strong>{_e(str(item.get("name", "")))}</strong>'
+    if key == "line":
+        return _e(str(item.get("line", "")))
+    if key == "sku":
+        return _e(str(item.get("sku", "")))
+    if key == "hsn":
+        return _e(str(item.get("hsn", "")))
+    if key == "service_date":
+        return _e(str(item.get("service_date_display", item.get("service_date", ""))))
+    if key == "quantity":
+        return _e(str(item.get("quantity", "")))
+    if key == "quantity_unit":
+        return _e(str(item.get("quantity_display", item.get("quantity", ""))))
+    if key == "unit_price":
+        return _money(float(item.get("unit_price", 0)), data)
+    if key == "amount":
+        return _money(float(item.get("amount", 0)), data)
+    if key == "taxable":
+        return _money(float(item.get("taxable_amount", item.get("amount", 0))), data)
+    if key == "description":
+        return _e(str(item.get("description", "")))
+    return _e(str(item.get(key, "")))
+
+
+def _totals(data: dict[str, Any]) -> str:
+    labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
+    return f"""
+<dl class="invoice-totals-list">
+  <div><dt>{_e(labels.get("subtotal", "Subtotal"))}</dt><dd>{_money(data["subtotal"], data)}</dd></div>
+  <div><dt>{_e(labels.get("discount", "Discount"))}</dt><dd>{_money(data["discount"], data)}</dd></div>
+  <div><dt>{_e(labels.get("tax", "Tax"))}</dt><dd>{_money(data["tax"], data)}</dd></div>
+  <div><dt>{_e(labels.get("shipping", "Shipping"))}</dt><dd>{_money(data["shipping"], data)}</dd></div>
+  <div><dt>{_e(labels.get("paid", "Paid"))}</dt><dd>{_money(data["paid"], data)}</dd></div>
+  <div class="invoice-total-row"><dt>{_e(labels.get("balance_due", "Balance due"))}</dt><dd>{_money(data["balance_due"], data)}</dd></div>
+</dl>
+"""
+
+
+def _money(value: float, data: dict[str, Any]) -> str:
+    currency = str(data.get("currency", "USD"))
+    formatting = data.get("formatting") if isinstance(data.get("formatting"), dict) else {}
+    style = str(formatting.get("money_style", "code-prefix-2dp"))
+    decimals = int(formatting.get("decimals", 2))
+    amount = _formatted_amount(value, decimals=decimals, comma_decimal="comma" in style, spaced="space" in style)
+    if style.startswith("plain"):
+        return amount
+    unit = _currency_symbol(currency) if "symbol" in style else currency
+    if "suffix" in style:
+        return f"{amount} {unit}" if len(unit) > 1 else f"{amount}{unit}"
+    separator = "" if len(unit) == 1 else " "
+    return f"{unit}{separator}{amount}"
+
+
+def _currency_symbol(currency: str) -> str:
+    return {
+        "USD": "$",
+        "INR": "₹",
+        "EUR": "€",
+        "GBP": "£",
+        "AED": "د.إ",
+        "SGD": "S$",
+        "CAD": "C$",
+        "AUD": "A$",
+        "CNY": "¥",
+        "JPY": "¥",
+        "ZAR": "R",
+        "MXN": "Mex$",
+    }.get(currency, currency)
+
+
+def _formatted_amount(value: float, *, decimals: int, comma_decimal: bool, spaced: bool) -> str:
+    amount = f"{float(value):,.{decimals}f}"
+    if decimals == 0:
+        amount = amount.split(".", 1)[0]
+    if spaced:
+        amount = amount.replace(",", " ")
+    if comma_decimal:
+        amount = amount.replace(",", "_").replace(".", ",").replace("_", ".")
+    return amount
+
+
+def _initials(name: str) -> str:
+    parts = [part[0] for part in name.replace("&", " ").split() if part[:1]]
+    return "".join(parts[:2]).upper() or "Z"
 
 
 def error_page(status: int, message: str) -> str:
