@@ -31,6 +31,7 @@ body {
 
 button,
 input,
+textarea,
 a {
   font: inherit;
 }
@@ -169,7 +170,21 @@ input {
   background: #fff;
 }
 
-input:focus {
+textarea {
+  width: 100%;
+  min-height: 132px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: var(--ink);
+  background: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  line-height: 1.4;
+}
+
+input:focus,
+textarea:focus {
   outline: 3px solid rgba(15, 118, 110, 0.18);
   border-color: var(--accent);
 }
@@ -326,6 +341,31 @@ button.secondary:hover {
   color: var(--danger-ink);
 }
 
+.pattern-helper {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.pattern-helper.dragging {
+  border-color: var(--accent);
+  background: #eef7f6;
+}
+
+.pattern-helper-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.pattern-helper input[type="file"] {
+  min-height: 0;
+  padding: 8px;
+}
+
 .account-list {
   display: grid;
   gap: 8px;
@@ -456,6 +496,10 @@ pre {
 
   .mail-actions button {
     width: 100%;
+  }
+
+  .pattern-helper-row {
+    grid-template-columns: 1fr;
   }
 
   .account-row {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import secrets
 import threading
@@ -9,7 +10,12 @@ from typing import Any
 from urllib.parse import urlencode
 
 from .config import AppConfig
-from .mail_ingestion import MailIngestionService, TokenManager
+from .mail_ingestion import (
+    MailIngestionService,
+    TokenManager,
+    normalize_invoice_match_patterns,
+    suggest_invoice_match_pattern_from_filename,
+)
 from .mail_providers import (
     GmailClient,
     GMAIL_READONLY_SCOPE,
@@ -173,6 +179,19 @@ class MailIntegration:
     def list_accounts(self, *, owner_user_id: str) -> list[dict[str, Any]]:
         accounts = self.repo.list_accounts(owner_user_id=owner_user_id)
         return [_public_account(row) for row in accounts]
+
+    def get_invoice_match_patterns(self, *, owner_user_id: str) -> list[str]:
+        return self.repo.get_invoice_match_patterns(owner_user_id=owner_user_id)
+
+    def update_invoice_match_patterns(self, *, owner_user_id: str, patterns: list[str]) -> list[str]:
+        normalized = normalize_invoice_match_patterns(patterns)
+        stored = self.repo.set_invoice_match_patterns(owner_user_id=owner_user_id, patterns=normalized)
+        if stored:
+            self._enqueue_owner_fallbacks(owner_user_id=owner_user_id, patterns=stored)
+        return stored
+
+    def suggest_invoice_match_pattern(self, *, filename: str) -> str:
+        return suggest_invoice_match_pattern_from_filename(filename)
 
     def disconnect_account(self, *, owner_user_id: str, account_id: int) -> bool:
         account = self.repo.get_account(account_id)
@@ -363,6 +382,27 @@ class MailIntegration:
 
     def _outlook_notification_url(self) -> str:
         return f"{self.config.app_url.rstrip('/')}/webhooks/outlook"
+
+    def _enqueue_owner_fallbacks(self, *, owner_user_id: str, patterns: list[str]) -> None:
+        settings_fingerprint = hashlib.sha256(
+            json.dumps(patterns, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        for account in self.repo.list_accounts(owner_user_id=owner_user_id):
+            if account.get("status") != "active":
+                continue
+            account_id = int(account["id"])
+            if account.get("provider") == "gmail":
+                self.repo.enqueue_job(
+                    job_type="gmail_fallback_sync",
+                    payload={"account_id": account_id},
+                    unique_key=f"gmail-fallback:{account_id}:settings:{settings_fingerprint}",
+                )
+            elif account.get("provider") == "outlook":
+                self.repo.enqueue_job(
+                    job_type="outlook_delta_sync",
+                    payload={"account_id": account_id},
+                    unique_key=f"outlook-delta:{account_id}:settings:{settings_fingerprint}",
+                )
 
     def _frontend_redirect(self, params: dict[str, str]) -> str:
         separator = "&" if "?" in self.config.mail_frontend_redirect_url else "?"

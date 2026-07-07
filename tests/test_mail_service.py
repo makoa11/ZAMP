@@ -10,9 +10,11 @@ from app.mail_service import MailIntegration, _require_granted_scopes
 from app.mail_store import MailIntegrationError, TokenCipher
 
 
-class FakeRepo:
+class TestRepo:
     def __init__(self) -> None:
         self.encrypted_code_verifier: str | None = None
+        self.invoice_patterns: list[str] = []
+        self.jobs: list[dict[str, object]] = []
 
     def create_oauth_state(
         self,
@@ -39,8 +41,30 @@ class FakeRepo:
             "encrypted_code_verifier": self.encrypted_code_verifier,
         }
 
+    def get_invoice_match_patterns(self, *, owner_user_id: str) -> list[str]:
+        return self.invoice_patterns
 
-class FakeGmail:
+    def set_invoice_match_patterns(
+        self, *, owner_user_id: str, patterns: list[str]
+    ) -> list[str]:
+        self.invoice_patterns = patterns
+        return patterns
+
+    def list_accounts(self, *, owner_user_id: str) -> list[dict[str, object]]:
+        return [
+            {"id": 1, "provider": "gmail", "status": "active"},
+            {"id": 2, "provider": "outlook", "status": "active"},
+            {"id": 3, "provider": "gmail", "status": "disconnected"},
+        ]
+
+    def enqueue_job(self, **kwargs: object) -> bool:
+        if any(job["unique_key"] == kwargs["unique_key"] for job in self.jobs):
+            return False
+        self.jobs.append(kwargs)
+        return True
+
+
+class TestGmail:
     def __init__(self) -> None:
         self.authorization_request: dict[str, str | None] = {}
 
@@ -59,7 +83,7 @@ class FakeGmail:
         return "https://accounts.google.example/auth"
 
 
-class FakeOutlook:
+class TestOutlook:
     def authorization_url(self, *, redirect_uri: str, state: str) -> str:
         return "https://login.microsoft.example/auth"
 
@@ -73,13 +97,15 @@ class CapturingMailIntegration(MailIntegration):
             )
         )
         self._ready = True
-        self._repo = FakeRepo()  # type: ignore[assignment]
+        self._repo = TestRepo()  # type: ignore[assignment]
         self._cipher = TokenCipher(Fernet.generate_key().decode("ascii"))  # type: ignore[assignment]
-        self._gmail = FakeGmail()  # type: ignore[assignment]
-        self._outlook = FakeOutlook()  # type: ignore[assignment]
+        self._gmail = TestGmail()  # type: ignore[assignment]
+        self._outlook = TestOutlook()  # type: ignore[assignment]
         self.completed_gmail: dict[str, str | None] = {}
 
-    def _complete_gmail_oauth(self, *, owner_user_id: str, code: str, code_verifier: str | None = None) -> None:
+    def _complete_gmail_oauth(
+        self, *, owner_user_id: str, code: str, code_verifier: str | None = None
+    ) -> None:
         self.completed_gmail = {
             "owner_user_id": owner_user_id,
             "code": code,
@@ -110,7 +136,9 @@ class MailIntegrationPkceTests(unittest.TestCase):
 
     def test_complete_gmail_oauth_passes_stored_verifier_to_exchange(self) -> None:
         integration = CapturingMailIntegration()
-        integration.repo.encrypted_code_verifier = integration.cipher.encrypt("verifier-123")
+        integration.repo.encrypted_code_verifier = integration.cipher.encrypt(
+            "verifier-123"
+        )
 
         location = integration.complete_oauth(
             provider="gmail",
@@ -131,7 +159,9 @@ class MailIntegrationPkceTests(unittest.TestCase):
 
     def test_complete_gmail_oauth_rejects_state_for_other_user(self) -> None:
         integration = CapturingMailIntegration()
-        integration.repo.encrypted_code_verifier = integration.cipher.encrypt("verifier-123")
+        integration.repo.encrypted_code_verifier = integration.cipher.encrypt(
+            "verifier-123"
+        )
 
         location = integration.complete_oauth(
             provider="gmail",
@@ -140,7 +170,9 @@ class MailIntegrationPkceTests(unittest.TestCase):
             owner_user_id="other-user",
         )
 
-        self.assertEqual(location, "https://front.example/mail?mail_error=invalid_oauth_state")
+        self.assertEqual(
+            location, "https://front.example/mail?mail_error=invalid_oauth_state"
+        )
         self.assertEqual(integration.completed_gmail, {})
 
 
@@ -182,6 +214,68 @@ class MailIntegrationLifecycleTests(unittest.TestCase):
         self.assertFalse(integration._ready)
         self.assertIsNone(integration._repo)
         self.assertIsNone(integration._cipher)
+
+
+class InvoicePatternSettingsTests(unittest.TestCase):
+    def test_update_invoice_patterns_saves_patterns_and_enqueues_catchup_jobs(
+        self,
+    ) -> None:
+        integration = CapturingMailIntegration()
+
+        patterns = integration.update_invoice_match_patterns(
+            owner_user_id="user-123",
+            patterns=[r"\binvoice\b", " ", r"^INV-\d+"],
+        )
+
+        self.assertEqual(patterns, [r"\binvoice\b", r"^INV-\d+"])
+        self.assertEqual(
+            integration.get_invoice_match_patterns(owner_user_id="user-123"), patterns
+        )
+        self.assertEqual(
+            [job["job_type"] for job in integration.repo.jobs],
+            ["gmail_fallback_sync", "outlook_delta_sync"],
+        )
+        self.assertEqual(
+            [job["unique_key"] for job in integration.repo.jobs],
+            [
+                "gmail-fallback:1:settings:d8f1065acdc2bfa2",
+                "outlook-delta:2:settings:d8f1065acdc2bfa2",
+            ],
+        )
+
+        integration.update_invoice_match_patterns(
+            owner_user_id="user-123",
+            patterns=[r"\binvoice\b", " ", r"^INV-\d+"],
+        )
+
+        self.assertEqual(len(integration.repo.jobs), 2)
+
+    def test_update_invoice_patterns_allows_empty_list_without_catchup_jobs(
+        self,
+    ) -> None:
+        integration = CapturingMailIntegration()
+
+        patterns = integration.update_invoice_match_patterns(
+            owner_user_id="user-123", patterns=[]
+        )
+
+        self.assertEqual(patterns, [])
+        self.assertEqual(integration.repo.jobs, [])
+
+    def test_update_invoice_patterns_rejects_invalid_regex(self) -> None:
+        integration = CapturingMailIntegration()
+
+        with self.assertRaises(MailIntegrationError):
+            integration.update_invoice_match_patterns(
+                owner_user_id="user-123", patterns=["["]
+            )
+
+    def test_suggest_invoice_pattern_from_filename(self) -> None:
+        integration = CapturingMailIntegration()
+
+        pattern = integration.suggest_invoice_match_pattern(filename="Bill_889.pdf")
+
+        self.assertEqual(pattern, r"^Bill[\s._:#-]*\d+(?:\.pdf)?$")
 
 
 class ScopeValidationTests(unittest.TestCase):

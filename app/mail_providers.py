@@ -294,7 +294,19 @@ class OutlookClient:
 
     def message(self, *, access_token: str, message_id: str) -> dict[str, Any]:
         params = {
-            "$select": "id,subject,from,sender,receivedDateTime,hasAttachments,conversationId,internetMessageId"
+            "$select": ",".join(
+                [
+                    "id",
+                    "subject",
+                    "bodyPreview",
+                    "from",
+                    "sender",
+                    "receivedDateTime",
+                    "hasAttachments",
+                    "conversationId",
+                    "internetMessageId",
+                ]
+            )
         }
         return self.http.get_json(
             f"https://graph.microsoft.com/v1.0/me/messages/{quote(message_id)}?" + urlencode(params),

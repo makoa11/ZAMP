@@ -10,8 +10,8 @@ from unittest.mock import patch
 from app.server import ZampHTTPServer, ZampRequestHandler
 
 
-class FakeSocket:
-    def __init__(self, request: bytes, *, fail_on_send_number: int | None = None) -> None:
+class TestSocket:
+    def __init__(self, request: bytes, fail_on_send_number: int | None = None) -> None:
         self.reader = io.BytesIO(request)
         self.writer = io.BytesIO()
         self.fail_on_send_number = fail_on_send_number
@@ -35,12 +35,8 @@ class ServerRouteTests(unittest.TestCase):
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
-        request = (
-            b"GET /logout HTTP/1.1\r\n"
-            b"Host: localhost\r\n"
-            b"\r\n"
-        )
-        fake_socket = FakeSocket(request, fail_on_send_number=2)
+        request = b"GET /logout HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        fake_socket = TestSocket(request, fail_on_send_number=2)
 
         Handler(fake_socket, ("127.0.0.1", 12345), SimpleNamespace())
 
@@ -75,9 +71,9 @@ class ServerRouteTests(unittest.TestCase):
             b"Cookie: zamp_session=sealed\r\n"
             b"\r\n"
         )
-        fake_socket = FakeSocket(request)
-        Handler(fake_socket, ("127.0.0.1", 12345), SimpleNamespace())
-        response = fake_socket.writer.getvalue().decode("iso-8859-1")
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
 
         self.assertIn(" 405 ", response.splitlines()[0])
         self.assertIn("Allow: POST\r\n", response)
@@ -88,7 +84,9 @@ class ServerRouteTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.payload: dict[str, object] | None = None
 
-            def handle_gmail_pubsub(self, *, payload: dict[str, object], subscription: str | None = None) -> dict[str, object]:
+            def handle_gmail_pubsub(
+                self, *, payload: dict[str, object], subscription: str | None = None
+            ) -> dict[str, object]:
                 self.payload = payload
                 return {"accepted": True}
 
@@ -99,7 +97,9 @@ class ServerRouteTests(unittest.TestCase):
         mail = MailIntegration()
         Handler.config = SimpleNamespace(gmail_webhook_secret="webhook-secret")
         Handler.mail_integration = mail  # type: ignore[assignment]
-        body = json.dumps({"subscription": "projects/p/subscriptions/s", "message": {}}).encode("utf-8")
+        body = json.dumps(
+            {"subscription": "projects/p/subscriptions/s", "message": {}}
+        ).encode("utf-8")
         request = (
             b"POST /webhooks/gmail/pubsub HTTP/1.1\r\n"
             b"Host: localhost\r\n"
@@ -110,12 +110,14 @@ class ServerRouteTests(unittest.TestCase):
             + body
         )
 
-        fake_socket = FakeSocket(request)
-        Handler(fake_socket, ("127.0.0.1", 12345), SimpleNamespace())
-        response = fake_socket.writer.getvalue().decode("iso-8859-1")
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
 
         self.assertIn(" 200 ", response.splitlines()[0])
-        self.assertEqual(mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}})
+        self.assertEqual(
+            mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}}
+        )
 
     def test_gmail_webhook_rejects_query_secret_without_header(self) -> None:
         class Handler(ZampRequestHandler):
@@ -134,8 +136,8 @@ class ServerRouteTests(unittest.TestCase):
             + body
         )
 
-        fake_socket = FakeSocket(request)
-        Handler(fake_socket, ("127.0.0.1", 12345), SimpleNamespace())
-        response = fake_socket.writer.getvalue().decode("iso-8859-1")
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
 
         self.assertIn(" 403 ", response.splitlines()[0])

@@ -110,6 +110,11 @@ def _enqueue_polling_fallbacks(integration: MailIntegration) -> None:
     bucket = datetime.now(UTC).strftime("%Y%m%d%H%M")
     for account in integration.repo.list_active_accounts():
         account_id = int(account["id"])
+        owner_user_id = account.get("owner_user_id")
+        if not isinstance(owner_user_id, str) or not integration.repo.get_invoice_match_patterns(
+            owner_user_id=owner_user_id,
+        ):
+            continue
         provider = account.get("provider")
         if provider == "gmail":
             integration.repo.enqueue_job(

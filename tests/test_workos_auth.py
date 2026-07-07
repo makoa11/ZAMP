@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from app.workos_auth import RequestMeta, TimedSessionRevoker, WorkOSAuthService
 
 
-class FakeAuthService:
+class TestAuthService:
     def __init__(self) -> None:
         self.revoked_session_ids: list[str | None] = []
 
@@ -17,7 +17,7 @@ class FakeAuthService:
 class TimedSessionRevokerTests(unittest.TestCase):
     def test_revoked_session_ids_are_pruned_after_retention_window(self) -> None:
         now = 1000.0
-        auth_service = FakeAuthService()
+        auth_service = TestAuthService()
         revoker = TimedSessionRevoker(auth_service, delay_seconds=10, clock=lambda: now)
 
         revoker.mark_revoked("session_1")
@@ -29,7 +29,7 @@ class TimedSessionRevokerTests(unittest.TestCase):
 
     def test_revoke_marks_and_calls_workos(self) -> None:
         now = 1000.0
-        auth_service = FakeAuthService()
+        auth_service = TestAuthService()
         revoker = TimedSessionRevoker(auth_service, delay_seconds=10, clock=lambda: now)
 
         revoker.revoke("session_1")
@@ -43,7 +43,7 @@ class SignupFlowTests(unittest.TestCase):
         created_users: list[dict[str, object]] = []
         service = WorkOSAuthService.__new__(WorkOSAuthService)
 
-        class FakeUserManagement:
+        class TestUserManagement:
             def create_user(self, **kwargs: object) -> SimpleNamespace:
                 created_users.append(kwargs)
                 return SimpleNamespace(id="user_123")
@@ -51,7 +51,7 @@ class SignupFlowTests(unittest.TestCase):
             def delete_user(self, user_id: str) -> None:
                 raise AssertionError(f"delete_user should not be called for {user_id}")
 
-        service.client = SimpleNamespace(user_management=FakeUserManagement())
+        service.client = SimpleNamespace(user_management=TestUserManagement())
 
         def fail_authentication(**kwargs: object) -> None:
             raise RuntimeError("authentication failed")

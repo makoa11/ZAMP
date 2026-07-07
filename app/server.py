@@ -92,6 +92,9 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/mail/accounts":
             self._handle_mail_accounts_get()
             return
+        if parsed.path == "/api/mail/invoice-patterns":
+            self._handle_mail_invoice_patterns_get()
+            return
         if parsed.path.startswith("/api/mail/oauth/") and parsed.path.endswith("/callback"):
             self._handle_mail_oauth_callback(parsed)
             return
@@ -116,6 +119,12 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/mail/oauth/") and parsed.path.endswith("/start"):
             self._handle_mail_oauth_start(parsed)
+            return
+        if parsed.path == "/api/mail/invoice-patterns/suggest":
+            self._handle_mail_invoice_pattern_suggest_post()
+            return
+        if parsed.path == "/api/mail/invoice-patterns":
+            self._handle_mail_invoice_patterns_post()
             return
         if parsed.path == "/webhooks/gmail/pubsub":
             self._handle_gmail_pubsub_webhook(parsed)
@@ -337,6 +346,57 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
             return
         self._send_json(HTTPStatus.OK, {"accounts": accounts}, cookies=cookies)
+
+    def _handle_mail_invoice_patterns_get(self) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        try:
+            patterns = self.mail_integration.get_invoice_match_patterns(owner_user_id=owner_user_id)
+        except (ConfigError, MailIntegrationError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, {"patterns": patterns}, cookies=cookies)
+
+    def _handle_mail_invoice_patterns_post(self) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        try:
+            body = self._json_body(max_bytes=32 * 1024)
+            patterns_value = body.get("patterns")
+            if isinstance(patterns_value, str):
+                patterns = patterns_value.splitlines()
+            elif isinstance(patterns_value, list) and all(isinstance(item, str) for item in patterns_value):
+                patterns = patterns_value
+            else:
+                raise ValueError("patterns must be a string array or newline-separated string.")
+            saved = self.mail_integration.update_invoice_match_patterns(
+                owner_user_id=owner_user_id,
+                patterns=patterns,
+            )
+        except (ConfigError, MailIntegrationError, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, {"patterns": saved}, cookies=cookies)
+
+    def _handle_mail_invoice_pattern_suggest_post(self) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        _, cookies = context
+        try:
+            body = self._json_body(max_bytes=4 * 1024)
+            filename = body.get("filename")
+            if not isinstance(filename, str):
+                raise ValueError("filename must be a string.")
+            pattern = self.mail_integration.suggest_invoice_match_pattern(filename=filename)
+        except (ConfigError, MailIntegrationError, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, {"pattern": pattern}, cookies=cookies)
 
     def _handle_mail_account_delete(self, parsed: Any) -> None:
         context = self._authenticated_api_user()

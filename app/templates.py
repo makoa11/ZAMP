@@ -254,6 +254,27 @@ def dashboard_page(
     <div class="account-list" data-mail-accounts></div>
   </section>
 
+  <section class="data-panel mail-panel" aria-labelledby="invoice-patterns-title">
+    <div class="panel-heading">
+      <div>
+        <p class="label">Invoice matching</p>
+        <h2 id="invoice-patterns-title">Regex patterns</h2>
+      </div>
+      <button type="button" data-save-invoice-patterns>Save patterns</button>
+    </div>
+    <div class="mail-status" data-invoice-pattern-status role="status"></div>
+    <div class="pattern-helper" data-invoice-pattern-dropzone>
+      <label for="invoice-pattern-filename">Sample filename</label>
+      <div class="pattern-helper-row">
+        <input id="invoice-pattern-filename" data-invoice-pattern-filename type="text" autocomplete="off" placeholder="INV-2024-001.pdf">
+        <button class="secondary" type="button" data-generate-invoice-pattern>Generate regex</button>
+      </div>
+      <input data-invoice-pattern-file type="file" accept="application/pdf,.pdf">
+    </div>
+    <label for="invoice-patterns">Patterns</label>
+    <textarea id="invoice-patterns" class="pattern-input" data-invoice-patterns rows="6" spellcheck="false" placeholder="^INV-\\d+"></textarea>
+  </section>
+
   <section class="data-panel">
     <h2>Session data</h2>
     <pre>{_e(session_json)}</pre>
@@ -263,12 +284,19 @@ def dashboard_page(
   (function () {{
     var statusEl = document.querySelector("[data-mail-status]");
     var accountsEl = document.querySelector("[data-mail-accounts]");
+    var invoiceStatusEl = document.querySelector("[data-invoice-pattern-status]");
+    var invoicePatternsEl = document.querySelector("[data-invoice-patterns]");
+    var invoicePatternFilenameEl = document.querySelector("[data-invoice-pattern-filename]");
+    var invoicePatternFileEl = document.querySelector("[data-invoice-pattern-file]");
+    var invoicePatternDropzoneEl = document.querySelector("[data-invoice-pattern-dropzone]");
+    var generateInvoicePatternButton = document.querySelector("[data-generate-invoice-pattern]");
+    var saveInvoicePatternsButton = document.querySelector("[data-save-invoice-patterns]");
     var buttons = Array.prototype.slice.call(document.querySelectorAll("[data-connect-provider]"));
 
-    function setStatus(message, kind) {{
-      if (!statusEl) return;
-      statusEl.textContent = message || "";
-      statusEl.className = "mail-status" + (message ? " visible " + (kind || "") : "");
+    function setStatus(target, message, kind) {{
+      if (!target) return;
+      target.textContent = message || "";
+      target.className = "mail-status" + (message ? " visible " + (kind || "") : "");
     }}
 
     function formatDate(value) {{
@@ -344,7 +372,7 @@ def dashboard_page(
     }}
 
     function loadAccounts() {{
-      setStatus("Loading mailboxes.", "");
+      setStatus(statusEl, "Loading mailboxes.", "");
       fetch("/api/mail/accounts")
         .then(function (response) {{
           return response.json().then(function (body) {{
@@ -354,16 +382,111 @@ def dashboard_page(
         }})
         .then(function (body) {{
           renderAccounts(body.accounts || []);
-          setStatus("", "");
+          setStatus(statusEl, "", "");
         }})
         .catch(function (error) {{
-          setStatus(error.message, "error");
+          setStatus(statusEl, error.message, "error");
+        }});
+    }}
+
+    function loadInvoicePatterns() {{
+      setStatus(invoiceStatusEl, "Loading patterns.", "");
+      fetch("/api/mail/invoice-patterns")
+        .then(function (response) {{
+          return response.json().then(function (body) {{
+            if (!response.ok) throw new Error(body.error || "Could not load patterns.");
+            return body;
+          }});
+        }})
+        .then(function (body) {{
+          if (invoicePatternsEl) invoicePatternsEl.value = (body.patterns || []).join("\\n");
+          setStatus(invoiceStatusEl, body.patterns && body.patterns.length ? "" : "No patterns saved.", "");
+        }})
+        .catch(function (error) {{
+          setStatus(invoiceStatusEl, error.message, "error");
+        }});
+    }}
+
+    function saveInvoicePatterns() {{
+      if (!invoicePatternsEl || !saveInvoicePatternsButton) return;
+      saveInvoicePatternsButton.disabled = true;
+      setStatus(invoiceStatusEl, "Saving patterns.", "");
+      var patterns = invoicePatternsEl.value.split(/\\r?\\n/).map(function (line) {{
+        return line.trim();
+      }}).filter(Boolean);
+      fetch("/api/mail/invoice-patterns", {{
+        method: "POST",
+        headers: {{"Content-Type": "application/json"}},
+        body: JSON.stringify({{patterns: patterns}})
+      }})
+        .then(function (response) {{
+          return response.json().then(function (body) {{
+            if (!response.ok) throw new Error(body.error || "Could not save patterns.");
+            return body;
+          }});
+        }})
+        .then(function (body) {{
+          invoicePatternsEl.value = (body.patterns || []).join("\\n");
+          setStatus(
+            invoiceStatusEl,
+            body.patterns && body.patterns.length ? "Patterns saved." : "No patterns saved.",
+            "success"
+          );
+        }})
+        .catch(function (error) {{
+          setStatus(invoiceStatusEl, error.message, "error");
+        }})
+        .finally(function () {{
+          saveInvoicePatternsButton.disabled = false;
+        }});
+    }}
+
+    function appendInvoicePattern(pattern) {{
+      if (!invoicePatternsEl || !pattern) return;
+      var patterns = invoicePatternsEl.value.split(/\\r?\\n/).map(function (line) {{
+        return line.trim();
+      }}).filter(Boolean);
+      if (patterns.indexOf(pattern) === -1) {{
+        patterns.push(pattern);
+      }}
+      invoicePatternsEl.value = patterns.join("\\n");
+    }}
+
+    function suggestInvoicePattern(filename) {{
+      if (!generateInvoicePatternButton) return;
+      filename = (filename || "").trim();
+      if (!filename) {{
+        setStatus(invoiceStatusEl, "Filename is required.", "error");
+        return;
+      }}
+      generateInvoicePatternButton.disabled = true;
+      setStatus(invoiceStatusEl, "Generating regex.", "");
+      fetch("/api/mail/invoice-patterns/suggest", {{
+        method: "POST",
+        headers: {{"Content-Type": "application/json"}},
+        body: JSON.stringify({{filename: filename}})
+      }})
+        .then(function (response) {{
+          return response.json().then(function (body) {{
+            if (!response.ok) throw new Error(body.error || "Could not generate regex.");
+            return body;
+          }});
+        }})
+        .then(function (body) {{
+          appendInvoicePattern(body.pattern);
+          setStatus(invoiceStatusEl, "Regex added. Save patterns to apply.", "success");
+        }})
+        .catch(function (error) {{
+          setStatus(invoiceStatusEl, error.message, "error");
+        }})
+        .finally(function () {{
+          generateInvoicePatternButton.disabled = false;
         }});
     }}
 
     function connectProvider(provider, button) {{
       button.disabled = true;
-      setStatus("Starting " + providerLabel(provider) + " connection.", "");
+      setStatus(statusEl, "Starting " + providerLabel(provider) + " connection.", "");
       fetch("/api/mail/oauth/" + provider + "/start", {{
         method: "POST",
         headers: {{"Content-Type": "application/json"}},
@@ -380,13 +503,13 @@ def dashboard_page(
         }})
         .catch(function (error) {{
           button.disabled = false;
-          setStatus(error.message, "error");
+          setStatus(statusEl, error.message, "error");
         }});
     }}
 
     function disconnectAccount(accountId, button) {{
       button.disabled = true;
-      setStatus("Disconnecting mailbox.", "");
+      setStatus(statusEl, "Disconnecting mailbox.", "");
       fetch("/api/mail/accounts/" + accountId, {{method: "DELETE"}})
         .then(function (response) {{
           return response.json().then(function (body) {{
@@ -399,7 +522,7 @@ def dashboard_page(
         }})
         .catch(function (error) {{
           button.disabled = false;
-          setStatus(error.message, "error");
+          setStatus(statusEl, error.message, "error");
         }});
     }}
 
@@ -409,7 +532,45 @@ def dashboard_page(
       }});
     }});
 
+    if (saveInvoicePatternsButton) {{
+      saveInvoicePatternsButton.addEventListener("click", saveInvoicePatterns);
+    }}
+
+    if (generateInvoicePatternButton) {{
+      generateInvoicePatternButton.addEventListener("click", function () {{
+        suggestInvoicePattern(invoicePatternFilenameEl ? invoicePatternFilenameEl.value : "");
+      }});
+    }}
+
+    if (invoicePatternFileEl) {{
+      invoicePatternFileEl.addEventListener("change", function () {{
+        var file = invoicePatternFileEl.files && invoicePatternFileEl.files[0];
+        if (!file) return;
+        if (invoicePatternFilenameEl) invoicePatternFilenameEl.value = file.name;
+        suggestInvoicePattern(file.name);
+      }});
+    }}
+
+    if (invoicePatternDropzoneEl) {{
+      invoicePatternDropzoneEl.addEventListener("dragover", function (event) {{
+        event.preventDefault();
+        invoicePatternDropzoneEl.classList.add("dragging");
+      }});
+      invoicePatternDropzoneEl.addEventListener("dragleave", function () {{
+        invoicePatternDropzoneEl.classList.remove("dragging");
+      }});
+      invoicePatternDropzoneEl.addEventListener("drop", function (event) {{
+        event.preventDefault();
+        invoicePatternDropzoneEl.classList.remove("dragging");
+        var file = event.dataTransfer.files && event.dataTransfer.files[0];
+        var filename = file ? file.name : event.dataTransfer.getData("text");
+        if (invoicePatternFilenameEl) invoicePatternFilenameEl.value = filename || "";
+        suggestInvoicePattern(filename || "");
+      }});
+    }}
+
     loadAccounts();
+    loadInvoicePatterns();
   }})();
 </script>{expiry_script}
 """

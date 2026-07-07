@@ -13,13 +13,18 @@ from app.config import load_config
 from app.mail_providers import GmailClient, OutlookClient, pkce_code_challenge
 
 
-class FakeHttp:
+class TestHttp:
     def __init__(self) -> None:
         self.posted_forms: list[tuple[str, dict[str, str]]] = []
+        self.get_urls: list[str] = []
 
     def post_form(self, url: str, *, payload: dict[str, str]) -> dict[str, object]:
         self.posted_forms.append((url, payload))
         return {"access_token": "access-token"}
+
+    def get_json(self, url: str, *, access_token: str) -> dict[str, object]:
+        self.get_urls.append(url)
+        return {}
 
 
 class ProviderAuthorizationUrlTests(unittest.TestCase):
@@ -72,7 +77,7 @@ class ProviderAuthorizationUrlTests(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 config = load_config(root)
 
-        http = FakeHttp()
+        http = TestHttp()
         GmailClient(config, http=http).exchange_code(
             code="code-123",
             redirect_uri="https://app.example/api/mail/oauth/gmail/callback",
@@ -99,3 +104,16 @@ class ProviderAuthorizationUrlTests(unittest.TestCase):
         self.assertEqual(params["response_mode"], ["query"])
         self.assertIn("offline_access", params["scope"][0])
         self.assertIn("Mail.Read", params["scope"][0])
+
+    def test_outlook_message_fetch_requests_body_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(root)
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        http = TestHttp()
+        OutlookClient(config, http=http).message(access_token="access-token", message_id="message-123")
+        params = parse_qs(urlparse(http.get_urls[0]).query)
+
+        self.assertIn("bodyPreview", params["$select"][0].split(","))

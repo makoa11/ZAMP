@@ -67,7 +67,7 @@ class PdfStorage:
 
     def save_pdf(self, content: bytes) -> StoredPdf:
         digest = hashlib.sha256(content).hexdigest()
-        relative_path = f"{digest[:2]}/{digest[2:4]}/{digest}.pdf"
+        relative_path = f"{digest}.pdf"
         destination = self.root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -129,6 +129,13 @@ CREATE TABLE IF NOT EXISTS mail_accounts (
     outlook_subscription_expiration TIMESTAMPTZ,
     outlook_delta_link TEXT,
     webhook_client_state TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS mail_invoice_match_settings (
+    owner_user_id TEXT PRIMARY KEY,
+    patterns JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -383,6 +390,41 @@ class MailRepository:
                 (owner_user_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def get_invoice_match_patterns(self, *, owner_user_id: str) -> list[str]:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT patterns FROM mail_invoice_match_settings WHERE owner_user_id = %s",
+                (owner_user_id,),
+            ).fetchone()
+            if not row:
+                return []
+            patterns = row["patterns"]
+            if isinstance(patterns, str):
+                try:
+                    patterns = json.loads(patterns)
+                except json.JSONDecodeError:
+                    return []
+            if not isinstance(patterns, list):
+                return []
+            return [item for item in patterns if isinstance(item, str)]
+
+    def set_invoice_match_patterns(self, *, owner_user_id: str, patterns: list[str]) -> list[str]:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO mail_invoice_match_settings (owner_user_id, patterns)
+                VALUES (%s, %s::jsonb)
+                ON CONFLICT (owner_user_id)
+                DO UPDATE SET patterns = EXCLUDED.patterns, updated_at = now()
+                RETURNING patterns
+                """,
+                (owner_user_id, json.dumps(patterns, separators=(",", ":"))),
+            ).fetchone()
+            stored = row["patterns"]
+            if isinstance(stored, str):
+                stored = json.loads(stored)
+            return [item for item in stored if isinstance(item, str)]
 
     def list_active_accounts(self) -> list[dict[str, Any]]:
         with self.database.connect() as conn:

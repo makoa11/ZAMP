@@ -31,7 +31,7 @@ class PdfStorageTests(unittest.TestCase):
             first = storage.save_pdf(content)
             second = storage.save_pdf(content)
 
-            expected_relative_path = f"{digest[:2]}/{digest[2:4]}/{digest}.pdf"
+            expected_relative_path = f"{digest}.pdf"
             self.assertEqual(first.sha256, digest)
             self.assertEqual(first.relative_path, expected_relative_path)
             self.assertEqual(second.relative_path, expected_relative_path)
