@@ -769,8 +769,10 @@ def _invoice_component_body(kind: str, sample: dict[str, Any]) -> str:
 <p>{_e(payment["reference"])}</p>
 <p>{_e(payment["remit_to"])}</p>
 """
-    if kind in {"terms", "footer"}:
+    if kind == "terms":
         return f"<p>{_e(data['notes'])}</p>"
+    if kind == "footer":
+        return f"<p>{_e(data.get('footer_note', data.get('notes', '')))}</p>"
     if kind == "stamp":
         return "<div class=\"invoice-stamp-text\">Approved</div>"
     if kind == "barcode":

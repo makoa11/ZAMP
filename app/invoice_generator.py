@@ -1081,6 +1081,7 @@ def _invoice_data(
         "total_quantity": sum(int(item["quantity"]) for item in items),
         "payment": _payment_details(seller, rng, labels=profile["labels"]),
         "notes": _notes(template, rng),
+        "footer_note": _footer_note(template, rng),
     }
 
 
@@ -1199,10 +1200,20 @@ def _payment_details(seller: dict[str, str], rng: random.Random, *, labels: dict
 
 def _notes(template: TemplateProfile, rng: random.Random) -> str:
     options = [
-        "Thank you for your business.",
-        "Please notify accounts receivable of any billing questions within seven days.",
+        "Payment is due according to the terms shown above.",
+        "Please report billing disputes to accounts receivable within seven days.",
         "Late balances may be subject to fees defined in the service agreement.",
-        f"{template.industry} charges are grouped for audit-friendly reconciliation.",
+        f"{template.industry} charges follow the active service agreement.",
+    ]
+    return rng.choice(options)
+
+
+def _footer_note(template: TemplateProfile, rng: random.Random) -> str:
+    options = [
+        "Retain this invoice for your records.",
+        "Reference the invoice number on all correspondence.",
+        "This document was generated electronically.",
+        f"{template.industry} billing record prepared for account review.",
     ]
     return rng.choice(options)
 

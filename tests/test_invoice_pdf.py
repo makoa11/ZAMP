@@ -38,6 +38,22 @@ class InvoicePdfTests(unittest.TestCase):
         self.assertIn(samples[0]["data"]["seller"]["name"].encode("latin-1"), content)
         self.assertIn(samples[0]["data"]["invoice_number"].encode("latin-1"), content)
 
+    def test_pdf_terms_and_footer_render_distinct_copy(self) -> None:
+        samples = generate_invoice_samples(
+            paper_slug="a4",
+            count=1,
+            seed=500,
+            today=date(2026, 7, 7),
+        )
+        samples[0]["data"]["notes"] = "Terms copy only."
+        samples[0]["data"]["footer_note"] = "Footer copy only."
+
+        content = render_invoice_pdf(samples)
+
+        self.assertIn(b"Terms copy only.", content)
+        self.assertIn(b"Footer copy only.", content)
+        self.assertEqual(content.count(b"Terms copy only."), 1)
+
     def test_render_invoice_pdf_supports_horizontal_split_pages(self) -> None:
         samples = generate_invoice_samples(
             paper_slug="a4-third-horizontal",

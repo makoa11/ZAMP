@@ -503,7 +503,7 @@ def _render_invoice_page(canvas: _PdfCanvas, sample: dict[str, Any]) -> None:
         elif kind == "payment":
             _render_payment(canvas, component, sample)
         elif kind in {"terms", "footer", "remittance", "timeline"}:
-            _render_note(canvas, component, sample, title=kind.replace("-", " ").title())
+            _render_note(canvas, component, sample, kind=kind, title=kind.replace("-", " ").title())
         elif kind in {
             "signature",
             "approver",
@@ -517,7 +517,7 @@ def _render_invoice_page(canvas: _PdfCanvas, sample: dict[str, Any]) -> None:
             "itinerary",
             "sla",
         }:
-            _render_note(canvas, component, sample, title=kind.replace("-", " ").title())
+            _render_note(canvas, component, sample, kind=kind, title=kind.replace("-", " ").title())
         elif kind == "stamp":
             _render_stamp(canvas, component, sample)
         elif kind == "barcode":
@@ -900,14 +900,22 @@ def _render_payment(canvas: _PdfCanvas, component: dict[str, Any], sample: dict[
     canvas.wrapped_text(component["x_mm"], component["y_mm"] + 17, component["width_mm"], payment["remit_to"], size=5.4, max_lines=1)
 
 
-def _render_note(canvas: _PdfCanvas, component: dict[str, Any], sample: dict[str, Any], *, title: str) -> None:
+def _render_note(
+    canvas: _PdfCanvas,
+    component: dict[str, Any],
+    sample: dict[str, Any],
+    *,
+    kind: str,
+    title: str,
+) -> None:
     data = sample["data"]
     if component["height_mm"] > 12:
         canvas.text(component["x_mm"], component["y_mm"], title.upper(), size=5.5, bold=True, color=sample["template"]["accent"])
         y = component["y_mm"] + 4
     else:
         y = component["y_mm"]
-    canvas.wrapped_text(component["x_mm"], y, component["width_mm"], data.get("notes", ""), size=5.2, line_height_mm=2.6, max_lines=3)
+    note_text = data.get("footer_note", data.get("notes", "")) if kind == "footer" else data.get("notes", "")
+    canvas.wrapped_text(component["x_mm"], y, component["width_mm"], note_text, size=5.2, line_height_mm=2.6, max_lines=3)
 
 
 def _render_stamp(canvas: _PdfCanvas, component: dict[str, Any], sample: dict[str, Any]) -> None:

@@ -240,6 +240,30 @@ class InvoiceGeneratorTests(unittest.TestCase):
         self.assertIn("<td class=\"number invoice-col-unit_price\"></td>", html)
         self.assertIn("$", html)
 
+    def test_terms_and_footer_use_distinct_generated_copy(self) -> None:
+        invoice = generate_invoice(
+            template_slug="ledger-clean",
+            paper_slug="a4",
+            seed=500,
+            today=date(2026, 7, 7),
+        )
+        kinds = {component["kind"] for component in invoice["components"]}
+        html = invoice_samples_page(
+            samples=[invoice],
+            papers=[],
+            templates=[],
+            active_paper="a4",
+            active_template="ledger-clean",
+            seed=500,
+            count=1,
+        )
+
+        self.assertIn("terms", kinds)
+        self.assertIn("footer", kinds)
+        self.assertNotEqual(invoice["data"]["notes"], invoice["data"]["footer_note"])
+        self.assertIn(invoice["data"]["notes"], html)
+        self.assertIn(invoice["data"]["footer_note"], html)
+
     def test_table_total_label_uses_descriptive_column(self) -> None:
         invoice = generate_invoice(
             template_slug="ledger-clean",
