@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import hmac
 import time
+from datetime import date, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from workos._errors import EmailVerificationRequiredError
 from workos.session import (
@@ -14,8 +16,10 @@ from workos.session import (
     RefreshWithSessionCookieSuccessResponse,
 )
 
-from .config import AppConfig
+from .config import AppConfig, ConfigError
 from .cookies import build_cookie, clear_cookie, parse_cookie_header
+from .mail_service import MailIntegration
+from .mail_store import MailIntegrationError
 from .security import generate_csrf_token, sign_value, unsign_value, valid_signed_pair
 from .templates import dashboard_page, error_page, login_page, signup_page
 from .workos_auth import (
@@ -37,6 +41,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
     config: AppConfig
     auth: WorkOSAuthService
     timed_revoker: TimedSessionRevoker
+    mail_integration: MailIntegration
 
     server_version = "ZAMPAuth/0.1"
 
@@ -56,10 +61,16 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             self._handle_signup_get(parsed.query)
             return
         if parsed.path == "/dashboard":
-            self._handle_dashboard_get()
+            self._handle_dashboard_get(parsed.query)
             return
         if parsed.path == "/api/session":
             self._handle_api_session()
+            return
+        if parsed.path == "/api/mail/accounts":
+            self._handle_mail_accounts_get()
+            return
+        if parsed.path.startswith("/api/mail/oauth/") and parsed.path.endswith("/callback"):
+            self._handle_mail_oauth_callback(parsed)
             return
         if parsed.path == "/logout":
             self._send_method_not_allowed("POST")
@@ -80,7 +91,23 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/logout":
             self._handle_logout_post()
             return
+        if parsed.path.startswith("/api/mail/oauth/") and parsed.path.endswith("/start"):
+            self._handle_mail_oauth_start(parsed)
+            return
+        if parsed.path == "/webhooks/gmail/pubsub":
+            self._handle_gmail_pubsub_webhook(parsed)
+            return
+        if parsed.path == "/webhooks/outlook":
+            self._handle_outlook_webhook(parsed)
+            return
         self._send_html(HTTPStatus.NOT_FOUND, error_page(404, "Page not found."))
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/mail/accounts/"):
+            self._handle_mail_account_delete(parsed)
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Page not found."})
 
     def _handle_login_post(self) -> None:
         form = self._form()
@@ -172,7 +199,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             cookies=[csrf_cookie] if csrf_cookie else None,
         )
 
-    def _handle_dashboard_get(self) -> None:
+    def _handle_dashboard_get(self, query: str) -> None:
         session, set_session_cookie, clear_cookies = self._session()
         if not session:
             self._redirect("/login", cookies=clear_cookies)
@@ -180,9 +207,23 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         cookies = self._cookies()
         csrf, csrf_cookie = self._csrf_cookie(cookies)
         response_cookies = [cookie for cookie in [set_session_cookie, csrf_cookie] if cookie]
+        params = parse_qs(query)
+        mail_notice = None
+        mail_notice_kind = "success"
+        if params.get("mail_connected"):
+            provider = params.get("mail_connected", ["mail"])[0]
+            mail_notice = f"{provider.title()} connected."
+        elif params.get("mail_error"):
+            mail_notice = params.get("mail_error", ["Mail connection failed."])[0]
+            mail_notice_kind = "error"
         self._send_html(
             HTTPStatus.OK,
-            dashboard_page(csrf_token=csrf, session=self._session_payload(session)),
+            dashboard_page(
+                csrf_token=csrf,
+                session=self._session_payload(session),
+                mail_notice=mail_notice,
+                mail_notice_kind=mail_notice_kind,
+            ),
             cookies=response_cookies,
         )
 
@@ -196,6 +237,143 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             {"authenticated": True, **self._session_payload(session)},
             cookies=[set_session_cookie] if set_session_cookie else None,
         )
+
+    def _handle_mail_oauth_start(self, parsed: Any) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        provider = self._provider_from_oauth_path(parsed.path, suffix="start")
+        if not provider:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Unsupported mail provider."}, cookies=cookies)
+            return
+        try:
+            body = self._json_body()
+            redirect_after = body.get("redirect_after") if isinstance(body.get("redirect_after"), str) else None
+            result = self.mail_integration.start_oauth(
+                provider=provider,
+                owner_user_id=owner_user_id,
+                redirect_after=redirect_after,
+            )
+        except (ConfigError, MailIntegrationError, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        except Exception as exc:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, result, cookies=cookies)
+
+    def _handle_mail_oauth_callback(self, parsed: Any) -> None:
+        provider = self._provider_from_oauth_path(parsed.path, suffix="callback")
+        if not provider:
+            self._send_html(HTTPStatus.NOT_FOUND, error_page(404, "Page not found."))
+            return
+        params = parse_qs(parsed.query)
+        if params.get("error"):
+            self._redirect(self._mail_frontend_redirect({"mail_error": "oauth_denied"}))
+            return
+        state = params.get("state", [""])[0]
+        code = params.get("code", [""])[0]
+        if not state or not code:
+            self._redirect(self._mail_frontend_redirect({"mail_error": "missing_oauth_code"}))
+            return
+        session, set_session_cookie, clear_cookies = self._session()
+        if not session:
+            self._redirect(
+                self._mail_frontend_redirect({"mail_error": "oauth_session_required"}),
+                cookies=clear_cookies,
+            )
+            return
+        payload = self._session_payload(session)
+        user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+        owner_user_id = user.get("id")
+        if not isinstance(owner_user_id, str) or not owner_user_id:
+            self._redirect(self._mail_frontend_redirect({"mail_error": "oauth_session_required"}))
+            return
+        try:
+            location = self.mail_integration.complete_oauth(
+                provider=provider,
+                state=state,
+                code=code,
+                owner_user_id=owner_user_id,
+            )
+        except Exception as exc:
+            self.log_message("Mail OAuth callback failed: %s", exc)
+            self._send_html(HTTPStatus.BAD_REQUEST, error_page(400, "Mail OAuth callback failed."))
+            return
+        self._redirect(location, cookies=[set_session_cookie] if set_session_cookie else None)
+
+    def _handle_mail_accounts_get(self) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        try:
+            accounts = self.mail_integration.list_accounts(owner_user_id=owner_user_id)
+        except (ConfigError, MailIntegrationError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, {"accounts": accounts}, cookies=cookies)
+
+    def _handle_mail_account_delete(self, parsed: Any) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        account_id_raw = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            account_id = int(account_id_raw)
+        except ValueError:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid account id."}, cookies=cookies)
+            return
+        try:
+            disconnected = self.mail_integration.disconnect_account(
+                owner_user_id=owner_user_id,
+                account_id=account_id,
+            )
+        except (ConfigError, MailIntegrationError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(
+            HTTPStatus.OK if disconnected else HTTPStatus.NOT_FOUND,
+            {"disconnected": disconnected},
+            cookies=cookies,
+        )
+
+    def _handle_gmail_pubsub_webhook(self, parsed: Any) -> None:
+        if not self._valid_webhook_secret(self.config.gmail_webhook_secret, provider="gmail"):
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid webhook secret."})
+            return
+        try:
+            payload = self._json_body(max_bytes=1024 * 1024)
+            result = self.mail_integration.handle_gmail_pubsub(
+                payload=payload,
+                subscription=payload.get("subscription") if isinstance(payload.get("subscription"), str) else None,
+            )
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+        self._send_json(HTTPStatus.OK, result)
+
+    def _handle_outlook_webhook(self, parsed: Any) -> None:
+        params = parse_qs(parsed.query)
+        validation_token = params.get("validationToken", [""])[0]
+        if validation_token:
+            self._send_text(HTTPStatus.OK, validation_token, content_type="text/plain; charset=utf-8")
+            return
+        try:
+            payload = self._json_body(max_bytes=1024 * 1024)
+            result = self.mail_integration.handle_outlook_notifications(payload=payload)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            return
+        self._send_json(HTTPStatus.ACCEPTED, result)
 
     def _handle_password_login(self, form: dict[str, str] | None = None) -> None:
         if form is None:
@@ -718,6 +896,50 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             user_agent=self.headers.get("User-Agent"),
         )
 
+    def _authenticated_api_user(self) -> tuple[str, list[str]] | None:
+        session, set_session_cookie, clear_cookies = self._session()
+        if not session:
+            self._send_json(
+                HTTPStatus.UNAUTHORIZED,
+                {"authenticated": False},
+                cookies=clear_cookies,
+            )
+            return None
+        payload = self._session_payload(session)
+        user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+        user_id = user.get("id")
+        if not isinstance(user_id, str) or not user_id:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"authenticated": False})
+            return None
+        return user_id, [set_session_cookie] if set_session_cookie else []
+
+    def _provider_from_oauth_path(self, path: str, *, suffix: str) -> str | None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5 or parts[:3] != ["api", "mail", "oauth"] or parts[4] != suffix:
+            return None
+        provider = parts[3]
+        return provider if provider in {"gmail", "outlook"} else None
+
+    def _mail_frontend_redirect(self, params: dict[str, str]) -> str:
+        separator = "&" if "?" in self.config.mail_frontend_redirect_url else "?"
+        return self.config.mail_frontend_redirect_url + separator + urlencode(params)
+
+    def _valid_webhook_secret(self, expected_secret: str | None, *, provider: str) -> bool:
+        if not expected_secret:
+            return False
+        candidates = [
+            self.headers.get(f"X-Zamp-{provider.title()}-Webhook-Secret"),
+            self.headers.get("X-Zamp-Webhook-Secret"),
+        ]
+        authorization = self.headers.get("Authorization")
+        if authorization and authorization.lower().startswith("bearer "):
+            candidates.append(authorization[7:].strip())
+        return any(
+            hmac.compare_digest(candidate, expected_secret)
+            for candidate in candidates
+            if isinstance(candidate, str)
+        )
+
     def _form(self) -> dict[str, str]:
         try:
             content_length = int(self.headers.get("Content-Length", "0") or "0")
@@ -727,6 +949,24 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             return {}
         raw = self.rfile.read(content_length).decode("utf-8")
         return {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
+
+    def _json_body(self, *, max_bytes: int = 256 * 1024) -> dict[str, Any]:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length.") from exc
+        if content_length > max_bytes:
+            raise ValueError("Request body is too large.")
+        raw = self.rfile.read(content_length)
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Request body must be JSON.") from exc
+        if not isinstance(data, dict):
+            raise ValueError("Request body must be a JSON object.")
+        return data
 
     def _cookies(self) -> dict[str, str]:
         return parse_cookie_header(self.headers.get("Cookie"))
@@ -882,12 +1122,26 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         *,
         cookies: list[str] | None = None,
     ) -> None:
-        encoded = json.dumps(content, sort_keys=True).encode("utf-8")
+        encoded = json.dumps(content, sort_keys=True, default=_json_default).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         for cookie in cookies or []:
             self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_text(
+        self,
+        status: HTTPStatus,
+        content: str,
+        *,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
+        encoded = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -911,6 +1165,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
 def create_server(config: AppConfig) -> ThreadingHTTPServer:
     auth = WorkOSAuthService(config)
     timed_revoker = TimedSessionRevoker(auth, config.session_max_age_seconds)
+    mail_integration = MailIntegration(config)
 
     class Handler(ZampRequestHandler):
         pass
@@ -918,4 +1173,11 @@ def create_server(config: AppConfig) -> ThreadingHTTPServer:
     Handler.config = config
     Handler.auth = auth
     Handler.timed_revoker = timed_revoker
+    Handler.mail_integration = mail_integration
     return ThreadingHTTPServer((config.host, config.port), Handler)
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")

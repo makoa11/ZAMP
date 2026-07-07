@@ -188,7 +188,13 @@ def signup_page(
     return page("Create account - ZAMP", body)
 
 
-def dashboard_page(*, csrf_token: str, session: dict[str, Any]) -> str:
+def dashboard_page(
+    *,
+    csrf_token: str,
+    session: dict[str, Any],
+    mail_notice: str | None = None,
+    mail_notice_kind: str = "success",
+) -> str:
     user = session.get("user") or {}
     name = " ".join(
         part for part in [user.get("first_name"), user.get("last_name")] if isinstance(part, str)
@@ -204,6 +210,9 @@ def dashboard_page(*, csrf_token: str, session: dict[str, Any]) -> str:
       window.location.href = "/login";
     }}, Math.max(0, ({expires_at} * 1000) - Date.now() + 250));
   </script>"""
+    notice = ""
+    if mail_notice:
+        notice = f'<div class="notice notice-{_e(mail_notice_kind)}" role="status">{_e(mail_notice)}</div>'
     body = f"""
 <main class="dashboard-shell">
   <header class="topbar">
@@ -229,11 +238,180 @@ def dashboard_page(*, csrf_token: str, session: dict[str, Any]) -> str:
     </div>
   </section>
 
+  <section class="data-panel mail-panel" aria-labelledby="mail-title">
+    <div class="panel-heading">
+      <div>
+        <p class="label">Mail ingestion</p>
+        <h2 id="mail-title">Connected mailboxes</h2>
+      </div>
+      <div class="mail-actions">
+        <button type="button" data-connect-provider="gmail">Connect Gmail</button>
+        <button class="secondary" type="button" data-connect-provider="outlook">Connect Outlook</button>
+      </div>
+    </div>
+    {notice}
+    <div class="mail-status" data-mail-status role="status"></div>
+    <div class="account-list" data-mail-accounts></div>
+  </section>
+
   <section class="data-panel">
     <h2>Session data</h2>
     <pre>{_e(session_json)}</pre>
   </section>
-</main>{expiry_script}
+</main>
+<script>
+  (function () {{
+    var statusEl = document.querySelector("[data-mail-status]");
+    var accountsEl = document.querySelector("[data-mail-accounts]");
+    var buttons = Array.prototype.slice.call(document.querySelectorAll("[data-connect-provider]"));
+
+    function setStatus(message, kind) {{
+      if (!statusEl) return;
+      statusEl.textContent = message || "";
+      statusEl.className = "mail-status" + (message ? " visible " + (kind || "") : "");
+    }}
+
+    function formatDate(value) {{
+      if (!value) return "Not set";
+      var date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString();
+    }}
+
+    function providerLabel(provider) {{
+      return provider === "gmail" ? "Gmail" : "Outlook";
+    }}
+
+    function renderAccounts(accounts) {{
+      if (!accountsEl) return;
+      accountsEl.innerHTML = "";
+      if (!accounts.length) {{
+        var empty = document.createElement("p");
+        empty.className = "empty-state";
+        empty.textContent = "No mailboxes connected.";
+        accountsEl.appendChild(empty);
+        return;
+      }}
+      accounts.forEach(function (account) {{
+        var row = document.createElement("div");
+        row.className = "account-row";
+
+        var mark = document.createElement("div");
+        mark.className = "provider-mark";
+        mark.textContent = providerLabel(account.provider).charAt(0);
+
+        var details = document.createElement("div");
+        details.className = "account-details";
+
+        var title = document.createElement("div");
+        title.className = "account-title";
+        title.textContent = account.email || "Unknown mailbox";
+
+        var meta = document.createElement("div");
+        meta.className = "account-meta";
+        var renewal = account.provider === "gmail"
+          ? account.gmail_watch_expiration
+          : account.outlook_subscription_expiration;
+        meta.textContent = providerLabel(account.provider) + " - " + formatDate(renewal);
+
+        details.appendChild(title);
+        details.appendChild(meta);
+        if (account.last_error) {{
+          var error = document.createElement("div");
+          error.className = "account-error";
+          error.textContent = account.last_error;
+          details.appendChild(error);
+        }}
+
+        var badge = document.createElement("span");
+        badge.className = "status-badge " + (account.status || "unknown");
+        badge.textContent = account.status || "unknown";
+
+        var disconnect = document.createElement("button");
+        disconnect.className = "secondary compact-button";
+        disconnect.type = "button";
+        disconnect.textContent = "Disconnect";
+        disconnect.addEventListener("click", function () {{
+          disconnectAccount(account.id, disconnect);
+        }});
+
+        row.appendChild(mark);
+        row.appendChild(details);
+        row.appendChild(badge);
+        row.appendChild(disconnect);
+        accountsEl.appendChild(row);
+      }});
+    }}
+
+    function loadAccounts() {{
+      setStatus("Loading mailboxes.", "");
+      fetch("/api/mail/accounts")
+        .then(function (response) {{
+          return response.json().then(function (body) {{
+            if (!response.ok) throw new Error(body.error || "Could not load mailboxes.");
+            return body;
+          }});
+        }})
+        .then(function (body) {{
+          renderAccounts(body.accounts || []);
+          setStatus("", "");
+        }})
+        .catch(function (error) {{
+          setStatus(error.message, "error");
+        }});
+    }}
+
+    function connectProvider(provider, button) {{
+      button.disabled = true;
+      setStatus("Starting " + providerLabel(provider) + " connection.", "");
+      fetch("/api/mail/oauth/" + provider + "/start", {{
+        method: "POST",
+        headers: {{"Content-Type": "application/json"}},
+        body: JSON.stringify({{}})
+      }})
+        .then(function (response) {{
+          return response.json().then(function (body) {{
+            if (!response.ok) throw new Error(body.error || "Could not start connection.");
+            return body;
+          }});
+        }})
+        .then(function (body) {{
+          window.location.href = body.authorization_url;
+        }})
+        .catch(function (error) {{
+          button.disabled = false;
+          setStatus(error.message, "error");
+        }});
+    }}
+
+    function disconnectAccount(accountId, button) {{
+      button.disabled = true;
+      setStatus("Disconnecting mailbox.", "");
+      fetch("/api/mail/accounts/" + accountId, {{method: "DELETE"}})
+        .then(function (response) {{
+          return response.json().then(function (body) {{
+            if (!response.ok) throw new Error(body.error || "Could not disconnect mailbox.");
+            return body;
+          }});
+        }})
+        .then(function () {{
+          loadAccounts();
+        }})
+        .catch(function (error) {{
+          button.disabled = false;
+          setStatus(error.message, "error");
+        }});
+    }}
+
+    buttons.forEach(function (button) {{
+      button.addEventListener("click", function () {{
+        connectProvider(button.getAttribute("data-connect-provider"), button);
+      }});
+    }});
+
+    loadAccounts();
+  }})();
+</script>{expiry_script}
 """
     return page("Dashboard - ZAMP", body)
 

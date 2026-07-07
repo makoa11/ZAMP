@@ -55,3 +55,19 @@ class ConfigTests(unittest.TestCase):
         }
         self.assertEqual(len(signing_secrets), 4)
         self.assertNotIn(config.workos_cookie_password, signing_secrets)
+
+    def test_mail_db_pool_max_must_not_be_less_than_min(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            values = {
+                **self._base_env(),
+                "MAIL_DB_POOL_MIN_SIZE": "5",
+                "MAIL_DB_POOL_MAX_SIZE": "2",
+            }
+            self._write_env(root, values)
+
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ConfigError) as error:
+                    load_config(root)
+
+        self.assertIn("MAIL_DB_POOL_MAX_SIZE", str(error.exception))

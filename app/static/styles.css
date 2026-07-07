@@ -196,6 +196,11 @@ button:hover,
   border-color: var(--accent-strong);
 }
 
+button:disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+}
+
 button.secondary {
   background: #fff;
   color: var(--ink);
@@ -282,6 +287,132 @@ button.secondary:hover {
   margin-bottom: 14px;
 }
 
+.mail-panel {
+  margin-bottom: 16px;
+}
+
+.panel-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.panel-heading h2 {
+  margin-bottom: 0;
+}
+
+.mail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.mail-status {
+  display: none;
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.mail-status.visible {
+  display: block;
+}
+
+.mail-status.error {
+  color: var(--danger-ink);
+}
+
+.account-list {
+  display: grid;
+  gap: 8px;
+}
+
+.account-row {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 64px;
+  border-top: 1px solid var(--line);
+  padding: 12px 0 4px;
+}
+
+.account-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.provider-mark {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  background: #eef7f6;
+  color: var(--accent-strong);
+  font-weight: 900;
+}
+
+.account-details {
+  min-width: 0;
+}
+
+.account-title {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.account-meta,
+.account-error,
+.empty-state {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.account-error {
+  color: var(--danger-ink);
+}
+
+.status-badge {
+  min-width: 78px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 9px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-align: center;
+  text-transform: capitalize;
+}
+
+.status-badge.active {
+  background: var(--success-bg);
+  border-color: var(--success-line);
+  color: var(--success-ink);
+}
+
+.status-badge.disconnected,
+.status-badge.reauthorization_required {
+  background: var(--danger-bg);
+  border-color: var(--danger-line);
+  color: var(--danger-ink);
+}
+
+.compact-button {
+  min-height: 36px;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
 pre {
   margin: 0;
   white-space: pre-wrap;
@@ -315,5 +446,25 @@ pre {
 
   .button-row {
     grid-template-columns: 1fr;
+  }
+
+  .panel-heading,
+  .mail-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .mail-actions button {
+    width: 100%;
+  }
+
+  .account-row {
+    grid-template-columns: 40px minmax(0, 1fr);
+  }
+
+  .status-badge,
+  .compact-button {
+    grid-column: 2;
+    justify-self: start;
   }
 }

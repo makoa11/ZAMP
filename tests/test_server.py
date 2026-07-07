@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import unittest
 from types import SimpleNamespace
 
@@ -40,3 +41,60 @@ class ServerRouteTests(unittest.TestCase):
         self.assertIn(" 405 ", response.splitlines()[0])
         self.assertIn("Allow: POST\r\n", response)
         self.assertNotIn("Set-Cookie:", response)
+
+    def test_gmail_webhook_accepts_header_secret(self) -> None:
+        class MailIntegration:
+            def __init__(self) -> None:
+                self.payload: dict[str, object] | None = None
+
+            def handle_gmail_pubsub(self, *, payload: dict[str, object], subscription: str | None = None) -> dict[str, object]:
+                self.payload = payload
+                return {"accepted": True}
+
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        mail = MailIntegration()
+        Handler.config = SimpleNamespace(gmail_webhook_secret="webhook-secret")
+        Handler.mail_integration = mail  # type: ignore[assignment]
+        body = json.dumps({"subscription": "projects/p/subscriptions/s", "message": {}}).encode("utf-8")
+        request = (
+            b"POST /webhooks/gmail/pubsub HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"X-Zamp-Webhook-Secret: webhook-secret\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"\r\n"
+            + body
+        )
+
+        fake_socket = FakeSocket(request)
+        Handler(fake_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = fake_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn(" 200 ", response.splitlines()[0])
+        self.assertEqual(mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}})
+
+    def test_gmail_webhook_rejects_query_secret_without_header(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        Handler.config = SimpleNamespace(gmail_webhook_secret="webhook-secret")
+        Handler.mail_integration = object()  # type: ignore[assignment]
+        body = b'{"message":{}}'
+        request = (
+            b"POST /webhooks/gmail/pubsub?secret=webhook-secret HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"\r\n"
+            + body
+        )
+
+        fake_socket = FakeSocket(request)
+        Handler(fake_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = fake_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn(" 403 ", response.splitlines()[0])

@@ -77,6 +77,20 @@ class AppConfig:
     email_verification_cookie_name: str
     csrf_cookie_name: str
     cookie_secure: bool
+    database_url: str | None
+    mail_db_pool_min_size: int
+    mail_db_pool_max_size: int
+    mail_token_encryption_key: str | None
+    mail_pdf_storage_dir: str
+    mail_frontend_redirect_url: str
+    google_oauth_client_id: str | None
+    google_oauth_client_secret: str | None
+    gmail_pubsub_topic: str | None
+    gmail_pubsub_subscription: str | None
+    gmail_webhook_secret: str | None
+    microsoft_client_id: str | None
+    microsoft_client_secret: str | None
+    microsoft_tenant_id: str
 
     @property
     def logout_return_url(self) -> str:
@@ -128,6 +142,20 @@ def load_config(root: Path | None = None) -> AppConfig:
     port_raw = _env("PORT", env_file_values, "8000") or "8000"
     app_url = _env("APP_URL", env_file_values, f"http://{host}:{port_raw}") or f"http://{host}:{port_raw}"
     secure_default = app_url.startswith("https://")
+    mail_db_pool_min_size = _int_env("MAIL_DB_POOL_MIN_SIZE", env_file_values, 1)
+    mail_db_pool_max_size = _int_env("MAIL_DB_POOL_MAX_SIZE", env_file_values, 10)
+    if mail_db_pool_max_size < mail_db_pool_min_size:
+        raise ConfigError("MAIL_DB_POOL_MAX_SIZE must be greater than or equal to MAIL_DB_POOL_MIN_SIZE.")
+    mail_token_encryption_key = _env("MAIL_TOKEN_ENCRYPTION_KEY", env_file_values)
+    if mail_token_encryption_key:
+        try:
+            Fernet(str(mail_token_encryption_key).encode("utf-8"))
+        except Exception as exc:
+            raise ConfigError(
+                "MAIL_TOKEN_ENCRYPTION_KEY must be a Fernet key. Generate one with: "
+                ".venv/bin/python -c \"from cryptography.fernet import Fernet; "
+                "print(Fernet.generate_key().decode())\""
+            ) from exc
 
     return AppConfig(
         workos_api_key=str(api_key),
@@ -163,4 +191,24 @@ def load_config(root: Path | None = None) -> AppConfig:
         or "zamp_email_verification",
         csrf_cookie_name=_env("CSRF_COOKIE_NAME", env_file_values, "zamp_csrf") or "zamp_csrf",
         cookie_secure=_bool_env(_env("COOKIE_SECURE", env_file_values), secure_default),
+        database_url=_env("DATABASE_URL", env_file_values),
+        mail_db_pool_min_size=mail_db_pool_min_size,
+        mail_db_pool_max_size=mail_db_pool_max_size,
+        mail_token_encryption_key=mail_token_encryption_key,
+        mail_pdf_storage_dir=_env("MAIL_PDF_STORAGE_DIR", env_file_values, "./storage/mail_pdfs")
+        or "./storage/mail_pdfs",
+        mail_frontend_redirect_url=_env(
+            "MAIL_FRONTEND_REDIRECT_URL",
+            env_file_values,
+            f"{app_url.rstrip('/')}/dashboard",
+        )
+        or f"{app_url.rstrip('/')}/dashboard",
+        google_oauth_client_id=_env("GOOGLE_OAUTH_CLIENT_ID", env_file_values),
+        google_oauth_client_secret=_env("GOOGLE_OAUTH_CLIENT_SECRET", env_file_values),
+        gmail_pubsub_topic=_env("GMAIL_PUBSUB_TOPIC", env_file_values),
+        gmail_pubsub_subscription=_env("GMAIL_PUBSUB_SUBSCRIPTION", env_file_values),
+        gmail_webhook_secret=_env("GMAIL_WEBHOOK_SECRET", env_file_values),
+        microsoft_client_id=_env("MICROSOFT_CLIENT_ID", env_file_values),
+        microsoft_client_secret=_env("MICROSOFT_CLIENT_SECRET", env_file_values),
+        microsoft_tenant_id=_env("MICROSOFT_TENANT_ID", env_file_values, "common") or "common",
     )
