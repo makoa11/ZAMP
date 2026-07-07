@@ -3,15 +3,19 @@ from __future__ import annotations
 import io
 import json
 import unittest
+from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from app.server import ZampRequestHandler
+from app.server import ZampHTTPServer, ZampRequestHandler
 
 
 class FakeSocket:
-    def __init__(self, request: bytes) -> None:
+    def __init__(self, request: bytes, *, fail_on_send_number: int | None = None) -> None:
         self.reader = io.BytesIO(request)
         self.writer = io.BytesIO()
+        self.fail_on_send_number = fail_on_send_number
+        self.send_count = 0
 
     def makefile(self, mode: str, buffering: int | None = None) -> io.BytesIO:
         if "r" in mode:
@@ -19,10 +23,47 @@ class FakeSocket:
         return self.writer
 
     def sendall(self, data: bytes) -> None:
+        self.send_count += 1
+        if self.fail_on_send_number == self.send_count:
+            raise BrokenPipeError("client disconnected")
         self.writer.write(data)
 
 
 class ServerRouteTests(unittest.TestCase):
+    def test_client_disconnect_during_response_is_ignored(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = (
+            b"GET /logout HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"\r\n"
+        )
+        fake_socket = FakeSocket(request, fail_on_send_number=2)
+
+        Handler(fake_socket, ("127.0.0.1", 12345), SimpleNamespace())
+
+        self.assertEqual(fake_socket.send_count, 2)
+
+    def test_server_close_closes_mail_integration(self) -> None:
+        class MailIntegration:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        mail = MailIntegration()
+        server = ZampHTTPServer.__new__(ZampHTTPServer)
+        server.mail_integration = mail  # type: ignore[assignment]
+
+        with patch.object(ThreadingHTTPServer, "server_close") as close_socket:
+            ZampHTTPServer.server_close(server)
+
+        close_socket.assert_called_once()
+        self.assertTrue(mail.closed)
+
     def test_get_logout_is_non_mutating(self) -> None:
         class Handler(ZampRequestHandler):
             def log_message(self, format: str, *args: object) -> None:

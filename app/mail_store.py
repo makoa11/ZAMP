@@ -248,9 +248,10 @@ class MailDatabase:
             return self._pool
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
-            self._pool = None
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.close()
+                self._pool = None
 
     def initialize_schema(self) -> None:
         with self.connect() as conn:

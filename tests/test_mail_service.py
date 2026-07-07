@@ -144,6 +144,46 @@ class MailIntegrationPkceTests(unittest.TestCase):
         self.assertEqual(integration.completed_gmail, {})
 
 
+class MailIntegrationLifecycleTests(unittest.TestCase):
+    def test_close_closes_database_and_resets_ready_state(self) -> None:
+        class Database:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        database = Database()
+        integration = MailIntegration(SimpleNamespace())
+        integration._ready = True
+        integration._repo = SimpleNamespace(database=database)  # type: ignore[assignment]
+        integration._cipher = object()  # type: ignore[assignment]
+
+        integration.close()
+
+        self.assertTrue(database.closed)
+        self.assertFalse(integration._ready)
+        self.assertIsNone(integration._repo)
+        self.assertIsNone(integration._cipher)
+
+    def test_close_resets_state_when_database_close_raises(self) -> None:
+        class Database:
+            def close(self) -> None:
+                raise RuntimeError("close failed")
+
+        integration = MailIntegration(SimpleNamespace())
+        integration._ready = True
+        integration._repo = SimpleNamespace(database=Database())  # type: ignore[assignment]
+        integration._cipher = object()  # type: ignore[assignment]
+
+        with self.assertRaises(RuntimeError):
+            integration.close()
+
+        self.assertFalse(integration._ready)
+        self.assertIsNone(integration._repo)
+        self.assertIsNone(integration._cipher)
+
+
 class ScopeValidationTests(unittest.TestCase):
     def test_required_scope_validation_rejects_missing_gmail_readonly(self) -> None:
         with self.assertRaises(MailIntegrationError):

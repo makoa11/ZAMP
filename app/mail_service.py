@@ -102,6 +102,21 @@ class MailIntegration:
             self._ingestion = ingestion
             self._ready = True
 
+    def close(self) -> None:
+        with self._lock:
+            try:
+                if self._repo is not None:
+                    self._repo.database.close()
+            finally:
+                self._repo = None
+                self._cipher = None
+                self._storage = None
+                self._gmail = None
+                self._outlook = None
+                self._token_manager = None
+                self._ingestion = None
+                self._ready = False
+
     def start_oauth(
         self,
         *,

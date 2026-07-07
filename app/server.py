@@ -37,6 +37,23 @@ from .workos_auth import (
 STATIC_CSS = Path(__file__).parent / "static" / "styles.css"
 
 
+class ZampHTTPServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+        mail_integration: MailIntegration,
+    ) -> None:
+        super().__init__(server_address, handler_class)
+        self.mail_integration = mail_integration
+
+    def server_close(self) -> None:
+        try:
+            super().server_close()
+        finally:
+            self.mail_integration.close()
+
+
 class ZampRequestHandler(BaseHTTPRequestHandler):
     config: AppConfig
     auth: WorkOSAuthService
@@ -44,6 +61,12 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
     mail_integration: MailIntegration
 
     server_version = "ZAMPAuth/0.1"
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            self.close_connection = True
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format % args}")
@@ -1162,7 +1185,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def create_server(config: AppConfig) -> ThreadingHTTPServer:
+def create_server(config: AppConfig) -> ZampHTTPServer:
     auth = WorkOSAuthService(config)
     timed_revoker = TimedSessionRevoker(auth, config.session_max_age_seconds)
     mail_integration = MailIntegration(config)
@@ -1174,7 +1197,7 @@ def create_server(config: AppConfig) -> ThreadingHTTPServer:
     Handler.auth = auth
     Handler.timed_revoker = timed_revoker
     Handler.mail_integration = mail_integration
-    return ThreadingHTTPServer((config.host, config.port), Handler)
+    return ZampHTTPServer((config.host, config.port), Handler, mail_integration)
 
 
 def _json_default(value: Any) -> str:

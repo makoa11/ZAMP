@@ -15,15 +15,18 @@ from .mail_service import MailIntegration
 def run_once(*, limit: int = 10, worker_id: str | None = None) -> int:
     config = load_config()
     integration = MailIntegration(config)
-    worker_name = worker_id or f"{socket.gethostname()}:{time.time_ns()}"
-    jobs = integration.repo.claim_jobs(
-        worker_id=worker_name,
-        job_types=MAIL_JOB_TYPES,
-        limit=limit,
-    )
-    for job in jobs:
-        _handle_job(integration, job)
-    return len(jobs)
+    try:
+        worker_name = worker_id or f"{socket.gethostname()}:{time.time_ns()}"
+        jobs = integration.repo.claim_jobs(
+            worker_id=worker_name,
+            job_types=MAIL_JOB_TYPES,
+            limit=limit,
+        )
+        for job in jobs:
+            _handle_job(integration, job)
+        return len(jobs)
+    finally:
+        integration.close()
 
 
 def run_forever(
@@ -38,23 +41,26 @@ def run_forever(
     integration = MailIntegration(config)
     last_fallback_at = 0.0
     last_renewal_at = 0.0
-    while True:
-        now = time.time()
-        if now - last_fallback_at >= fallback_seconds:
-            _enqueue_polling_fallbacks(integration)
-            last_fallback_at = now
-        if now - last_renewal_at >= 3600:
-            integration.ingestion.renew_mail_subscriptions()
-            last_renewal_at = now
-        jobs = integration.repo.claim_jobs(
-            worker_id=worker_name,
-            job_types=MAIL_JOB_TYPES,
-            limit=limit,
-        )
-        for job in jobs:
-            _handle_job(integration, job)
-        if not jobs:
-            time.sleep(poll_seconds)
+    try:
+        while True:
+            now = time.time()
+            if now - last_fallback_at >= fallback_seconds:
+                _enqueue_polling_fallbacks(integration)
+                last_fallback_at = now
+            if now - last_renewal_at >= 3600:
+                integration.ingestion.renew_mail_subscriptions()
+                last_renewal_at = now
+            jobs = integration.repo.claim_jobs(
+                worker_id=worker_name,
+                job_types=MAIL_JOB_TYPES,
+                limit=limit,
+            )
+            for job in jobs:
+                _handle_job(integration, job)
+            if not jobs:
+                time.sleep(poll_seconds)
+    finally:
+        integration.close()
 
 
 def _handle_job(integration: MailIntegration, job: dict[str, Any]) -> None:
