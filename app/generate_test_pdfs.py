@@ -10,6 +10,7 @@ from .invoice_generator import (
     generate_invoice,
     generate_invoice_samples,
 )
+from .invoice_fixtures import generate_invoice_stress_fixtures, write_invoice_manifest
 from .invoice_pdf import render_invoice_pdf
 
 
@@ -24,6 +25,8 @@ def generate_test_pdfs(
     today: date | None = None,
     pdf_count: int | None = None,
     samples_per_pdf: int = 1,
+    write_manifests: bool = False,
+    stress_cases: bool = False,
 ) -> list[Path]:
     if count < 1 or count > 60:
         raise ValueError("count must be between 1 and 60.")
@@ -33,9 +36,25 @@ def generate_test_pdfs(
         raise ValueError("pdf-count must be greater than 0.")
     if samples_per_pdf < 1 or samples_per_pdf > 60:
         raise ValueError("samples-per-pdf must be between 1 and 60.")
+    if stress_cases and pdf_count is not None:
+        raise ValueError("--stress-cases cannot be combined with --pdf-count.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     written_paths: list[Path] = []
+
+    if stress_cases:
+        for fixture in generate_invoice_stress_fixtures(seed=seed, today=today):
+            path = output_dir / fixture.filename
+            path.write_bytes(render_invoice_pdf(fixture.samples))
+            if write_manifests:
+                write_invoice_manifest(
+                    path,
+                    fixture.samples,
+                    suite="stress",
+                    fixture_slug=fixture.slug,
+                )
+            written_paths.append(path)
+        return written_paths
 
     if pdf_count is not None:
         sequence_width = max(4, len(str(pdf_count)))
@@ -56,6 +75,8 @@ def generate_test_pdfs(
             ]
             path = output_dir / f"invoice-sample-{pdf_index + 1:0{sequence_width}d}-{paper.slug}.pdf"
             path.write_bytes(render_invoice_pdf(samples))
+            if write_manifests:
+                write_invoice_manifest(path, samples)
             written_paths.append(path)
         return written_paths
 
@@ -68,6 +89,8 @@ def generate_test_pdfs(
         )
         path = output_dir / f"invoice-samples-{paper.slug}.pdf"
         path.write_bytes(render_invoice_pdf(samples))
+        if write_manifests:
+            write_invoice_manifest(path, samples)
         written_paths.append(path)
 
     return written_paths
@@ -101,6 +124,16 @@ def main() -> None:
         default=1,
         help="Samples/pages per PDF when --pdf-count is used.",
     )
+    parser.add_argument(
+        "--write-manifests",
+        action="store_true",
+        help="Write expected-output JSON manifests beside generated PDFs.",
+    )
+    parser.add_argument(
+        "--stress-cases",
+        action="store_true",
+        help="Write deterministic parser stress PDFs for multi-page, ambiguous label, and currency cases.",
+    )
     parser.add_argument("--seed", type=int, default=1000, help="Seed for deterministic samples.")
     parser.add_argument(
         "--date",
@@ -118,12 +151,16 @@ def main() -> None:
             today=args.date,
             pdf_count=args.pdf_count,
             samples_per_pdf=args.samples_per_pdf,
+            write_manifests=args.write_manifests,
+            stress_cases=args.stress_cases,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
     for path in paths:
         print(path)
+        if args.write_manifests:
+            print(path.with_suffix(".manifest.json"))
 
 
 if __name__ == "__main__":

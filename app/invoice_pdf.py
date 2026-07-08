@@ -975,6 +975,10 @@ def _table_cell_text(row: dict[str, Any], key: str, data: dict[str, Any]) -> str
     return str(row.get(key, ""))
 
 
+def format_invoice_money(value: float, data: dict[str, Any]) -> str:
+    return _money(value, data)
+
+
 def _money(value: float, data: dict[str, Any]) -> str:
     currency = str(data.get("currency", "USD"))
     formatting = data.get("formatting") if isinstance(data.get("formatting"), dict) else {}

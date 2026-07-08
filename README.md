@@ -57,9 +57,25 @@ To save a specific number of individual one-invoice PDFs, use `--pdf-count`; fil
 .venv/bin/python -m app.generate_test_pdfs --pdf-count 200
 ```
 
+Add `--write-manifests` to write an expected-output JSON sidecar for each PDF:
+
+```bash
+.venv/bin/python -m app.generate_test_pdfs --pdf-count 50 --write-manifests
+```
+
+Parser stress fixtures are available for cases that are hard to evaluate visually: multi-page invoices, line-item tables continued across pages, notes/footers close to table bounds, side-panel totals, table-row totals, ambiguous entity labels such as `Account`, `To`, `Source`, and `Entity`, and glyph-sensitive currency rendering:
+
+```bash
+.venv/bin/python -m app.generate_test_pdfs --stress-cases --write-manifests
+```
+
+`--stress-cases` is a separate fixture suite and cannot be combined with `--pdf-count`.
+
+Each manifest records normalized invoice fields, rendered display values, line items, total placement, page/table continuation metadata, key component bounding boxes, and challenge tags so parser output can be compared automatically.
+
 Each generated model includes positioned invoice components such as `company-header`, `invoice-meta`, `items-table`, `totals`, and optional payment or footer blocks. The `company-header` component carries a header variant such as centered, no-line, boxed, banded, receipt, rail, or minimal.
 Generated samples also vary capture-sensitive content: compact date strings such as `DDMMYYYY`, `DDMMYY`, and `MMDDYYYY`; invoice number styles; currencies including USD, INR, EUR, GBP, AED, SGD, and others; decimal/no-decimal amount rendering; table schemas; and alternate labels such as left balance, remaining payment, billed amount, pay by, settle by, and amount open.
-Some full A4 layouts place the payable total as the last row of the item table, with total quantity populated, the rate cell intentionally blank, and the amount cell using the final payable value. Currency can render as a code or a symbol such as `$`, `₹`, `€`, `£`, `¥`, `A$`, or `S$`.
+Some full A4 layouts place the payable total as the last row of the item table, with total quantity populated, the rate cell intentionally blank, and the amount cell using the final payable value. Currency can render as a code or a symbol such as `$`, `Rs`, `€`, `£`, `¥`, `A$`, or `S$`.
 Template metadata also includes `font_style`, and rendered samples rotate through system, serif, slab, mono, condensed, rounded, formal, industrial, humanist, geometric, courier, book, narrow, typewriter, and neo-grotesque font stacks.
 
 ## WorkOS Configuration
