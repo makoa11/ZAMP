@@ -772,7 +772,10 @@ def _invoice_component_body(kind: str, sample: dict[str, Any]) -> str:
     if kind == "terms":
         return f"<p>{_e(data['notes'])}</p>"
     if kind == "footer":
-        return f"<p>{_e(data.get('footer_note', data.get('notes', '')))}</p>"
+        footer_note = data.get("footer_note", "")
+        if not footer_note:
+            return ""
+        return f"<h3>Notice</h3><p>{_e(footer_note)}</p>"
     if kind == "stamp":
         return "<div class=\"invoice-stamp-text\">Approved</div>"
     if kind == "barcode":

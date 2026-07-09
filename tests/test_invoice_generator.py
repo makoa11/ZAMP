@@ -261,8 +261,33 @@ class InvoiceGeneratorTests(unittest.TestCase):
         self.assertIn("terms", kinds)
         self.assertIn("footer", kinds)
         self.assertNotEqual(invoice["data"]["notes"], invoice["data"]["footer_note"])
+        self.assertFalse(
+            invoice["data"]["footer_note"].startswith(f"{invoice['template']['industry']} ")
+        )
         self.assertIn(invoice["data"]["notes"], html)
         self.assertIn(invoice["data"]["footer_note"], html)
+        self.assertIn("<h3>Notice</h3>", html)
+
+    def test_footer_without_footer_note_does_not_repeat_terms_copy(self) -> None:
+        invoice = generate_invoice(
+            template_slug="ledger-clean",
+            paper_slug="a4",
+            seed=500,
+            today=date(2026, 7, 7),
+        )
+        invoice["data"]["notes"] = "Terms copy should appear once."
+        invoice["data"].pop("footer_note", None)
+        html = invoice_samples_page(
+            samples=[invoice],
+            papers=[],
+            templates=[],
+            active_paper="a4",
+            active_template="ledger-clean",
+            seed=500,
+            count=1,
+        )
+
+        self.assertEqual(html.count("Terms copy should appear once."), 1)
 
     def test_table_total_label_uses_descriptive_column(self) -> None:
         invoice = generate_invoice(

@@ -52,7 +52,22 @@ class InvoicePdfTests(unittest.TestCase):
 
         self.assertIn(b"Terms copy only.", content)
         self.assertIn(b"Footer copy only.", content)
+        self.assertIn(b"NOTICE", content)
         self.assertEqual(content.count(b"Terms copy only."), 1)
+
+    def test_pdf_footer_without_footer_note_does_not_repeat_terms_copy(self) -> None:
+        samples = generate_invoice_samples(
+            paper_slug="a4",
+            count=1,
+            seed=500,
+            today=date(2026, 7, 7),
+        )
+        samples[0]["data"]["notes"] = "Terms copy should appear once."
+        samples[0]["data"].pop("footer_note", None)
+
+        content = render_invoice_pdf(samples)
+
+        self.assertEqual(content.count(b"Terms copy should appear once."), 1)
 
     def test_render_invoice_pdf_supports_horizontal_split_pages(self) -> None:
         samples = generate_invoice_samples(

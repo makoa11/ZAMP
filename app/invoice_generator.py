@@ -1213,7 +1213,7 @@ def _footer_note(template: TemplateProfile, rng: random.Random) -> str:
         "Retain this invoice for your records.",
         "Reference the invoice number on all correspondence.",
         "This document was generated electronically.",
-        f"{template.industry} billing record prepared for account review.",
+        "Billing record prepared for account review.",
     ]
     return rng.choice(options)
 

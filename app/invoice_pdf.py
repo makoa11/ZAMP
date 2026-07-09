@@ -909,12 +909,45 @@ def _render_note(
     title: str,
 ) -> None:
     data = sample["data"]
+    if kind == "footer":
+        note_text = data.get("footer_note", "")
+    else:
+        note_text = data.get("notes", "")
+    if not note_text:
+        return
+    if kind == "footer" and component["height_mm"] <= 12:
+        canvas.line(
+            component["x_mm"],
+            component["y_mm"],
+            component["x_mm"] + component["width_mm"],
+            component["y_mm"],
+            color=sample["template"]["secondary"],
+            line_width=0.25,
+        )
+        canvas.text(
+            component["x_mm"],
+            component["y_mm"] + 1.2,
+            "NOTICE",
+            size=4.7,
+            bold=True,
+            color=sample["template"]["accent"],
+        )
+        canvas.wrapped_text(
+            component["x_mm"],
+            component["y_mm"] + 4.0,
+            component["width_mm"],
+            note_text,
+            size=4.7,
+            line_height_mm=2.4,
+            max_lines=1,
+            color="#475569",
+        )
+        return
     if component["height_mm"] > 12:
         canvas.text(component["x_mm"], component["y_mm"], title.upper(), size=5.5, bold=True, color=sample["template"]["accent"])
         y = component["y_mm"] + 4
     else:
         y = component["y_mm"]
-    note_text = data.get("footer_note", data.get("notes", "")) if kind == "footer" else data.get("notes", "")
     canvas.wrapped_text(component["x_mm"], y, component["width_mm"], note_text, size=5.2, line_height_mm=2.6, max_lines=3)
 
 
