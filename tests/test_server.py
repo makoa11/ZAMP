@@ -176,14 +176,27 @@ class ServerRouteTests(unittest.TestCase):
             mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}}
         )
 
-    def test_gmail_webhook_rejects_query_secret_without_header(self) -> None:
+    def test_gmail_webhook_accepts_query_secret(self) -> None:
+        class MailIntegration:
+            def __init__(self) -> None:
+                self.payload: dict[str, object] | None = None
+
+            def handle_gmail_pubsub(
+                self, *, payload: dict[str, object], subscription: str | None = None
+            ) -> dict[str, object]:
+                self.payload = payload
+                return {"accepted": True}
+
         class Handler(ZampRequestHandler):
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
+        mail = MailIntegration()
         Handler.config = SimpleNamespace(gmail_webhook_secret="webhook-secret")
-        Handler.mail_integration = object()  # type: ignore[assignment]
-        body = b'{"message":{}}'
+        Handler.mail_integration = mail  # type: ignore[assignment]
+        body = json.dumps(
+            {"subscription": "projects/p/subscriptions/s", "message": {}}
+        ).encode("utf-8")
         request = (
             b"POST /webhooks/gmail/pubsub?secret=webhook-secret HTTP/1.1\r\n"
             b"Host: localhost\r\n"
@@ -197,4 +210,23 @@ class ServerRouteTests(unittest.TestCase):
         Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
         response = test_socket.writer.getvalue().decode("iso-8859-1")
 
-        self.assertIn(" 403 ", response.splitlines()[0])
+        self.assertIn(" 200 ", response.splitlines()[0])
+        self.assertEqual(
+            mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}}
+        )
+
+    def test_access_log_redacts_query_secret(self) -> None:
+        request = (
+            b"GET /logout?secret=super-secret&next=%2Fdashboard HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"\r\n"
+        )
+        test_socket = TestSocket(request)
+
+        with patch("builtins.print") as log:
+            ZampRequestHandler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+
+        lines = "\n".join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn("secret=REDACTED", lines)
+        self.assertIn("next=%2Fdashboard", lines)
+        self.assertNotIn("super-secret", lines)

@@ -145,7 +145,7 @@ Frontend-facing APIs:
 
 Provider webhooks:
 
-- Gmail Pub/Sub push target: `POST /webhooks/gmail/pubsub` with `X-Zamp-Webhook-Secret` or `Authorization: Bearer ...`.
+- Gmail Pub/Sub push target: `POST /webhooks/gmail/pubsub` with `X-Zamp-Webhook-Secret`, `Authorization: Bearer ...`, or `?secret=...` when Pub/Sub cannot send a custom header.
 - Outlook Graph notification target: `POST /webhooks/outlook`; notifications are validated with Graph `clientState`.
 
 Run the ingestion worker:

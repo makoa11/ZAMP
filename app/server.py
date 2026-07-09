@@ -8,7 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from workos._errors import EmailVerificationRequiredError
 from workos.session import (
@@ -42,6 +42,33 @@ from .workos_auth import (
 
 
 STATIC_CSS = Path(__file__).parent / "static" / "styles.css"
+SENSITIVE_QUERY_PARAMETERS = {"secret"}
+
+
+def _redact_query_parameters(target: str) -> str:
+    parsed = urlparse(target)
+    if not parsed.query:
+        return target
+    query = [
+        (key, "REDACTED" if key.lower() in SENSITIVE_QUERY_PARAMETERS else value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+    ]
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(query, doseq=True),
+            parsed.fragment,
+        )
+    )
+
+
+def _redact_log_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return " ".join(_redact_query_parameters(part) for part in value.split(" "))
 
 
 class ZampHTTPServer(ThreadingHTTPServer):
@@ -76,6 +103,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def log_message(self, format: str, *args: Any) -> None:
+        args = tuple(_redact_log_value(arg) for arg in args)
         print(f"{self.address_string()} - {format % args}")
 
     def do_GET(self) -> None:
@@ -534,7 +562,11 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_gmail_pubsub_webhook(self, parsed: Any) -> None:
-        if not self._valid_webhook_secret(self.config.gmail_webhook_secret, provider="gmail"):
+        if not self._valid_webhook_secret(
+            self.config.gmail_webhook_secret,
+            provider="gmail",
+            query=parsed.query,
+        ):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid webhook secret."})
             return
         try:
@@ -1117,13 +1149,21 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         separator = "&" if "?" in self.config.mail_frontend_redirect_url else "?"
         return self.config.mail_frontend_redirect_url + separator + urlencode(params)
 
-    def _valid_webhook_secret(self, expected_secret: str | None, *, provider: str) -> bool:
+    def _valid_webhook_secret(
+        self,
+        expected_secret: str | None,
+        *,
+        provider: str,
+        query: str | None = None,
+    ) -> bool:
         if not expected_secret:
             return False
         candidates = [
             self.headers.get(f"X-Zamp-{provider.title()}-Webhook-Secret"),
             self.headers.get("X-Zamp-Webhook-Secret"),
         ]
+        if query:
+            candidates.extend(parse_qs(query, keep_blank_values=True).get("secret", []))
         authorization = self.headers.get("Authorization")
         if authorization and authorization.lower().startswith("bearer "):
             candidates.append(authorization[7:].strip())
