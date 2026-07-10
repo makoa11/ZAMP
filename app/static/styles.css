@@ -1050,6 +1050,36 @@ pre {
   line-height: 1.1;
 }
 
+.invoice-items-table.table-density-amount_boundary_collision {
+  overflow: visible;
+}
+
+.invoice-table.table-density-amount_boundary_collision {
+  overflow: visible;
+}
+
+.invoice-table.table-density-amount_boundary_collision td.invoice-col-amount,
+.invoice-table.table-density-amount_boundary_collision td.invoice-col-taxable {
+  overflow: visible;
+  padding-right: 0.2mm;
+}
+
+.invoice-table.table-density-amount_boundary_collision td .invoice-print-drift {
+  display: inline-block;
+  margin-top: 0;
+  color: inherit;
+  font-size: inherit;
+  font-style: normal;
+  font-weight: inherit;
+  line-height: inherit;
+  white-space: nowrap;
+  transform: translate(1.8mm, 0.2mm);
+}
+
+.invoice-table.table-density-amount_boundary_collision tbody tr:nth-child(even) td .invoice-print-drift {
+  transform: translate(2.25mm, -0.15mm);
+}
+
 .invoice-table.schema-compact-total td span,
 .invoice-table.schema-sku-ledger td span,
 .invoice-table.schema-receipt-lines td span,

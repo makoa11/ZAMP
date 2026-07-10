@@ -691,6 +691,10 @@ def _invoice_component(component: dict[str, Any], sample: dict[str, Any]) -> str
     kind = component["kind"]
     variant = component.get("variant")
     variant_class = f' variant-{_e(str(variant))}' if isinstance(variant, str) and variant else ""
+    table_density_class = ""
+    if kind == "items-table":
+        density = _table_visual_density(sample["data"])
+        table_density_class = f" table-density-{_e(density)}" if density else ""
     style = (
         f'left:{component["x_mm"]}mm;'
         f'top:{component["y_mm"]}mm;'
@@ -698,7 +702,7 @@ def _invoice_component(component: dict[str, Any], sample: dict[str, Any]) -> str
         f'height:{component["height_mm"]}mm;'
     )
     return (
-        f'<section class="invoice-component invoice-{_e(kind)}{variant_class}" '
+        f'<section class="invoice-component invoice-{_e(kind)}{variant_class}{table_density_class}" '
         f'data-component="{_e(kind)}" style="{style}">'
         f'{_invoice_component_body(kind, sample)}'
         "</section>"
@@ -825,6 +829,8 @@ def _items_table(data: dict[str, Any]) -> str:
             {"key": "amount", "label": "Amount", "numeric": True},
         ]
     variant = str(table.get("variant") or "standard-desc")
+    density = _table_visual_density(data)
+    density_class = f" table-density-{_e(density)}" if density else ""
     rows = "\n".join(
         f"""
     <tr>
@@ -839,7 +845,7 @@ def _items_table(data: dict[str, Any]) -> str:
         for column in columns
     )
     return f"""
-<table class="invoice-table schema-{_e(variant)}">
+<table class="invoice-table schema-{_e(variant)}{density_class}">
   <thead>
     <tr>
       {headings}
@@ -883,7 +889,7 @@ def _table_total_cell_value(
     if index == quantity_column_index:
         return _e(str(data.get("total_quantity", "")))
     if index == amount_column_index:
-        return f'<strong>{_money(float(data.get("balance_due", 0)), data)}</strong>'
+        return f'<strong>{_table_numeric_value(_money(float(data.get("balance_due", 0)), data), key, data)}</strong>'
     return ""
 
 
@@ -958,12 +964,28 @@ def _table_cell_value(item: dict[str, Any], key: str, data: dict[str, Any]) -> s
     if key == "unit_price":
         return _money(float(item.get("unit_price", 0)), data)
     if key == "amount":
-        return _money(float(item.get("amount", 0)), data)
+        return _table_numeric_value(_money(float(item.get("amount", 0)), data), key, data)
     if key == "taxable":
-        return _money(float(item.get("taxable_amount", item.get("amount", 0))), data)
+        return _table_numeric_value(
+            _money(float(item.get("taxable_amount", item.get("amount", 0))), data),
+            key,
+            data,
+        )
     if key == "description":
         return _e(str(item.get("description", "")))
     return _e(str(item.get(key, "")))
+
+
+def _table_numeric_value(value: str, key: str, data: dict[str, Any]) -> str:
+    if key in {"amount", "taxable"} and _table_visual_density(data) == "amount_boundary_collision":
+        return f'<span class="invoice-print-drift">{_e(value)}</span>'
+    return value
+
+
+def _table_visual_density(data: dict[str, Any]) -> str:
+    table = data.get("table") if isinstance(data.get("table"), dict) else {}
+    density = table.get("visual_density")
+    return str(density) if density else ""
 
 
 def _totals(data: dict[str, Any]) -> str:

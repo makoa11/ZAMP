@@ -140,6 +140,47 @@ class InvoicePdfTests(unittest.TestCase):
         self.assertEqual(header_alignments["Qty"], "right")
         self.assertEqual(header_alignments["Amount"], "right")
 
+    def test_pdf_table_amount_boundary_collision_offsets_amount_values(self) -> None:
+        class RecordingCanvas(_PdfCanvas):
+            def __init__(self) -> None:
+                super().__init__(width_pt=240, height_pt=180, font_style="system")
+                self.text_calls: list[tuple[float, float, str, dict[str, object]]] = []
+
+            def text(self, x_mm: float, y_mm: float, text: str, **kwargs: object) -> None:
+                self.text_calls.append((x_mm, y_mm, text, kwargs))
+                super().text(x_mm, y_mm, text, **kwargs)
+
+        base_data = {
+            "currency": "USD",
+            "formatting": {"money_style": "symbol-prefix-2dp", "decimals": 2},
+            "items": [{"name": "Implementation", "quantity": 2, "unit_price": 100, "amount": 200}],
+            "table": {
+                "columns": [
+                    {"key": "item", "label": "Item"},
+                    {"key": "quantity", "label": "Qty", "numeric": True},
+                    {"key": "amount", "label": "Amount", "numeric": True},
+                ],
+                "total_in_table": False,
+            },
+        }
+        normal = {"template": {"accent": "#111827"}, "data": base_data}
+        collision_data = {
+            **base_data,
+            "table": {**base_data["table"], "visual_density": "amount_boundary_collision"},
+        }
+        collision = {"template": {"accent": "#111827"}, "data": collision_data}
+        component = {"x_mm": 8, "y_mm": 8, "width_mm": 68, "height_mm": 24}
+        normal_canvas = RecordingCanvas()
+        collision_canvas = RecordingCanvas()
+
+        _render_table(normal_canvas, component, normal)
+        _render_table(collision_canvas, component, collision)
+
+        normal_amount = next(call for call in normal_canvas.text_calls if call[2] == "$200.00")
+        collision_amount = next(call for call in collision_canvas.text_calls if call[2] == "$200.00")
+        self.assertGreater(collision_amount[0], normal_amount[0])
+        self.assertGreater(collision_amount[1], normal_amount[1])
+
     def test_pdf_money_symbols_distinguish_symbol_from_code_styles(self) -> None:
         expected_symbols = {
             "EUR": "€",

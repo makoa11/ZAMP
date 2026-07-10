@@ -745,6 +745,7 @@ def _render_table(canvas: _PdfCanvas, component: dict[str, Any], sample: dict[st
     header_h = 6.4 if component["height_mm"] > 40 else 4.5
     row_h = max(3.6, (component["height_mm"] - header_h) / max(1, row_count))
     widths = _column_widths(columns, component["width_mm"])
+    amount_collision = _table_visual_density(data) == "amount_boundary_collision"
     x = component["x_mm"]
     y = component["y_mm"]
     canvas.rect(x, y, component["width_mm"], component["height_mm"], stroke="#cbd5e1", line_width=0.25)
@@ -765,12 +766,33 @@ def _render_table(canvas: _PdfCanvas, component: dict[str, Any], sample: dict[st
         )
         col_x += width
     y += header_h
-    for row in rows:
-        _render_table_row(canvas, x, y, widths, columns, row, data, row_h=row_h)
+    for row_index, row in enumerate(rows):
+        _render_table_row(
+            canvas,
+            x,
+            y,
+            widths,
+            columns,
+            row,
+            data,
+            row_h=row_h,
+            row_index=row_index,
+            amount_collision=amount_collision,
+        )
         canvas.line(x, y + row_h, x + component["width_mm"], y + row_h, color="#cbd5e1", line_width=0.2)
         y += row_h
     if has_total:
-        _render_table_total_row(canvas, x, y, widths, columns, data, row_h=row_h, accent=sample["template"]["accent"])
+        _render_table_total_row(
+            canvas,
+            x,
+            y,
+            widths,
+            columns,
+            data,
+            row_h=row_h,
+            accent=sample["template"]["accent"],
+            amount_collision=amount_collision,
+        )
 
 
 def _render_table_row(
@@ -783,6 +805,8 @@ def _render_table_row(
     data: dict[str, Any],
     *,
     row_h: float,
+    row_index: int = 0,
+    amount_collision: bool = False,
 ) -> None:
     col_x = x
     for column, width in zip(columns, widths):
@@ -791,7 +815,19 @@ def _render_table_row(
         align = "right" if column.get("numeric") else "left"
         size = 5.6 if row_h < 6 else 6.2
         if align == "right":
-            canvas.text(col_x + 1.3, y + 1.0, value, size=size, align="right", width_mm=max(3, width - 2.2))
+            x_offset, y_offset = (
+                _amount_collision_offset(row_index)
+                if amount_collision and key in {"amount", "taxable"}
+                else (0.0, 0.0)
+            )
+            canvas.text(
+                col_x + 1.3 + x_offset,
+                y + 1.0 + y_offset,
+                value,
+                size=size,
+                align="right",
+                width_mm=max(3, width - 2.2),
+            )
         else:
             canvas.wrapped_text(
                 col_x + 1.3,
@@ -816,6 +852,7 @@ def _render_table_total_row(
     *,
     row_h: float,
     accent: str,
+    amount_collision: bool = False,
 ) -> None:
     canvas.rect(x, y, sum(widths), row_h, fill="#f8fafc")
     canvas.line(x, y, x + sum(widths), y, color=accent, line_width=1.1)
@@ -833,7 +870,20 @@ def _render_table_total_row(
         elif index == amount_index:
             text = _money(float(data.get("balance_due", 0)), data)
         align = "right" if column.get("numeric") else "left"
-        canvas.text(col_x + 1.3, y + max(1.1, row_h / 2 - 1.6), text, size=6.1, bold=True, align=align, width_mm=max(3, width - 2.2))
+        x_offset, y_offset = (
+            _amount_collision_offset(len(data.get("items", [])))
+            if amount_collision and index == amount_index
+            else (0.0, 0.0)
+        )
+        canvas.text(
+            col_x + 1.3 + x_offset,
+            y + max(1.1, row_h / 2 - 1.6) + y_offset,
+            text,
+            size=6.1,
+            bold=True,
+            align=align,
+            width_mm=max(3, width - 2.2),
+        )
         col_x += width
 
 
@@ -1008,6 +1058,17 @@ def _table_cell_text(row: dict[str, Any], key: str, data: dict[str, Any]) -> str
     if key == "taxable":
         return _money(float(row.get("taxable_amount", row.get("amount", 0))), data)
     return str(row.get(key, ""))
+
+
+def _table_visual_density(data: dict[str, Any]) -> str:
+    table = data.get("table") if isinstance(data.get("table"), dict) else {}
+    density = table.get("visual_density")
+    return str(density) if density else ""
+
+
+def _amount_collision_offset(row_index: int) -> tuple[float, float]:
+    offsets = ((1.8, 0.2), (2.25, -0.15), (1.95, 0.35))
+    return offsets[row_index % len(offsets)]
 
 
 def format_invoice_money(value: float, data: dict[str, Any]) -> str:

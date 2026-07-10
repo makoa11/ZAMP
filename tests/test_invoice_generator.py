@@ -242,6 +242,32 @@ class InvoiceGeneratorTests(unittest.TestCase):
         self.assertIn("<td class=\"number invoice-col-unit_price\"></td>", html)
         self.assertIn("$", html)
 
+    def test_table_amount_boundary_collision_renders_print_drift_markup(self) -> None:
+        invoice = generate_invoice(
+            template_slug="ledger-clean",
+            paper_slug="a4",
+            seed=123,
+            variation_index=1,
+            today=date(2026, 7, 7),
+        )
+        html = invoice_samples_page(
+            samples=[invoice],
+            papers=[],
+            templates=[],
+            active_paper="a4",
+            active_template="ledger-clean",
+            seed=123,
+            count=1,
+        )
+
+        self.assertEqual(invoice["data"]["table"]["visual_density"], "amount_boundary_collision")
+        self.assertIn("table-density-amount_boundary_collision", html)
+        self.assertIn("invoice-print-drift", html)
+        self.assertEqual(
+            invoice["data"]["visual_artifacts"][-1]["scenario"],
+            "table_amount_boundary_collision",
+        )
+
     def test_terms_and_footer_use_distinct_generated_copy(self) -> None:
         invoice = generate_invoice(
             template_slug="ledger-clean",
