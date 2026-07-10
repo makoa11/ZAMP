@@ -4,7 +4,7 @@ import unittest
 from datetime import date
 
 from app.invoice_generator import generate_invoice, generate_invoice_samples
-from app.invoice_pdf import _PdfCanvas, _money, _text_width, render_invoice_pdf
+from app.invoice_pdf import _PdfCanvas, _money, _render_table, _text_width, render_invoice_pdf
 
 
 class InvoicePdfTests(unittest.TestCase):
@@ -99,6 +99,46 @@ class InvoicePdfTests(unittest.TestCase):
         self.assertTrue(content.startswith(b"%PDF-1.4"))
         self.assertIn(b"/Count 2", content)
         self.assertIn(samples[0]["data"]["invoice_number"].encode("latin-1"), content)
+
+    def test_pdf_table_headers_align_with_numeric_columns(self) -> None:
+        class RecordingCanvas(_PdfCanvas):
+            def __init__(self) -> None:
+                super().__init__(width_pt=240, height_pt=180, font_style="system")
+                self.text_calls: list[tuple[str, dict[str, object]]] = []
+
+            def text(self, x_mm: float, y_mm: float, text: str, **kwargs: object) -> None:
+                self.text_calls.append((text, kwargs))
+                super().text(x_mm, y_mm, text, **kwargs)
+
+        sample = {
+            "template": {"accent": "#111827"},
+            "data": {
+                "currency": "USD",
+                "formatting": {"money_style": "symbol-prefix-2dp", "decimals": 2},
+                "items": [{"name": "Implementation", "quantity": 2, "unit_price": 100, "amount": 200}],
+                "table": {
+                    "columns": [
+                        {"key": "item", "label": "Item"},
+                        {"key": "quantity", "label": "Qty", "numeric": True},
+                        {"key": "amount", "label": "Amount", "numeric": True},
+                    ],
+                    "total_in_table": False,
+                },
+            },
+        }
+        component = {"x_mm": 8, "y_mm": 8, "width_mm": 68, "height_mm": 24}
+        canvas = RecordingCanvas()
+
+        _render_table(canvas, component, sample)
+
+        header_alignments = {
+            text: kwargs.get("align")
+            for text, kwargs in canvas.text_calls
+            if text in {"Item", "Qty", "Amount"}
+        }
+        self.assertEqual(header_alignments["Item"], "left")
+        self.assertEqual(header_alignments["Qty"], "right")
+        self.assertEqual(header_alignments["Amount"], "right")
 
     def test_pdf_money_symbols_distinguish_symbol_from_code_styles(self) -> None:
         expected_symbols = {

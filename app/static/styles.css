@@ -1086,8 +1086,8 @@ pre {
   border-bottom: 0.35mm dashed rgba(100, 116, 139, 0.65);
 }
 
-.invoice-table.schema-amount-left .number,
-.invoice-table.schema-description-only .number {
+.invoice-table.schema-amount-left td.number,
+.invoice-table.schema-description-only td.number {
   text-align: left;
 }
 

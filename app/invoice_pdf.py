@@ -751,6 +751,7 @@ def _render_table(canvas: _PdfCanvas, component: dict[str, Any], sample: dict[st
     canvas.rect(x, y, component["width_mm"], header_h, fill=sample["template"]["accent"])
     col_x = x
     for column, width in zip(columns, widths):
+        align = "right" if column.get("numeric") else "left"
         canvas.text(
             col_x + 1.3,
             y + 1.7,
@@ -758,6 +759,7 @@ def _render_table(canvas: _PdfCanvas, component: dict[str, Any], sample: dict[st
             size=5.4,
             bold=True,
             color="#ffffff",
+            align=align,
             width_mm=max(3, width - 2.2),
             min_size=4.0,
         )
