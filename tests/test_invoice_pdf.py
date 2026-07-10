@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date
 
-from app.invoice_generator import generate_invoice_samples
+from app.invoice_generator import generate_invoice, generate_invoice_samples
 from app.invoice_pdf import _PdfCanvas, _money, _text_width, render_invoice_pdf
 
 
@@ -37,6 +37,23 @@ class InvoicePdfTests(unittest.TestCase):
 
         self.assertIn(samples[0]["data"]["seller"]["name"].encode("latin-1"), content)
         self.assertIn(samples[0]["data"]["invoice_number"].encode("latin-1"), content)
+
+    def test_pdf_renders_invoice_number_occlusion_stamp(self) -> None:
+        sample = generate_invoice(
+            template_slug="ledger-clean",
+            paper_slug="a4",
+            seed=123,
+            variation_index=17,
+            today=date(2026, 7, 7),
+        )
+
+        content = render_invoice_pdf([sample])
+
+        self.assertIn(b"APPROVED", content)
+        self.assertEqual(
+            sample["data"]["visual_artifacts"][-1]["scenario"],
+            "invoice_number_seal_occlusion",
+        )
 
     def test_pdf_terms_and_footer_render_distinct_copy(self) -> None:
         samples = generate_invoice_samples(

@@ -45,6 +45,24 @@ PAPER_ALIASES = {
 
 MONEY_QUANT = Decimal("0.01")
 OVERLAP_RESOLUTION_MAX_ITERATIONS = 200
+PDF_OCCLUSION_EDGE_CASE_START_INDEX = 15
+
+AP_EDGE_CASE_SCENARIOS: tuple[str, ...] = (
+    "none",
+    "split_po_partial_billing",
+    "amount_variance_within_tolerance",
+    "amount_variance_above_tolerance",
+    "duplicate_invoice_number_normalized",
+    "missing_po_implied_match",
+    "vendor_bank_detail_changed",
+    "credit_memo_negative_balance",
+)
+
+VISUAL_EDGE_CASE_SCENARIOS: tuple[str, ...] = (
+    "none",
+    "table_amount_boundary_collision",
+    "invoice_number_seal_occlusion",
+)
 
 FONT_STYLES: tuple[str, ...] = (
     "system",
@@ -941,7 +959,7 @@ def generate_invoice(
     components = _layout_components(template, paper, data, rng)
     components, data = _optimize_for_paper(template, paper, components, data)
     font_style = FONT_STYLES[(_template_index(template) + variation_index) % len(FONT_STYLES)]
-    return {
+    sample = {
         "id": f"{template.slug}-{paper.slug}-{seed}-{variation_index}",
         "paper": {
             "slug": paper.slug,
@@ -964,8 +982,10 @@ def generate_invoice(
         },
         "data": data,
         "components": [component.copy() for component in components],
-        "layout_score": _layout_score(paper, components, data),
     }
+    _apply_generation_edge_cases(sample, variation_index)
+    sample["layout_score"] = _layout_score(paper, sample["components"], sample["data"])
+    return sample
 
 
 def _paper(slug: str) -> PaperFormat:
@@ -1216,6 +1236,428 @@ def _footer_note(template: TemplateProfile, rng: random.Random) -> str:
         "Billing record prepared for account review.",
     ]
     return rng.choice(options)
+
+
+def _apply_generation_edge_cases(sample: dict[str, Any], variation_index: int) -> None:
+    ap_scenario = AP_EDGE_CASE_SCENARIOS[variation_index % len(AP_EDGE_CASE_SCENARIOS)]
+    _apply_ap_edge_case(sample, ap_scenario)
+
+    visual_scenario = VISUAL_EDGE_CASE_SCENARIOS[variation_index % len(VISUAL_EDGE_CASE_SCENARIOS)]
+    if visual_scenario == "table_amount_boundary_collision":
+        _apply_table_boundary_collision(sample)
+    elif (
+        visual_scenario == "invoice_number_seal_occlusion"
+        and variation_index >= PDF_OCCLUSION_EDGE_CASE_START_INDEX
+    ):
+        _add_invoice_number_occlusion(sample, kind="stamp")
+
+
+def _apply_ap_edge_case(sample: dict[str, Any], scenario: str) -> None:
+    if scenario == "none":
+        return
+    if scenario == "split_po_partial_billing":
+        _apply_split_po_partial_billing(sample)
+    elif scenario == "amount_variance_within_tolerance":
+        _apply_amount_variance(
+            sample,
+            scenario=scenario,
+            shipping=Decimal("60.00"),
+            status="Within tolerance",
+            expected_decision="approve_with_tolerance",
+            note="Freight variance is inside the 2 percent PO tolerance.",
+        )
+    elif scenario == "amount_variance_above_tolerance":
+        _apply_amount_variance(
+            sample,
+            scenario=scenario,
+            shipping=Decimal("125.00"),
+            status="Over tolerance",
+            expected_decision="route_over_tolerance_review",
+            note="Freight variance exceeds the 2 percent PO tolerance.",
+        )
+    elif scenario == "duplicate_invoice_number_normalized":
+        _apply_duplicate_invoice_number(sample)
+    elif scenario == "missing_po_implied_match":
+        _apply_missing_po_implied_match(sample)
+    elif scenario == "vendor_bank_detail_changed":
+        _apply_vendor_bank_detail_changed(sample)
+    elif scenario == "credit_memo_negative_balance":
+        _apply_credit_memo_negative_balance(sample)
+
+
+def _apply_split_po_partial_billing(sample: dict[str, Any]) -> None:
+    data = sample["data"]
+    _force_invoice_amounts(data, subtotal=Decimal("4000.00"))
+    data["purchase_order"] = "PO-10000-PART"
+    data["status"] = "Partial billing"
+    data["notes"] = "Invoice is below the remaining PO balance and should partially consume the PO."
+    _record_edge_case(
+        data,
+        {
+            "kind": "accounts_payable",
+            "scenario": "split_po_partial_billing",
+            "challenge_tags": ["partial_po_consumption", "split_po_billing"],
+            "context": {
+                "po_number": data["purchase_order"],
+                "po_authorized_total": "10000.00",
+                "po_previously_consumed": "3000.00",
+                "po_remaining_before_invoice": "7000.00",
+                "invoice_total": _edge_money(data["total"]),
+            },
+            "expected": {
+                "decision": "approve_partial_consumption",
+                "remaining_after_invoice": "3000.00",
+                "explanation": "Do not reject a partial invoice when it is within remaining PO balance.",
+            },
+        },
+    )
+
+
+def _apply_amount_variance(
+    sample: dict[str, Any],
+    *,
+    scenario: str,
+    shipping: Decimal,
+    status: str,
+    expected_decision: str,
+    note: str,
+) -> None:
+    data = sample["data"]
+    po_total = Decimal("5000.00")
+    _force_invoice_amounts(data, subtotal=po_total, shipping=shipping)
+    data["purchase_order"] = "PO-5000-TOL"
+    data["status"] = status
+    data["notes"] = note
+    variance = _round_money(Decimal(str(data["total"])) - po_total)
+    tolerance_amount = _round_money(po_total * Decimal("0.02"))
+    _record_edge_case(
+        data,
+        {
+            "kind": "accounts_payable",
+            "scenario": scenario,
+            "challenge_tags": ["po_amount_variance", "tolerance_policy"],
+            "context": {
+                "po_number": data["purchase_order"],
+                "po_authorized_total": _edge_money(po_total),
+                "invoice_total": _edge_money(data["total"]),
+                "variance_amount": _edge_money(variance),
+                "tolerance_percent": "2.00",
+                "tolerance_amount": _edge_money(tolerance_amount),
+            },
+            "expected": {
+                "decision": expected_decision,
+                "explanation": "Compare variance against policy tolerance before treating the invoice as overbilling.",
+            },
+        },
+    )
+
+
+def _apply_duplicate_invoice_number(sample: dict[str, Any]) -> None:
+    data = sample["data"]
+    original_invoice_number = str(data["invoice_number"])
+    data["invoice_number"] = "1045"
+    data["status"] = "Duplicate review"
+    data["notes"] = "Invoice number formatting differs from a prior vendor invoice with the same date and total."
+    _record_edge_case(
+        data,
+        {
+            "kind": "accounts_payable",
+            "scenario": "duplicate_invoice_number_normalized",
+            "challenge_tags": ["duplicate_invoice", "invoice_number_normalization"],
+            "context": {
+                "prior_invoice": {
+                    "invoice_number": "INV-1045",
+                    "normalized_invoice_number": "1045",
+                    "vendor_name": data["seller"]["name"],
+                    "issue_date": data["issue_date"],
+                    "total": _edge_money(data["total"]),
+                },
+                "new_invoice": {
+                    "invoice_number": data["invoice_number"],
+                    "normalized_invoice_number": "1045",
+                    "vendor_name": data["seller"]["name"],
+                    "issue_date": data["issue_date"],
+                    "total": _edge_money(data["total"]),
+                    "generated_invoice_number": original_invoice_number,
+                },
+            },
+            "expected": {
+                "decision": "flag_possible_duplicate",
+                "explanation": "Normalize invoice numbers before duplicate checks.",
+            },
+        },
+    )
+
+
+def _apply_missing_po_implied_match(sample: dict[str, Any]) -> None:
+    data = sample["data"]
+    candidate_po = "PO-IMPLIED-7421"
+    original_po = str(data["purchase_order"])
+    data["purchase_order"] = ""
+    data["status"] = "PO review"
+    data["notes"] = "No PO is printed, but vendor, amount, line details, and service period match one open PO."
+    _record_edge_case(
+        data,
+        {
+            "kind": "accounts_payable",
+            "scenario": "missing_po_implied_match",
+            "challenge_tags": ["missing_po_reference", "implied_po_match"],
+            "context": {
+                "missing_purchase_order": True,
+                "generated_purchase_order": original_po,
+                "candidate_open_po": {
+                    "po_number": candidate_po,
+                    "vendor_name": data["seller"]["name"],
+                    "authorized_total": _edge_money(data["total"]),
+                    "remaining_balance": _edge_money(data["total"]),
+                    "service_period": _service_period(data),
+                    "matching_line_description": _first_line_description(data),
+                },
+            },
+            "expected": {
+                "decision": "suggest_candidate_and_route_review",
+                "candidate_po_number": candidate_po,
+                "explanation": "Suggest the likely PO, but require review because the invoice omits the PO reference.",
+            },
+        },
+    )
+
+
+def _apply_vendor_bank_detail_changed(sample: dict[str, Any]) -> None:
+    data = sample["data"]
+    payment = dict(data["payment"])
+    approved_account = "**** 1842"
+    changed_account = "**** 9901" if payment.get("account") != "**** 9901" else "**** 6627"
+    payment["account"] = changed_account
+    payment["method"] = "Wire transfer"
+    data["payment"] = payment
+    data["purchase_order"] = "PO-BANK-7750"
+    data["status"] = "Bank review"
+    data["notes"] = "PO and amount match, but the remittance account differs from the approved vendor master."
+    _record_edge_case(
+        data,
+        {
+            "kind": "accounts_payable",
+            "scenario": "vendor_bank_detail_changed",
+            "challenge_tags": ["vendor_bank_change", "fraud_risk"],
+            "context": {
+                "po_number": data["purchase_order"],
+                "po_match": True,
+                "amount_match": True,
+                "vendor_master": {
+                    "vendor_name": data["seller"]["name"],
+                    "approved_bank_account": approved_account,
+                },
+                "invoice_payment": {
+                    "bank_account": changed_account,
+                    "remit_to": payment["remit_to"],
+                },
+            },
+            "expected": {
+                "decision": "block_or_escalate",
+                "explanation": "Bank detail changes should override an otherwise valid PO and amount match.",
+            },
+        },
+    )
+
+
+def _apply_credit_memo_negative_balance(sample: dict[str, Any]) -> None:
+    data = sample["data"]
+    labels = dict(data.get("labels", {}))
+    original_invoice_number = str(data["invoice_number"])
+    credit_amount = Decimal("250.00")
+    _force_invoice_amounts(data, subtotal=-credit_amount)
+    labels.update(
+        {
+            "document_title": "Credit Memo",
+            "invoice_number": "Credit Memo No.",
+            "purchase_order": "Related PO",
+            "status": "Credit Status",
+            "subtotal": "Credit Subtotal",
+            "paid": "Applied Credit",
+            "balance_due": "Credit Balance",
+        }
+    )
+    data["labels"] = labels
+    data["invoice_number"] = f"CM-{original_invoice_number.lstrip('#')}"
+    data["purchase_order"] = "PO-CREDIT-4100"
+    data["status"] = "Credit pending"
+    data["notes"] = "Credit memo generated from an overpayment; negative lines should not be treated as payable charges."
+    _record_edge_case(
+        data,
+        {
+            "kind": "accounts_payable",
+            "scenario": "credit_memo_negative_balance",
+            "challenge_tags": [
+                "credit_memo",
+                "negative_invoice",
+                "negative_line_items",
+                "overpayment_credit",
+            ],
+            "context": {
+                "related_invoice_number": original_invoice_number,
+                "related_po_number": data["purchase_order"],
+                "credit_amount": _edge_money(credit_amount),
+                "overpayment_amount": _edge_money(credit_amount),
+                "subtotal": _edge_money(data["subtotal"]),
+                "total": _edge_money(data["total"]),
+                "balance_due": _edge_money(data["balance_due"]),
+                "has_negative_line_items": True,
+            },
+            "expected": {
+                "decision": "apply_credit_or_route_review",
+                "explanation": "Credit memos and overpayments should reduce open liability or route to review, not create a payable invoice.",
+            },
+        },
+    )
+
+
+def _apply_table_boundary_collision(sample: dict[str, Any]) -> None:
+    table_component = _first_component(sample, "items-table")
+    if not table_component:
+        return
+    data = sample["data"]
+    table = dict(data.get("table", {}))
+    rows = len(data.get("items", [])) + (1 if table.get("total_in_table") else 0)
+    header_height = 6.4 if table_component["height_mm"] > 40 else 4.5
+    compressed_height = header_height + (max(1, rows) * 3.65)
+    table_component["height_mm"] = round(min(table_component["height_mm"], compressed_height), 2)
+    table["visual_density"] = "amount_boundary_collision"
+    data["table"] = table
+    _record_visual_artifact(
+        data,
+        {
+            "scenario": "table_amount_boundary_collision",
+            "target": "amount_column",
+            "effect": "numeric text sits close to or crosses table rules",
+        },
+    )
+
+
+def _add_invoice_number_occlusion(sample: dict[str, Any], *, kind: str) -> None:
+    meta_component = _first_component(sample, "invoice-meta")
+    if not meta_component:
+        return
+    width = 28 if kind == "stamp" else 18
+    height = 12 if kind == "stamp" else 18
+    paper_width = float(sample["paper"]["width_mm"])
+    x = min(paper_width - width - 4, meta_component["x_mm"] + (meta_component["width_mm"] * 0.56))
+    y = max(0.0, meta_component["y_mm"] + 0.8)
+    sample["components"].append(
+        _component(
+            kind,
+            x,
+            y,
+            width,
+            height,
+            priority=9,
+            optional=True,
+            variant="invoice-number-occlusion",
+        )
+    )
+    _record_visual_artifact(
+        sample["data"],
+        {
+            "scenario": "invoice_number_seal_occlusion",
+            "target": "invoice_number",
+            "effect": f"{kind} covers part of the invoice number",
+        },
+    )
+
+
+def _force_invoice_amounts(
+    data: dict[str, Any],
+    *,
+    subtotal: Decimal,
+    discount: Decimal = Decimal("0.00"),
+    tax_rate: Decimal = Decimal("0.00"),
+    shipping: Decimal = Decimal("0.00"),
+    paid: Decimal = Decimal("0.00"),
+) -> None:
+    subtotal_amount = _round_money(subtotal)
+    discount_amount = _round_money(discount)
+    taxable_amount = _round_money(subtotal_amount - discount_amount)
+    tax_rate_amount = _decimal_money(tax_rate)
+    tax_amount = _round_money(taxable_amount * tax_rate_amount)
+    shipping_amount = _round_money(shipping)
+    total_amount = _round_money(taxable_amount + tax_amount + shipping_amount)
+    paid_amount = _round_money(paid)
+    balance_due_amount = _round_money(total_amount - paid_amount)
+    _scale_line_items_to_subtotal(data.get("items", []), subtotal_amount)
+    data["subtotal"] = _money_float(subtotal_amount)
+    data["discount"] = _money_float(discount_amount)
+    data["tax_rate"] = float(tax_rate_amount)
+    data["tax"] = _money_float(tax_amount)
+    data["shipping"] = _money_float(shipping_amount)
+    data["paid"] = _money_float(paid_amount)
+    data["total"] = _money_float(total_amount)
+    data["balance_due"] = _money_float(balance_due_amount)
+    data["total_quantity"] = sum(int(item["quantity"]) for item in data.get("items", []))
+
+
+def _scale_line_items_to_subtotal(items: list[dict[str, Any]], subtotal: Decimal) -> None:
+    if not items:
+        return
+    current_total = _round_money(sum(_decimal_money(item.get("amount", 0)) for item in items))
+    remaining = _round_money(subtotal)
+    equal_weight = Decimal("1") / Decimal(len(items))
+    for index, item in enumerate(items):
+        if index == len(items) - 1:
+            amount = remaining
+        elif current_total > 0:
+            amount = _round_money(subtotal * (_decimal_money(item.get("amount", 0)) / current_total))
+            remaining = _round_money(remaining - amount)
+        else:
+            amount = _round_money(subtotal * equal_weight)
+            remaining = _round_money(remaining - amount)
+        item["quantity"] = 1
+        item["quantity_display"] = "1 ea"
+        unit_price = _round_money(amount)
+        item["unit_price"] = _money_float(unit_price)
+        item["amount"] = _money_float(unit_price)
+        item["taxable_amount"] = _money_float(unit_price)
+
+
+def _record_edge_case(data: dict[str, Any], edge_case: dict[str, Any]) -> None:
+    edge_cases = data.get("edge_cases")
+    if not isinstance(edge_cases, list):
+        edge_cases = []
+    edge_cases.append(edge_case)
+    data["edge_cases"] = edge_cases
+    if edge_case.get("kind") == "accounts_payable":
+        data["ap_context"] = edge_case
+
+
+def _record_visual_artifact(data: dict[str, Any], artifact: dict[str, Any]) -> None:
+    artifacts = data.get("visual_artifacts")
+    if not isinstance(artifacts, list):
+        artifacts = []
+    artifacts.append(artifact)
+    data["visual_artifacts"] = artifacts
+
+
+def _first_component(sample: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    return next((component for component in sample.get("components", []) if component["kind"] == kind), None)
+
+
+def _first_line_description(data: dict[str, Any]) -> str:
+    first_item = next(iter(data.get("items", [])), {})
+    return str(first_item.get("description") or first_item.get("name") or "")
+
+
+def _service_period(data: dict[str, Any]) -> dict[str, str]:
+    dates = sorted(
+        str(item["service_date"])
+        for item in data.get("items", [])
+        if item.get("service_date")
+    )
+    if not dates:
+        return {"start": data["issue_date"], "end": data["issue_date"]}
+    return {"start": dates[0], "end": dates[-1]}
+
+
+def _edge_money(value: object) -> str:
+    return str(_round_money(value))
 
 
 def _layout_components(
@@ -1690,7 +2132,9 @@ def _fallback_overlap_y(
 
 
 def _is_decorative_component(component: dict[str, Any]) -> bool:
-    return component["kind"] in {"accent-band", "accent-rail", "watermark"}
+    if component["kind"] in {"accent-band", "accent-rail", "watermark"}:
+        return True
+    return component["kind"] == "stamp" and component.get("variant") == "invoice-number-occlusion"
 
 
 def _rectangles_overlap(first: dict[str, Any], second: dict[str, Any]) -> bool:

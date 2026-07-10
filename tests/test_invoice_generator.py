@@ -5,8 +5,10 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
 from app.invoice_generator import (
+    AP_EDGE_CASE_SCENARIOS,
     BASE_TEMPLATES,
     PAPER_FORMATS,
+    _is_decorative_component,
     _resolve_non_decorative_overlaps,
     generate_invoice,
     generate_invoice_samples,
@@ -294,7 +296,7 @@ class InvoiceGeneratorTests(unittest.TestCase):
             template_slug="ledger-clean",
             paper_slug="a4",
             seed=123,
-            variation_index=7,
+            variation_index=22,
             today=date(2026, 7, 7),
         )
         html = invoice_samples_page(
@@ -310,6 +312,82 @@ class InvoiceGeneratorTests(unittest.TestCase):
         self.assertIn("schema-receipt-lines", html)
         self.assertIn("<td class=\"number invoice-col-line\"></td>", html)
         self.assertIn('<td class="invoice-col-item_plain"><strong>AMOUNT LEFT</strong>', html)
+
+    def test_default_samples_include_credit_memo_edge_case(self) -> None:
+        samples = generate_invoice_samples(
+            paper_slug="a4",
+            count=15,
+            seed=500,
+            today=date(2026, 7, 7),
+        )
+
+        scenarios = {
+            sample["data"].get("ap_context", {}).get("scenario", "none")
+            for sample in samples
+        }
+
+        self.assertIn("credit_memo_negative_balance", scenarios)
+
+    def test_count_60_covers_all_ap_edge_case_scenarios(self) -> None:
+        samples = generate_invoice_samples(
+            paper_slug="a4",
+            count=60,
+            seed=500,
+            today=date(2026, 7, 7),
+        )
+
+        scenarios = {
+            sample["data"].get("ap_context", {}).get("scenario", "none")
+            for sample in samples
+        }
+
+        self.assertTrue(set(AP_EDGE_CASE_SCENARIOS).issubset(scenarios))
+
+    def test_credit_memo_has_negative_lines_and_apply_credit_decision(self) -> None:
+        invoice = generate_invoice(
+            template_slug="ledger-clean",
+            paper_slug="a4",
+            seed=123,
+            variation_index=7,
+            today=date(2026, 7, 7),
+        )
+        data = invoice["data"]
+        ap_context = data["ap_context"]
+
+        self.assertEqual(data["labels"]["document_title"], "Credit Memo")
+        self.assertTrue(data["invoice_number"].startswith("CM-"))
+        self.assertLess(_money_decimal(data["subtotal"]), 0)
+        self.assertLess(_money_decimal(data["balance_due"]), 0)
+        self.assertEqual(ap_context["scenario"], "credit_memo_negative_balance")
+        self.assertEqual(ap_context["expected"]["decision"], "apply_credit_or_route_review")
+        self.assertTrue(all(_money_decimal(item["amount"]) < 0 for item in data["items"]))
+        for item in data["items"]:
+            row_total = _money_round(_money_decimal(item["quantity"]) * _money_decimal(item["unit_price"]))
+            self.assertEqual(row_total, _money_decimal(item["amount"]))
+
+    def test_invoice_number_occlusion_stamp_is_decorative_overlap(self) -> None:
+        invoice = generate_invoice(
+            template_slug="ledger-clean",
+            paper_slug="a4",
+            seed=123,
+            variation_index=17,
+            today=date(2026, 7, 7),
+        )
+        invoice_meta = next(
+            component for component in invoice["components"] if component["kind"] == "invoice-meta"
+        )
+        occlusion_stamp = next(
+            component
+            for component in invoice["components"]
+            if component["kind"] == "stamp" and component.get("variant") == "invoice-number-occlusion"
+        )
+
+        self.assertTrue(_rectangles_overlap(invoice_meta, occlusion_stamp))
+        self.assertTrue(_is_decorative_component(occlusion_stamp))
+        self.assertEqual(
+            invoice["data"]["visual_artifacts"][-1]["scenario"],
+            "invoice_number_seal_occlusion",
+        )
 
     def test_horizontal_split_formats_trim_rows_and_optional_components(self) -> None:
         full = generate_invoice(
