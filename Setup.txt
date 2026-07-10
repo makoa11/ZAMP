@@ -1,0 +1,48 @@
+  # Setup
+  python3 -m venv .venv
+  .venv/bin/python -m pip install -r requirements.txt
+
+  # Generate secrets for .env
+  .venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  .venv/bin/python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+  # Run backend
+  .venv/bin/python main.py
+
+  # Generate the default diverse parser corpus: 150 standard PDFs, 100 stress PDFs, plus manifests
+  .venv/bin/python -m app.generate_test_pdfs
+
+.venv/bin/python -m app.generate_test_pdfs --seed 1000 --date 2026-07-10
+ .venv/bin/python scripts/seed_company_invoice_data.py --manifest-dir storage/test_pdfs  --batch-id parser-test  
+
+  # Generate a smaller quick corpus when needed
+  .venv/bin/python -m app.generate_test_pdfs --pdf-count 50
+
+  # Generate with custom output/seed/date
+  .venv/bin/python -m app.generate_test_pdfs --output-dir storage/test_pdfs --pdf-count 50 --seed 1000 --date YYYY-MM-DD
+
+  # Parse generated PDFs to JSON and overlay PDFs
+  .venv/bin/python scripts/parse_test_pdfs.py
+  .venv/bin/python scripts/parse_test_pdfs.py --limit 10
+  .venv/bin/python scripts/parse_test_pdfs.py --input-dir storage/test_pdfs --output-dir storage/parsed --boxes parsed
+  .venv/bin/python scripts/parse_test_pdfs.py --input-dir storage/test_pdfs --output-dir storage/parsed --boxes words
+  .venv/bin/python scripts/parse_test_pdfs.py --input-dir storage/test_pdfs --output-dir storage/parsed --boxes all
+
+  # Plot boxes on one PDF
+  .venv/bin/python -m app.invoice_overlay storage/test_pdfs/invoice-sample-0001-a4-ledger-clean.pdf storage/parsed/invoice-sample-0001-a4-ledger-clean.parsed.pdf
+  .venv/bin/python -m app.invoice_overlay storage/test_pdfs/invoice-sample-0001-a4-ledger-clean.pdf storage/parsed/invoice-sample-0001-a4-ledger-clean.words.pdf --boxes words
+  .venv/bin/python -m app.invoice_overlay storage/test_pdfs/invoice-sample-0001-a4-ledger-clean.pdf storage/parsed/invoice-sample-0001-a4-ledger-clean.all.pdf --boxes all
+
+  # Run mail ingestion worker
+  .venv/bin/python -m app.mail_worker
+  .venv/bin/python -m app.mail_worker --once --limit 10
+
+  # Run tests
+  .venv/bin/python -m unittest
+  .venv/bin/python -m unittest tests.test_invoice_generator
+  .venv/bin/python -m unittest tests.test_generate_test_pdfs
+  .venv/bin/python -m unittest tests.test_invoice_parser
+  .venv/bin/python -m unittest tests.test_invoice_overlay
+  .venv/bin/python -m unittest tests.test_invoice_pdf
+
+  Important: scripts/parse_test_pdfs.py scans every PDF in the input directory, including standard samples and stress fixtures.

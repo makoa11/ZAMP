@@ -19,6 +19,7 @@ MAIL_JOB_TYPES = {
     "outlook_message_fetch",
     "outlook_delta_sync",
     "renew_mail_subscriptions",
+    "parse_pdf",
 }
 
 GMAIL_PDF_FALLBACK_QUERY = "newer_than:1d has:attachment filename:pdf"

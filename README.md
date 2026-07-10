@@ -43,38 +43,39 @@ Signup is available at `http://127.0.0.1:8000/signup`.
 Synthetic invoice layout samples are available at `http://127.0.0.1:8000/invoice-samples`.
 The generator exposes full A4, A4/2 horizontal, and A4/3 horizontal paper formats, with 15 base templates and seeded JSON output at `/api/invoices/samples`.
 PDF output is available at `/api/invoices/samples.pdf` with the same `paper`, `template`, `count`, and `seed` query parameters.
-To save all three paper variations as local test files, run:
+To generate the local parser test corpus, run:
 
 ```bash
 .venv/bin/python -m app.generate_test_pdfs
 ```
 
-This writes `invoice-samples-a4.pdf`, `invoice-samples-a4-half-horizontal.pdf`, and `invoice-samples-a4-third-horizontal.pdf` to `storage/test_pdfs`.
-To save a specific number of individual one-invoice PDFs, use `--pdf-count`; files rotate through all three paper variations:
+By default this writes 250 PDFs and 250 expected-output manifests to `storage/test_pdfs`: 150 diverse one-invoice PDFs plus 100 stress PDFs. The standard PDFs cover every A4/A4-half/A4-third paper and base-template pairing at least three times, while repeat rounds shift capture profiles, fonts, currencies, date formats, table schemas, invoice number styles, labels, totals placement, amounts, and invoice dates.
+The stress PDFs cycle through multi-page invoices, line-item tables continued across pages, notes/footers close to table bounds, side-panel totals, table-row totals, ambiguous entity labels such as `Account`, `To`, `Source`, and `Entity`, and glyph-sensitive currency rendering. Stress filenames are sequenced by fixture family, for example `invoice-stress-0001-multipage-continuation.pdf`.
+
+Use the smaller override only when you need a quick local run:
 
 ```bash
 .venv/bin/python -m app.generate_test_pdfs --pdf-count 50
-.venv/bin/python -m app.generate_test_pdfs --pdf-count 200
 ```
 
-Add `--write-manifests` to write an expected-output JSON sidecar for each PDF:
+The remaining generator options are for reproducibility and output location:
 
 ```bash
-.venv/bin/python -m app.generate_test_pdfs --pdf-count 50 --write-manifests
+.venv/bin/python -m app.generate_test_pdfs --output-dir storage/test_pdfs --seed 1000 --date YYYY-MM-DD
 ```
 
-Parser stress fixtures are available for cases that are hard to evaluate visually: multi-page invoices, line-item tables continued across pages, notes/footers close to table bounds, side-panel totals, table-row totals, ambiguous entity labels such as `Account`, `To`, `Source`, and `Entity`, and glyph-sensitive currency rendering:
-
-```bash
-.venv/bin/python -m app.generate_test_pdfs --stress-cases --write-manifests
-```
-
-`--stress-cases` is a separate fixture suite and cannot be combined with `--pdf-count`.
-
-Each manifest records normalized invoice fields, rendered display values, line items, total placement, page/table continuation metadata, key component bounding boxes, and challenge tags so parser output can be compared automatically.
+Each manifest records normalized invoice fields, rendered display values, line items, total placement, page/table continuation metadata, key component bounding boxes, and challenge tags so parser output can be compared automatically. Standard manifests also include AP edge-case metadata when generated, including `edge_cases`, `ap_context`, and AP challenge tags such as `partial_po_consumption` and `split_po_billing`.
 
 Each generated model includes positioned invoice components such as `company-header`, `invoice-meta`, `items-table`, `totals`, and optional payment or footer blocks. The `company-header` component carries a header variant such as centered, no-line, boxed, banded, receipt, rail, or minimal.
 Generated samples also vary capture-sensitive content: compact date strings such as `DDMMYYYY`, `DDMMYY`, and `MMDDYYYY`; invoice number styles; currencies including USD, INR, EUR, GBP, AED, SGD, and others; decimal/no-decimal amount rendering; table schemas; and alternate labels such as left balance, remaining payment, billed amount, pay by, settle by, and amount open.
+
+To visualize parser evidence boxes on top of a PDF, generate a highlighted overlay PDF:
+
+```bash
+.venv/bin/python -m app.invoice_overlay storage/test_pdfs/invoice-sample-0001-a4-ledger-clean.pdf /tmp/invoice-sample-0001-parsed.pdf
+```
+
+The output keeps the original PDF pages and appends transparent yellow rectangle overlays. By default it highlights accepted parsed field evidence only. Use `--boxes words` to highlight every extracted text word box, or `--boxes all` to include both parser evidence and word geometry.
 Some full A4 layouts place the payable total as the last row of the item table, with total quantity populated, the rate cell intentionally blank, and the amount cell using the final payable value. Currency can render as a code or a symbol such as `$`, `Rs`, `€`, `£`, `¥`, `A$`, or `S$`.
 Template metadata also includes `font_style`, and rendered samples rotate through system, serif, slab, mono, condensed, rounded, formal, industrial, humanist, geometric, courier, book, narrow, typewriter, and neo-grotesque font stacks.
 
@@ -154,4 +155,4 @@ Run the ingestion worker:
 .venv/bin/python -m app.mail_worker
 ```
 
-The worker claims provider jobs, refreshes OAuth tokens when needed, renews Gmail watches and Outlook subscriptions hourly, and enqueues polling fallback jobs every 15 minutes by default. PDFs are saved only when the signed-in user has added dashboard regex patterns and a pattern matches the PDF filename, subject, or body/snippet. The dashboard can generate a regex from a sample filename or dropped local PDF name. PDFs are stored under `MAIL_PDF_STORAGE_DIR` as SHA-256-named files; Postgres stores account, message, attachment, file, webhook event, job, and invoice matching metadata. Saved PDFs enqueue `parse_pdf` jobs, but OCR/parsing is intentionally left for the later parser worker.
+The worker claims provider jobs, refreshes OAuth tokens when needed, renews Gmail watches and Outlook subscriptions hourly, and enqueues polling fallback jobs every 15 minutes by default. PDFs are saved only when the signed-in user has added dashboard regex patterns and a pattern matches the PDF filename, subject, or body/snippet. The dashboard can generate a regex from a sample filename or dropped local PDF name. PDFs are stored under `MAIL_PDF_STORAGE_DIR` as SHA-256-named files; Postgres stores account, message, attachment, file, webhook event, active/retry/failed job state, lightweight job dedupe keys, invoice matching metadata, and static parse results. Saved PDFs enqueue `parse_pdf` jobs that run the non-OCR text-layer invoice parser.

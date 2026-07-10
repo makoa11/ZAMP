@@ -391,6 +391,48 @@ class InvoiceGeneratorTests(unittest.TestCase):
             row_total = _money_round(_money_decimal(item["quantity"]) * _money_decimal(item["unit_price"]))
             self.assertEqual(row_total, _money_decimal(item["amount"]))
 
+    def test_split_po_partial_billing_records_ap_context(self) -> None:
+        invoice = generate_invoice(
+            template_slug="ledger-clean",
+            paper_slug="a4-half-horizontal",
+            seed=123,
+            variation_index=1,
+            today=date(2026, 7, 7),
+        )
+        data = invoice["data"]
+        ap_context = data["ap_context"]
+
+        self.assertEqual(ap_context["scenario"], "split_po_partial_billing")
+        self.assertEqual(data["purchase_order"], "PO-10000-PART")
+        self.assertEqual(_money_decimal(data["total"]), Decimal("4000.00"))
+        self.assertEqual(ap_context["context"]["po_authorized_total"], "10000.00")
+        self.assertEqual(ap_context["context"]["po_previously_consumed"], "3000.00")
+        self.assertEqual(ap_context["context"]["po_remaining_before_invoice"], "7000.00")
+        self.assertEqual(
+            ap_context["context"]["previous_related_document"]["invoice_number"],
+            "INV-PO10000-0001",
+        )
+        self.assertEqual(
+            ap_context["context"]["client_database"]["previous_related_documents"][0]["applied_to_po"],
+            "3000.00",
+        )
+        self.assertEqual(
+            ap_context["context"]["vendor_database"]["previous_related_documents"][0]["applied_to_po"],
+            "3000.00",
+        )
+        self.assertEqual(ap_context["expected"]["decision"], "approve_partial_consumption")
+        self.assertEqual(ap_context["expected"]["remaining_after_invoice"], "3000.00")
+        self.assertTrue(ap_context["expected"]["requires_client_vendor_match"])
+        self.assertNotIn("remaining PO balance", data["notes"])
+        self.assertNotIn("partially consume", data["notes"])
+        self.assertNotIn("INV-PO10000-0001", data["footer_note"])
+        self.assertNotIn("approve_partial_consumption", data["footer_note"])
+        self.assertNotIn("client/vendor match", data["footer_note"])
+        self.assertEqual(
+            ap_context["challenge_tags"],
+            ["partial_po_consumption", "split_po_billing"],
+        )
+
     def test_invoice_number_occlusion_stamp_is_decorative_overlap(self) -> None:
         invoice = generate_invoice(
             template_slug="ledger-clean",

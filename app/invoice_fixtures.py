@@ -107,16 +107,20 @@ def _manifest_document(
     )
     first_sample = sorted_pages[0][1]
     data = first_sample["data"]
+    samples = [sample for _, sample in sorted_pages]
     items = _combined_line_items([sample for _, sample in sorted_pages])
     pages_manifest = [_manifest_page(pdf_page_number, sample) for pdf_page_number, sample in sorted_pages]
     total_placement = _document_total_placement([sample for _, sample in sorted_pages])
+    edge_cases = _document_edge_cases(samples)
+    ap_context = _document_ap_context(samples)
     challenge_tags = _document_challenge_tags(
         data=data,
         pages=pages_manifest,
-        samples=[sample for _, sample in sorted_pages],
+        samples=samples,
+        edge_cases=edge_cases,
         total_placement=total_placement,
     )
-    return {
+    document = {
         "document_id": document_id,
         "sample_ids": [sample["id"] for _, sample in sorted_pages],
         "invoice_number": data["invoice_number"],
@@ -154,6 +158,11 @@ def _manifest_document(
         "pages": pages_manifest,
         "challenge_tags": challenge_tags,
     }
+    if edge_cases:
+        document["edge_cases"] = edge_cases
+    if ap_context is not None:
+        document["ap_context"] = ap_context
+    return document
 
 
 def _manifest_page(pdf_page_number: int, sample: dict[str, Any]) -> dict[str, Any]:
@@ -222,6 +231,7 @@ def _document_challenge_tags(
     data: dict[str, Any],
     pages: list[dict[str, Any]],
     samples: list[dict[str, Any]],
+    edge_cases: list[dict[str, Any]],
     total_placement: str,
 ) -> list[str]:
     tags = {
@@ -230,6 +240,7 @@ def _document_challenge_tags(
         for tag in _fixture_meta(sample).get("challenge_tags", [])
         if isinstance(tag, str)
     }
+    tags.update(_edge_case_challenge_tags(edge_cases))
     if len(pages) > 1:
         tags.add("multi_page_invoice")
     if any(page["table_continues_from_previous_page"] or page["table_continues_after_page"] for page in pages):
@@ -250,6 +261,48 @@ def _document_challenge_tags(
     if _uses_localized_money_separator(data):
         tags.add("localized_decimal_separator")
     return sorted(tags)
+
+
+def _document_edge_cases(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    edge_cases: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for sample in samples:
+        data = sample.get("data") if isinstance(sample.get("data"), dict) else {}
+        sample_edge_cases = data.get("edge_cases")
+        if not isinstance(sample_edge_cases, list):
+            continue
+        for edge_case in sample_edge_cases:
+            if not isinstance(edge_case, dict):
+                continue
+            stable_key = json.dumps(
+                edge_case,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if stable_key in seen:
+                continue
+            seen.add(stable_key)
+            edge_cases.append(copy.deepcopy(edge_case))
+    return edge_cases
+
+
+def _document_ap_context(samples: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for sample in samples:
+        data = sample.get("data") if isinstance(sample.get("data"), dict) else {}
+        ap_context = data.get("ap_context")
+        if isinstance(ap_context, dict):
+            return copy.deepcopy(ap_context)
+    return None
+
+
+def _edge_case_challenge_tags(edge_cases: list[dict[str, Any]]) -> set[str]:
+    tags: set[str] = set()
+    for edge_case in edge_cases:
+        challenge_tags = edge_case.get("challenge_tags", [])
+        if not isinstance(challenge_tags, list):
+            continue
+        tags.update(tag for tag in challenge_tags if isinstance(tag, str))
+    return tags
 
 
 def _entity_manifest(entity: dict[str, Any]) -> dict[str, Any]:

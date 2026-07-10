@@ -67,6 +67,12 @@ class MailIntegration:
         return self._outlook
 
     @property
+    def storage(self) -> PdfStorage:
+        self.ensure_ready()
+        assert self._storage is not None
+        return self._storage
+
+    @property
     def token_manager(self) -> TokenManager:
         self.ensure_ready()
         assert self._token_manager is not None

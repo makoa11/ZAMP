@@ -1290,7 +1290,18 @@ def _apply_split_po_partial_billing(sample: dict[str, Any]) -> None:
     _force_invoice_amounts(data, subtotal=Decimal("4000.00"))
     data["purchase_order"] = "PO-10000-PART"
     data["status"] = "Partial billing"
-    data["notes"] = "Invoice is below the remaining PO balance and should partially consume the PO."
+    data["notes"] = "Services billed under the purchase order shown above."
+    previous_related_document = _partial_billing_previous_document(data)
+    client_database_document = {
+        **previous_related_document,
+        "database": "client_ap",
+        "document_id": "client-ap-PO-10000-PART-0001",
+    }
+    vendor_database_document = {
+        **previous_related_document,
+        "database": "vendor_ar",
+        "document_id": "vendor-ar-PO-10000-PART-0001",
+    }
     _record_edge_case(
         data,
         {
@@ -1303,14 +1314,64 @@ def _apply_split_po_partial_billing(sample: dict[str, Any]) -> None:
                 "po_previously_consumed": "3000.00",
                 "po_remaining_before_invoice": "7000.00",
                 "invoice_total": _edge_money(data["total"]),
+                "previous_related_document": {
+                    "invoice_number": previous_related_document["invoice_number"],
+                    "purchase_order": previous_related_document["purchase_order"],
+                    "applied_to_po": previous_related_document["applied_to_po"],
+                    "client_document_id": client_database_document["document_id"],
+                    "vendor_document_id": vendor_database_document["document_id"],
+                    "matched_on": [
+                        "purchase_order",
+                        "vendor_name",
+                        "buyer_name",
+                        "invoice_total",
+                    ],
+                },
+                "client_database": {
+                    "purchase_order": {
+                        "po_number": data["purchase_order"],
+                        "authorized_total": "10000.00",
+                        "previously_consumed": "3000.00",
+                        "remaining_before_invoice": "7000.00",
+                    },
+                    "previous_related_documents": [client_database_document],
+                },
+                "vendor_database": {
+                    "purchase_order": {
+                        "po_number": data["purchase_order"],
+                        "authorized_total": "10000.00",
+                        "previously_billed": "3000.00",
+                        "remaining_before_invoice": "7000.00",
+                    },
+                    "previous_related_documents": [vendor_database_document],
+                },
             },
             "expected": {
                 "decision": "approve_partial_consumption",
                 "remaining_after_invoice": "3000.00",
+                "requires_client_vendor_match": True,
+                "previous_related_document_invoice_number": previous_related_document[
+                    "invoice_number"
+                ],
                 "explanation": "Do not reject a partial invoice when it is within remaining PO balance.",
             },
         },
     )
+
+
+def _partial_billing_previous_document(data: dict[str, Any]) -> dict[str, Any]:
+    issue_date = date.fromisoformat(str(data["issue_date"]))
+    previous_issue_date = issue_date - timedelta(days=30)
+    return {
+        "invoice_number": "INV-PO10000-0001",
+        "purchase_order": data["purchase_order"],
+        "vendor_name": data["seller"]["name"],
+        "buyer_name": data["buyer"]["name"],
+        "issue_date": previous_issue_date.isoformat(),
+        "invoice_total": "3000.00",
+        "applied_to_po": "3000.00",
+        "status": "approved",
+    }
 
 
 def _apply_amount_variance(

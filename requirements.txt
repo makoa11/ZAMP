@@ -1,2 +1,4 @@
 workos
 psycopg[binary,pool]
+pdfplumber
+pypdf

@@ -5,9 +5,11 @@ import json
 import socket
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, load_config
+from .invoice_parser import PARSER_VERSION, parse_invoice_pdf
 from .mail_ingestion import MAIL_JOB_TYPES
 from .mail_service import MailIntegration
 
@@ -93,6 +95,8 @@ def _handle_job(integration: MailIntegration, job: dict[str, Any]) -> None:
             integration.ingestion.process_outlook_delta(account_id=int(payload["account_id"]))
         elif job_type == "renew_mail_subscriptions":
             integration.ingestion.renew_mail_subscriptions()
+        elif job_type == "parse_pdf":
+            _handle_parse_pdf_job(integration, payload)
         else:
             raise RuntimeError(f"Unsupported job type: {job_type}")
     except Exception as exc:
@@ -104,6 +108,31 @@ def _handle_job(integration: MailIntegration, job: dict[str, Any]) -> None:
         return
 
     integration.repo.complete_job(job_id=int(job["id"]))
+
+
+def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any]) -> None:
+    pdf_file_id = int(payload["pdf_file_id"])
+    storage_path = str(payload["storage_path"])
+    pdf_path = _storage_pdf_path(integration.storage.root, storage_path)
+    result = parse_invoice_pdf(
+        pdf_path.read_bytes(),
+        source_id=f"mail_pdf_file:{pdf_file_id}",
+    )
+    warnings = result.get("warnings")
+    integration.repo.upsert_pdf_parse_result(
+        pdf_file_id=pdf_file_id,
+        status=str(result.get("status") or "failed"),
+        parser_version=str(result.get("parser_version") or PARSER_VERSION),
+        result=result,
+        warnings=warnings if isinstance(warnings, list) else [],
+    )
+
+
+def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
+    relative_path = Path(storage_path)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise RuntimeError("PDF storage path must be relative to MAIL_PDF_STORAGE_DIR.")
+    return Path(root) / relative_path
 
 
 def _enqueue_polling_fallbacks(integration: MailIntegration) -> None:

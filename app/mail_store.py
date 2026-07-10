@@ -57,6 +57,14 @@ class StoredPdf:
     relative_path: str
 
 
+DURABLE_DEDUPE_JOB_TYPES = ("gmail_message_fetch", "outlook_message_fetch", "parse_pdf")
+DURABLE_DEDUPE_JOB_TYPE_SET = frozenset(DURABLE_DEDUPE_JOB_TYPES)
+
+
+def _uses_durable_dedupe(job_type: str) -> bool:
+    return job_type in DURABLE_DEDUPE_JOB_TYPE_SET
+
+
 class PdfStorage:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -165,6 +173,16 @@ CREATE TABLE IF NOT EXISTS mail_pdf_files (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS mail_pdf_parse_results (
+    pdf_file_id BIGINT PRIMARY KEY REFERENCES mail_pdf_files(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('parsed', 'no_text_layer', 'unsupported', 'failed')),
+    parser_version TEXT NOT NULL,
+    result JSONB NOT NULL DEFAULT '{}'::jsonb,
+    warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS mail_attachments (
     id BIGSERIAL PRIMARY KEY,
     account_id BIGINT NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
@@ -205,6 +223,29 @@ CREATE TABLE IF NOT EXISTS ingestion_jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS ingestion_job_dedupe_keys (
+    unique_key TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO ingestion_job_dedupe_keys (unique_key, type, first_seen_at, completed_at, updated_at)
+SELECT unique_key, type, MIN(created_at), MAX(updated_at), MAX(updated_at)
+FROM ingestion_jobs
+WHERE status = 'completed'
+  AND type IN ('gmail_message_fetch', 'outlook_message_fetch', 'parse_pdf')
+GROUP BY unique_key, type
+ON CONFLICT (unique_key) DO UPDATE SET
+    type = EXCLUDED.type,
+    first_seen_at = LEAST(ingestion_job_dedupe_keys.first_seen_at, EXCLUDED.first_seen_at),
+    completed_at = COALESCE(ingestion_job_dedupe_keys.completed_at, EXCLUDED.completed_at),
+    updated_at = GREATEST(ingestion_job_dedupe_keys.updated_at, EXCLUDED.updated_at);
+
+DELETE FROM ingestion_jobs
+WHERE status = 'completed';
 
 CREATE INDEX IF NOT EXISTS idx_mail_accounts_owner ON mail_accounts(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_mail_accounts_provider_email ON mail_accounts(provider, lower(email));
@@ -665,22 +706,37 @@ class MailRepository:
         unique_key: str,
         available_at: datetime | None = None,
     ) -> bool:
+        payload_json = json.dumps(payload, separators=(",", ":"))
         with self.database.connect() as conn:
-            row = conn.execute(
-                """
-                INSERT INTO ingestion_jobs (type, payload, unique_key, available_at)
-                VALUES (%s, %s::jsonb, %s, COALESCE(%s, now()))
-                ON CONFLICT (unique_key) DO NOTHING
-                RETURNING id
-                """,
-                (
-                    job_type,
-                    json.dumps(payload, separators=(",", ":")),
-                    unique_key,
-                    available_at,
-                ),
-            ).fetchone()
-            return row is not None
+            with conn.transaction():
+                if _uses_durable_dedupe(job_type):
+                    dedupe_row = conn.execute(
+                        """
+                        INSERT INTO ingestion_job_dedupe_keys (unique_key, type)
+                        VALUES (%s, %s)
+                        ON CONFLICT (unique_key) DO NOTHING
+                        RETURNING unique_key
+                        """,
+                        (unique_key, job_type),
+                    ).fetchone()
+                    if dedupe_row is None:
+                        return False
+
+                row = conn.execute(
+                    """
+                    INSERT INTO ingestion_jobs (type, payload, unique_key, available_at)
+                    VALUES (%s, %s::jsonb, %s, COALESCE(%s, now()))
+                    ON CONFLICT (unique_key) DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        job_type,
+                        payload_json,
+                        unique_key,
+                        available_at,
+                    ),
+                ).fetchone()
+                return row is not None
 
     def claim_jobs(self, *, worker_id: str, job_types: Iterable[str], limit: int) -> list[dict[str, Any]]:
         job_types = list(job_types)
@@ -715,8 +771,27 @@ class MailRepository:
     def complete_job(self, *, job_id: int) -> None:
         with self.database.connect() as conn:
             conn.execute(
-                "UPDATE ingestion_jobs SET status = 'completed', updated_at = now() WHERE id = %s",
-                (job_id,),
+                """
+                WITH completed AS (
+                    DELETE FROM ingestion_jobs
+                    WHERE id = %s
+                    RETURNING type, unique_key, created_at
+                )
+                INSERT INTO ingestion_job_dedupe_keys (
+                    unique_key, type, first_seen_at, completed_at, updated_at
+                )
+                SELECT unique_key, type, created_at, now(), now()
+                FROM completed
+                WHERE type = ANY(%s)
+                ON CONFLICT (unique_key) DO UPDATE SET
+                    type = EXCLUDED.type,
+                    completed_at = COALESCE(
+                        ingestion_job_dedupe_keys.completed_at,
+                        EXCLUDED.completed_at
+                    ),
+                    updated_at = now()
+                """,
+                (job_id, list(DURABLE_DEDUPE_JOB_TYPES)),
             )
 
     def retry_job(self, *, job_id: int, attempts: int, error: str) -> None:
@@ -797,6 +872,41 @@ class MailRepository:
                 RETURNING *
                 """,
                 (stored_pdf.sha256, stored_pdf.byte_size, stored_pdf.relative_path),
+            ).fetchone()
+            return dict(row)
+
+    def upsert_pdf_parse_result(
+        self,
+        *,
+        pdf_file_id: int,
+        status: str,
+        parser_version: str,
+        result: dict[str, Any],
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO mail_pdf_parse_results (
+                    pdf_file_id, status, parser_version, result, warnings
+                )
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb)
+                ON CONFLICT (pdf_file_id)
+                DO UPDATE SET
+                    status = EXCLUDED.status,
+                    parser_version = EXCLUDED.parser_version,
+                    result = EXCLUDED.result,
+                    warnings = EXCLUDED.warnings,
+                    updated_at = now()
+                RETURNING *
+                """,
+                (
+                    pdf_file_id,
+                    status,
+                    parser_version,
+                    json.dumps(result, separators=(",", ":")),
+                    json.dumps(warnings, separators=(",", ":")),
+                ),
             ).fetchone()
             return dict(row)
 
