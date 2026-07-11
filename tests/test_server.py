@@ -216,6 +216,7 @@ class ServerRouteTests(unittest.TestCase):
                     },
                     "ap_context": {
                         "available": True,
+                        "reason": "No simulated AP context record matched the parsed vendor, PO, invoice number, amount, or date.",
                         "scenario": "amount_variance",
                         "source": {"type": "ap_context_records", "record_id": 5},
                     },
@@ -249,10 +250,20 @@ class ServerRouteTests(unittest.TestCase):
         self.assertIn("INV-DB-100", response)
         self.assertIn("Database Vendor LLC", response)
         self.assertIn("Invoice amount is outside tolerance.", response)
+        self.assertIn("Route to accounts payable review for variance approval.", response)
         self.assertIn("Amount match", response)
         self.assertIn("DATABASE VENDOR LLC", response)
+        self.assertIn("Accounts payable context", response)
+        self.assertIn(
+            "No simulated accounts payable context record matched the parsed vendor, purchase order, invoice number, amount due, or invoice date.",
+            response,
+        )
+        self.assertIn("Accounts payable context records", response)
         self.assertIn('/api/mail/invoices/20/overlay.pdf?boxes=all', response)
         self.assertNotIn('/api/mail/pdfs/20', response)
+        self.assertNotIn("AP context", response)
+        self.assertNotIn("AP review", response)
+        self.assertNotIn("ap_context_records", response)
         self.assertNotIn("Auto Approved LLC", response)
         self.assertNotIn("/api/invoices/samples.pdf", response)
         self.assertNotIn("Unknown Seller", response)

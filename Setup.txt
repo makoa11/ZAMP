@@ -21,6 +21,9 @@
   # Generate with custom output/seed/date
   .venv/bin/python -m app.generate_test_pdfs --output-dir storage/test_pdfs --pdf-count 50 --seed 1000 --date YYYY-MM-DD
 
+  # Generate, parse, plot boxes, normalize, decide, and write JSON/PDF artifacts without database writes
+  .venv/bin/python scripts/run_test_invoice_pipeline.py --generate --input-dir storage/test_pdfs --output-dir storage/test_invoice_pipeline --pdf-count 50 --seed 1000 --date YYYY-MM-DD --boxes all
+
   # Parse generated PDFs to JSON and overlay PDFs
   .venv/bin/python scripts/parse_test_pdfs.py
   .venv/bin/python scripts/parse_test_pdfs.py --limit 10

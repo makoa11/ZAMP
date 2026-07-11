@@ -99,6 +99,35 @@ def _humanize_token(value: Any) -> str:
     return text.capitalize() if text else ""
 
 
+def _frontend_copy(value: Any) -> str:
+    text = _display_value(value)
+    if not text:
+        return ""
+    replacements = (
+        (
+            "No simulated AP context record matched the parsed vendor, PO, invoice number, amount, or date.",
+            "No simulated accounts payable context record matched the parsed vendor, purchase order, invoice number, amount due, or invoice date.",
+        ),
+        ("AP context", "accounts payable context"),
+        ("AP review", "accounts payable review"),
+        ("AP tolerance", "accounts payable tolerance"),
+        ("AP expected amount", "accounts payable expected amount"),
+        (" AP ", " accounts payable "),
+    )
+    for source, replacement in replacements:
+        text = text.replace(source, replacement)
+    return text
+
+
+def _source_type_label(value: Any) -> str:
+    source_type = _display_value(value)
+    labels = {
+        "ap_context_records": "Accounts payable context records",
+        "manifest": "Manifest",
+    }
+    return labels.get(source_type, _humanize_token(source_type))
+
+
 def _badge_class(value: Any) -> str:
     text = _display_value(value).lower().replace("_", "-").replace(" ", "-")
     return "".join(character for character in text if character.isalnum() or character == "-")
@@ -618,8 +647,8 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         item: dict[str, Any],
     ) -> str:
         decision_value = _display_value(decision.get("decision") or item.get("decision"))
-        summary = _display_value(decision.get("summary")) or _display_value(item.get("next_action"))
-        next_action = _display_value(decision.get("next_action") or item.get("next_action"))
+        summary = _frontend_copy(decision.get("summary")) or _frontend_copy(item.get("next_action"))
+        next_action = _frontend_copy(decision.get("next_action") or item.get("next_action"))
         failed_or_review = sum(
             1
             for check in checks
@@ -687,7 +716,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
                 continue
             check_id = _display_value(check.get("id"))
             status = _display_value(check.get("status"))
-            summary = _display_value(check.get("summary"))
+            summary = _frontend_copy(check.get("summary"))
             status_label = _humanize_token(status) or "Unknown"
             status_class = html_lib.escape(_badge_class(status_label))
             rows.append(
@@ -721,10 +750,10 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         source = _nested_dict(ap_context.get("source") or audit.get("context_source"))
         facts = self._detail_facts_html(
             [
-                ("AP context", context_label),
-                ("Reason", ap_context.get("reason")),
+                ("Accounts payable context", context_label),
+                ("Reason", _frontend_copy(ap_context.get("reason"))),
                 ("Scenario", ap_context.get("scenario") or audit.get("context_scenario")),
-                ("Source", source.get("type")),
+                ("Source", _source_type_label(source.get("type"))),
                 ("Record", source.get("record_id") or source.get("source_key")),
                 ("Normalized vendor", audit.get("normalized_vendor")),
                 ("Normalized invoice #", audit.get("normalized_invoice_number")),

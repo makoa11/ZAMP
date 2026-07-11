@@ -13,6 +13,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.ap_context import load_procurement_context, missing_procurement_context  # noqa: E402
+from app.generate_test_pdfs import (  # noqa: E402
+    DEFAULT_PDF_COUNT as DEFAULT_GENERATED_PDF_COUNT,
+    DEFAULT_SEED as DEFAULT_GENERATION_SEED,
+    generate_test_pdfs,
+)
 from app.invoice_decision import decide_invoice  # noqa: E402
 from app.invoice_normalizer import normalize_invoice_parse  # noqa: E402
 from app.invoice_overlay import render_invoice_parse_overlay_pdf  # noqa: E402
@@ -29,8 +34,24 @@ def run_test_invoice_pipeline(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     limit: int | None = None,
     box_mode: str = "parsed",
+    generate: bool = False,
+    pdf_count: int = DEFAULT_GENERATED_PDF_COUNT,
+    seed: int = DEFAULT_GENERATION_SEED,
+    today: date | None = None,
 ) -> dict[str, Any]:
-    pdf_paths = _pdf_paths(input_dir)
+    generation_date = today or date.today()
+    if generate:
+        pdf_paths = generate_test_pdfs(
+            output_dir=input_dir,
+            pdf_count=pdf_count,
+            seed=seed,
+            today=generation_date,
+        )
+    else:
+        pdf_paths = _pdf_paths(input_dir)
+
+    pdf_paths = sorted(pdf_paths)
+    generated_pdf_count = len(pdf_paths) if generate else None
     if limit is not None:
         pdf_paths = pdf_paths[:limit]
 
@@ -39,6 +60,15 @@ def run_test_invoice_pipeline(
         "schema_version": 1,
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
+        "box_mode": box_mode,
+        "generation": {
+            "enabled": generate,
+            "pdf_count": pdf_count if generate else None,
+            "seed": seed if generate else None,
+            "date": generation_date.isoformat() if generate else None,
+            "generated_pdf_count": generated_pdf_count,
+            "processed_limit": limit,
+        },
         "total": len(pdf_paths),
         "decision_matches_expected": 0,
         "decision_mismatches": 0,
@@ -175,16 +205,50 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--boxes", choices=("parsed", "words", "all"), default="parsed")
+    parser.add_argument(
+        "--generate",
+        action="store_true",
+        help="Generate a synthetic PDF corpus into --input-dir before running the pipeline.",
+    )
+    parser.add_argument(
+        "--pdf-count",
+        type=int,
+        default=DEFAULT_GENERATED_PDF_COUNT,
+        help="Number of PDFs to generate when --generate is set.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_GENERATION_SEED,
+        help="Base seed for deterministic generated PDFs when --generate is set.",
+    )
+    parser.add_argument(
+        "--date",
+        type=date.fromisoformat,
+        default=None,
+        help="Anchor date for generated PDFs in YYYY-MM-DD format. Defaults to today.",
+    )
     args = parser.parse_args()
 
-    summary = run_test_invoice_pipeline(
-        input_dir=args.input_dir,
-        output_dir=args.output_dir,
-        limit=args.limit,
-        box_mode=args.boxes,
-    )
+    try:
+        summary = run_test_invoice_pipeline(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            limit=args.limit,
+            box_mode=args.boxes,
+            generate=args.generate,
+            pdf_count=args.pdf_count,
+            seed=args.seed,
+            today=args.date,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    generated_prefix = ""
+    if args.generate:
+        generated_prefix = f"Generated {args.pdf_count} PDFs in {args.input_dir}. "
     print(
-        f"Wrote {summary['total']} audit runs to {summary['output_dir']} "
+        f"{generated_prefix}Wrote {summary['total']} audit runs to {summary['output_dir']} "
         f"({summary['decision_matches_expected']} matched expected, "
         f"{summary['decision_mismatches']} mismatched, "
         f"{summary['missing_expected']} without expected decisions)."

@@ -38,7 +38,7 @@ def decide_invoice(
             "request_missing_info",
             "low",
             "Invoice text could not be extracted.",
-            "Request a text-searchable invoice PDF or run OCR before AP review.",
+            "Request a text-searchable invoice PDF or run OCR before accounts payable review.",
             checks,
             invoice,
             context,
@@ -51,7 +51,7 @@ def decide_invoice(
             "request_missing_info",
             "low",
             "Required invoice fields are missing.",
-            "Ask the vendor for the missing invoice fields before matching to AP context.",
+            "Ask the vendor for the missing invoice fields before matching to accounts payable context.",
             checks,
             invoice,
             context,
@@ -109,7 +109,7 @@ def decide_invoice(
             "apply_credit_or_route_review",
             _confidence_for_review(invoice),
             "Invoice appears to be a credit memo or negative payable.",
-            "Apply the credit to open liability or route to AP review if no matching payable is open.",
+            "Apply the credit to open liability or route to accounts payable review if no matching payable is open.",
             checks,
             invoice,
             context,
@@ -147,7 +147,7 @@ def decide_invoice(
         return _decision(
             "approve_with_tolerance",
             _confidence_for_approval(invoice),
-            "Invoice variance is within the configured AP tolerance.",
+            "Invoice variance is within the configured accounts payable tolerance.",
             "Approve with a tolerance note in the audit trail.",
             checks,
             invoice,
@@ -157,8 +157,8 @@ def decide_invoice(
         return _decision(
             "needs_review",
             _confidence_for_review(invoice),
-            "Invoice amount is outside the configured AP tolerance.",
-            "Route to AP review for PO variance approval or vendor correction.",
+            "Invoice amount is outside the configured accounts payable tolerance.",
+            "Route to accounts payable review for purchase order variance approval or vendor correction.",
             checks,
             invoice,
             context,
@@ -178,7 +178,7 @@ def decide_invoice(
     return _decision(
         "approve",
         _confidence_for_approval(invoice),
-        "Vendor, PO, payment details, duplicate check, and amount match AP context.",
+        "Vendor, purchase order, payment details, duplicate check, and amount match accounts payable context.",
         "Approve the invoice for payment.",
         checks,
         invoice,
@@ -264,7 +264,7 @@ def _vendor_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[str,
         return _check(
             "vendor_match",
             "review",
-            "No approved vendor name is available in AP context.",
+            "No approved vendor name is available in accounts payable context.",
             evidence={"invoice_vendor": invoice_vendor},
             context={"vendor": context_vendor},
         )
@@ -324,7 +324,7 @@ def _bank_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[str, A
         return _check(
             "bank_details",
             "pass",
-            "No approved bank account override is present in AP context.",
+            "No approved bank account override is present in accounts payable context.",
             evidence={"invoice_bank_account": invoice_bank},
             context={"approved_bank_account": None},
         )
@@ -391,7 +391,7 @@ def _purchase_order_check(invoice: dict[str, Any], context: dict[str, Any]) -> d
             **_check(
                 "purchase_order",
                 "review",
-                f"Invoice omits a PO, but AP context suggests {candidate_number}.",
+                f"Invoice omits a purchase order, but accounts payable context suggests {candidate_number}.",
                 evidence=_invoice_evidence(invoice, "purchase_order", "vendor", "amount_due"),
                 context={"candidate_open_po": candidate_po},
             ),
@@ -406,14 +406,14 @@ def _purchase_order_check(invoice: dict[str, Any], context: dict[str, Any]) -> d
                 evidence=_invoice_evidence(invoice, "purchase_order"),
                 context={"purchase_order": context.get("purchase_order")},
             ),
-            "next_action": "Request the PO reference or route to non-PO AP review.",
+            "next_action": "Request the purchase order reference or route to non-purchase-order accounts payable review.",
         }
     if context_po and invoice_po != context_po:
         return {
             **_check(
                 "purchase_order",
                 "review",
-                "Invoice PO does not match AP context.",
+                "Invoice purchase order does not match accounts payable context.",
                 evidence=_invoice_evidence(invoice, "purchase_order"),
                 context={"purchase_order": context.get("purchase_order")},
             ),
@@ -422,7 +422,7 @@ def _purchase_order_check(invoice: dict[str, Any], context: dict[str, Any]) -> d
     return _check(
         "purchase_order",
         "pass",
-        "Invoice PO matches AP context.",
+        "Invoice purchase order matches accounts payable context.",
         evidence=_invoice_evidence(invoice, "purchase_order"),
         context={"purchase_order": context.get("purchase_order")},
     )
@@ -490,14 +490,14 @@ def _amount_match_check(invoice: dict[str, Any], context: dict[str, Any]) -> dic
         return _check(
             "amount_match",
             "review",
-            "Invoice amount or AP expected amount is missing.",
+            "Invoice amount or accounts payable expected amount is missing.",
             evidence=_invoice_evidence(invoice, "amount_due"),
             context={"invoice_total": context.get("invoice_total"), "tolerance_policy": tolerance_policy},
         )
     variance = (amount - expected).quantize(Decimal("0.01"))
     if variance == 0:
         status = "pass"
-        summary = "Invoice amount matches AP expected amount."
+        summary = "Invoice amount matches accounts payable expected amount."
     elif abs(variance) <= tolerance:
         status = "pass_with_tolerance"
         summary = "Invoice amount variance is within tolerance."

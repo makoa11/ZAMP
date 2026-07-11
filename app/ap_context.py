@@ -47,7 +47,7 @@ def load_db_procurement_context(
     )
     if not record:
         return missing_procurement_context(
-            "No simulated AP context record matched the parsed vendor, PO, invoice number, amount, or date."
+            "No simulated accounts payable context record matched the parsed vendor, purchase order, invoice number, amount due, or invoice date."
         )
     return procurement_context_from_db_record(record)
 
@@ -55,7 +55,7 @@ def load_db_procurement_context(
 def procurement_context_from_db_record(record: Mapping[str, Any]) -> dict[str, Any]:
     context = record.get("context") if isinstance(record.get("context"), Mapping) else {}
     if not context:
-        return missing_procurement_context("Matched AP context record did not contain a usable context payload.")
+        return missing_procurement_context("Matched accounts payable context record did not contain a usable context payload.")
 
     result = copy.deepcopy(dict(context))
     result["available"] = True

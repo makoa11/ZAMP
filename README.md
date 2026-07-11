@@ -77,13 +77,17 @@ To visualize parser evidence boxes on top of a PDF, generate a highlighted overl
 
 The output keeps the original PDF pages and appends transparent yellow rectangle overlays. By default it highlights accepted parsed field evidence only. Use `--boxes words` to highlight every extracted text word box, or `--boxes all` to include both parser evidence and word geometry.
 
-To run the synthetic static-parser decision pipeline against generated PDFs and manifests:
+To run the synthetic static-parser decision pipeline in one command, generate PDFs and manifests, parse them, plot parser boxes, normalize the invoice, run deterministic decisioning, and write JSON audit artifacts:
+
+```bash
+.venv/bin/python scripts/run_test_invoice_pipeline.py --generate --input-dir storage/test_pdfs --output-dir storage/test_invoice_pipeline --pdf-count 50 --seed 1000 --date YYYY-MM-DD --boxes all
+```
+
+This path does not write to PostgreSQL. It writes parsed JSON, overlay PDFs, normalized invoice JSON, decision JSON, and audit JSON per PDF, plus a summary comparing actual decisions with manifest expected decisions. To rerun the same pipeline against PDFs already present in `storage/test_pdfs`, omit `--generate`:
 
 ```bash
 .venv/bin/python scripts/run_test_invoice_pipeline.py --input-dir storage/test_pdfs --output-dir storage/test_invoice_pipeline
 ```
-
-This writes parsed JSON, overlay PDFs, normalized invoice JSON, decision JSON, and audit JSON per PDF, plus a summary comparing actual decisions with manifest expected decisions.
 Some full A4 layouts place the payable total as the last row of the item table, with total quantity populated, the rate cell intentionally blank, and the amount cell using the final payable value. Currency can render as a code or a symbol such as `$`, `Rs`, `€`, `£`, `¥`, `A$`, or `S$`.
 Template metadata also includes `font_style`, and rendered samples rotate through system, serif, slab, mono, condensed, rounded, formal, industrial, humanist, geometric, courier, book, narrow, typewriter, and neo-grotesque font stacks.
 
