@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterable
 
+from .invoice_parser import PARSER_VERSION
 from .mail_http import HttpClientError
 from .mail_providers import GmailClient, OutlookClient, gmail_expiration_ms, parse_rfc3339
 from .mail_store import MailIntegrationError, MailRepository, PdfStorage, TokenCipher
@@ -452,8 +453,9 @@ class MailIngestionService:
                     "storage_path": stored.relative_path,
                     "account_id": account_id,
                     "owner_user_id": account.get("owner_user_id"),
+                    "parser_version": PARSER_VERSION,
                 },
-                unique_key=f"parse-pdf:{attachment_row['id']}",
+                unique_key=f"parse-pdf:{attachment_row['id']}:{PARSER_VERSION}",
             )
 
     def process_outlook_message(self, *, account_id: int, message_id: str) -> None:
@@ -553,8 +555,9 @@ class MailIngestionService:
                     "storage_path": stored.relative_path,
                     "account_id": account_id,
                     "owner_user_id": account.get("owner_user_id"),
+                    "parser_version": PARSER_VERSION,
                 },
-                unique_key=f"parse-pdf:{attachment_row['id']}",
+                unique_key=f"parse-pdf:{attachment_row['id']}:{PARSER_VERSION}",
             )
 
     def process_outlook_delta(self, *, account_id: int) -> None:

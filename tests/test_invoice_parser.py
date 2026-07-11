@@ -464,7 +464,8 @@ class InvoiceParserTests(unittest.TestCase):
         result = parse_invoice_pdf(_simple_invoice_pdf(), source_id="fixture:manual")
         fields = result["fields"]
 
-        self.assertEqual(result["status"], "parsed")
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["review"]["reason"], "low_confidence_or_ambiguous_fields")
         self.assertEqual(fields["invoice_number"]["value"], "INV-2026-0042")
         self.assertEqual(fields["issue_date"]["value"], "2026-06-10")
         self.assertEqual(fields["due_date"]["value"], "2026-07-10")

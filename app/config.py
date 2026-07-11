@@ -9,7 +9,7 @@ from typing import Dict
 
 from cryptography.fernet import Fernet
 
-from .invoice_ocr import OCR_MAX_REGIONS
+from .invoice_ocr import OCR_MAX_DOCUMENT_PAGES, OCR_MAX_REGIONS
 
 
 class ConfigError(RuntimeError):
@@ -94,6 +94,7 @@ class AppConfig:
     microsoft_client_secret: str | None
     microsoft_tenant_id: str
     mail_parse_ocr_max_regions: int
+    mail_parse_ocr_max_document_pages: int
 
     @property
     def logout_return_url(self) -> str:
@@ -150,6 +151,11 @@ def load_config(root: Path | None = None) -> AppConfig:
     if mail_db_pool_max_size < mail_db_pool_min_size:
         raise ConfigError("MAIL_DB_POOL_MAX_SIZE must be greater than or equal to MAIL_DB_POOL_MIN_SIZE.")
     mail_parse_ocr_max_regions = _int_env("MAIL_PARSE_OCR_MAX_REGIONS", env_file_values, OCR_MAX_REGIONS)
+    mail_parse_ocr_max_document_pages = _int_env(
+        "MAIL_PARSE_OCR_MAX_DOCUMENT_PAGES",
+        env_file_values,
+        OCR_MAX_DOCUMENT_PAGES,
+    )
     mail_token_encryption_key = _env("MAIL_TOKEN_ENCRYPTION_KEY", env_file_values)
     if mail_token_encryption_key:
         try:
@@ -216,4 +222,5 @@ def load_config(root: Path | None = None) -> AppConfig:
         microsoft_client_secret=_env("MICROSOFT_CLIENT_SECRET", env_file_values),
         microsoft_tenant_id=_env("MICROSOFT_TENANT_ID", env_file_values, "common") or "common",
         mail_parse_ocr_max_regions=mail_parse_ocr_max_regions,
+        mail_parse_ocr_max_document_pages=mail_parse_ocr_max_document_pages,
     )

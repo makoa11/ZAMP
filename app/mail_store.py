@@ -863,6 +863,60 @@ class MailRepository:
                 ).fetchone()
                 return row is not None
 
+    def enqueue_stale_pdf_parse_jobs(
+        self,
+        *,
+        parser_revision: str,
+        limit: int = 100,
+    ) -> int:
+        """Queue stored PDFs whose last parse used an older parser/config revision."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                WITH stale AS (
+                    SELECT DISTINCT ON (attachments.id)
+                        attachments.id AS attachment_id,
+                        attachments.account_id,
+                        attachments.pdf_file_id,
+                        accounts.owner_user_id,
+                        pdf_files.storage_path
+                    FROM mail_attachments AS attachments
+                    JOIN mail_accounts AS accounts ON accounts.id = attachments.account_id
+                    JOIN mail_pdf_files AS pdf_files ON pdf_files.id = attachments.pdf_file_id
+                    LEFT JOIN mail_pdf_parse_results AS parse_results
+                        ON parse_results.pdf_file_id = attachments.pdf_file_id
+                    WHERE parse_results.parser_version IS DISTINCT FROM %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM ingestion_jobs AS pending
+                          WHERE pending.type = 'parse_pdf'
+                            AND (pending.payload->>'pdf_file_id')::bigint = attachments.pdf_file_id
+                            AND pending.status IN ('pending', 'running', 'retry')
+                      )
+                    ORDER BY attachments.id, attachments.created_at ASC
+                    LIMIT %s
+                )
+                INSERT INTO ingestion_jobs (type, payload, unique_key, available_at)
+                SELECT
+                    'parse_pdf',
+                    jsonb_build_object(
+                        'attachment_id', stale.attachment_id,
+                        'pdf_file_id', stale.pdf_file_id,
+                        'storage_path', stale.storage_path,
+                        'account_id', stale.account_id,
+                        'owner_user_id', stale.owner_user_id,
+                        'parser_version', %s
+                    ),
+                    'parse-pdf:' || stale.attachment_id || ':' || %s,
+                    now()
+                FROM stale
+                ON CONFLICT (unique_key) DO NOTHING
+                RETURNING id
+                """,
+                (parser_revision, limit, parser_revision, parser_revision),
+            ).fetchall()
+            return len(rows)
+
     def claim_jobs(self, *, worker_id: str, job_types: Iterable[str], limit: int) -> list[dict[str, Any]]:
         job_types = list(job_types)
         if not job_types:

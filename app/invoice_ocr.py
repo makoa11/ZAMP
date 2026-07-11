@@ -5,9 +5,10 @@ from typing import Any, Callable, Iterable, Protocol
 
 
 OCR_CONFIDENCE_THRESHOLD = 0.85
-OCR_REGION_PADDING = 4.0
+OCR_REGION_PADDING = 0.15
 OCR_RENDER_DPI = 300
 OCR_MAX_REGIONS = 8
+OCR_MAX_DOCUMENT_PAGES = 3
 OCR_TIMEOUT_SECONDS = 5.0
 
 
@@ -33,6 +34,7 @@ class OcrRegionCandidate:
     bbox: tuple[float, float, float, float]
     padded_bbox: tuple[float, float, float, float]
     confidence: float
+    reason: str = "low_confidence"
 
 
 @dataclass(frozen=True)
@@ -75,7 +77,13 @@ class RegionOcrEngine(Protocol):
 
 
 class DocumentOcrEngine(Protocol):
-    def ocr_document(self, content: bytes) -> DocumentOcrResult:
+    def ocr_document(
+        self,
+        content: bytes,
+        *,
+        pages: Iterable[int] | None = None,
+        max_pages: int | None = OCR_MAX_DOCUMENT_PAGES,
+    ) -> DocumentOcrResult:
         ...
 
 
@@ -191,7 +199,13 @@ class TesseractRegionOcrEngine:
             method="tesseract_region",
         )
 
-    def ocr_document(self, content: bytes) -> DocumentOcrResult:
+    def ocr_document(
+        self,
+        content: bytes,
+        *,
+        pages: Iterable[int] | None = None,
+        max_pages: int | None = OCR_MAX_DOCUMENT_PAGES,
+    ) -> DocumentOcrResult:
         try:
             import fitz  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -208,15 +222,20 @@ class TesseractRegionOcrEngine:
         except Exception as exc:  # pragma: no cover - exercised only with real PDF renderer failures.
             raise RegionOcrError(f"Could not open PDF for OCR: {exc}") from exc
 
-        pages: list[DocumentOcrPage] = []
+        result_pages: list[DocumentOcrPage] = []
         words: list[DocumentOcrWord] = []
         confidences: list[float] = []
         try:
             zoom = self.dpi / 72.0
             matrix = fitz.Matrix(zoom, zoom)
-            for page_index in range(document.page_count):
+            page_numbers = _document_page_numbers(
+                document.page_count,
+                pages=pages,
+                max_pages=max_pages,
+            )
+            for page_number in page_numbers:
+                page_index = page_number - 1
                 pdf_page = document.load_page(page_index)
-                page_number = page_index + 1
                 page_rect = pdf_page.rect
                 try:
                     pixmap = pdf_page.get_pixmap(
@@ -254,7 +273,7 @@ class TesseractRegionOcrEngine:
                     if page_confidences
                     else None
                 )
-                pages.append(
+                result_pages.append(
                     DocumentOcrPage(
                         page=page_number,
                         width=float(page_rect.width),
@@ -269,7 +288,7 @@ class TesseractRegionOcrEngine:
 
         confidence = sum(confidences) / len(confidences) if confidences else None
         return DocumentOcrResult(
-            pages=pages,
+            pages=result_pages,
             words=words,
             confidence=confidence,
             method="tesseract_document",
@@ -285,6 +304,7 @@ def apply_low_confidence_region_ocr(
     threshold: float = OCR_CONFIDENCE_THRESHOLD,
     padding: float = OCR_REGION_PADDING,
     max_regions: int | None = OCR_MAX_REGIONS,
+    target_fields: Iterable[str] = (),
     engine: RegionOcrEngine | None = None,
     field_updater: RegionOcrFieldUpdater | None = None,
 ) -> dict[str, Any]:
@@ -293,6 +313,7 @@ def apply_low_confidence_region_ocr(
         pages=pages,
         threshold=threshold,
         padding=padding,
+        target_fields=target_fields,
     )
     if max_regions is None:
         attempted_candidates = candidates
@@ -302,7 +323,8 @@ def apply_low_confidence_region_ocr(
     summary: dict[str, Any] = {
         "status": "skipped" if not candidates else "completed",
         "confidence_threshold": round(threshold, 3),
-        "padding": round(padding, 2),
+        "padding_ratio": round(padding, 3),
+        "padding_percent": round(padding * 100, 1),
         "max_regions": max_regions,
         "candidate_count": len(candidates),
         "attempted_count": 0,
@@ -356,6 +378,11 @@ def apply_low_confidence_region_ocr(
         region["text"] = ocr_text.text
         region["confidence"] = round(ocr_text.confidence, 3) if ocr_text.confidence is not None else None
         region["method"] = ocr_text.method
+        created_field = False
+        if field is None and len(candidate.path) == 1 and isinstance(candidate.path[0], str):
+            field = {}
+            fields[candidate.path[0]] = field
+            created_field = True
         if field is None:
             region["applied"] = False
             region["reason"] = "field_missing"
@@ -369,6 +396,8 @@ def apply_low_confidence_region_ocr(
             if applied:
                 summary["applied_count"] += 1
             else:
+                if created_field:
+                    fields[candidate.path[0]] = None
                 summary["skipped_count"] += 1
         summary["regions"].append(region)
 
@@ -381,6 +410,7 @@ def low_confidence_ocr_regions(
     pages: list[dict[str, Any]],
     threshold: float = OCR_CONFIDENCE_THRESHOLD,
     padding: float = OCR_REGION_PADDING,
+    target_fields: Iterable[str] = (),
 ) -> list[OcrRegionCandidate]:
     page_dimensions = _page_dimensions(pages)
     found: list[OcrRegionCandidate] = []
@@ -388,6 +418,16 @@ def low_confidence_ocr_regions(
     _collect_low_confidence_regions(
         fields,
         path=(),
+        page_dimensions=page_dimensions,
+        threshold=threshold,
+        padding=padding,
+        found=found,
+        seen=seen,
+    )
+    _collect_target_field_regions(
+        fields=fields,
+        pages=pages,
+        target_fields=target_fields,
         page_dimensions=page_dimensions,
         threshold=threshold,
         padding=padding,
@@ -507,7 +547,8 @@ def _candidate_from_field(
     padding: float,
 ) -> OcrRegionCandidate | None:
     confidence = _confidence_value(value.get("confidence"))
-    if confidence is None or confidence >= threshold:
+    ambiguity_reasons = _ambiguity_reasons(value)
+    if confidence is not None and confidence >= threshold and not ambiguity_reasons:
         return None
     try:
         page = int(value["page"])
@@ -524,8 +565,126 @@ def _candidate_from_field(
         page=page,
         bbox=bbox,
         padded_bbox=padded_bbox,
-        confidence=confidence,
+        confidence=confidence if confidence is not None else 0.0,
+        reason=(
+            "explicit_ambiguity"
+            if ambiguity_reasons
+            else "missing_confidence"
+            if confidence is None
+            else "low_confidence"
+        ),
     )
+
+
+def _collect_target_field_regions(
+    *,
+    fields: dict[str, Any],
+    pages: list[dict[str, Any]],
+    target_fields: Iterable[str],
+    page_dimensions: dict[int, tuple[float, float]],
+    threshold: float,
+    padding: float,
+    found: list[OcrRegionCandidate],
+    seen: set[tuple[str, int, tuple[int, int, int, int]]],
+) -> None:
+    existing_paths = {candidate.path for candidate in found}
+    for field_key in target_fields:
+        path = (str(field_key),)
+        if path in existing_paths:
+            continue
+        field = fields.get(field_key)
+        if isinstance(field, dict):
+            confidence = _confidence_value(field.get("confidence"))
+            reasons = _ambiguity_reasons(field)
+            if confidence is not None and confidence >= threshold and not reasons:
+                continue
+            reason = (
+                "explicit_ambiguity"
+                if reasons
+                else "missing_confidence"
+                if confidence is None
+                else "low_confidence"
+            )
+        elif field not in (None, [], ""):
+            continue
+        else:
+            confidence = None
+            reason = "missing_field"
+
+        page, bbox = _likely_field_region(str(field_key), pages, page_dimensions)
+        if page is None or bbox is None:
+            continue
+        padded_bbox = _padded_bbox(bbox, padding=padding, dimensions=page_dimensions.get(page))
+        key = (
+            _format_path(path),
+            page,
+            tuple(round(item * 100) for item in padded_bbox),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(
+            OcrRegionCandidate(
+                path=path,
+                page=page,
+                bbox=bbox,
+                padded_bbox=padded_bbox,
+                confidence=confidence if confidence is not None else 0.0,
+                reason=reason,
+            )
+        )
+
+
+def _likely_field_region(
+    field_key: str,
+    pages: list[dict[str, Any]],
+    page_dimensions: dict[int, tuple[float, float]],
+) -> tuple[int | None, tuple[float, float, float, float] | None]:
+    if not page_dimensions:
+        return None, None
+    ordered_pages = [int(page["page"]) for page in pages if _valid_page_number(page, page_dimensions)]
+    if not ordered_pages:
+        ordered_pages = sorted(page_dimensions)
+    hints = _FIELD_LABEL_HINTS.get(field_key, (field_key.replace("_", " "),))
+    matching_pages = [
+        int(page["page"])
+        for page in pages
+        if _valid_page_number(page, page_dimensions)
+        and any(hint in str(page.get("text") or "").lower() for hint in hints)
+    ]
+    bottom_fields = {
+        "subtotal", "discount", "tax", "shipping", "paid", "balance_due", "payment_instructions"
+    }
+    page = (matching_pages[-1] if field_key in bottom_fields else matching_pages[0]) if matching_pages else (
+        ordered_pages[-1] if field_key in bottom_fields else ordered_pages[0]
+    )
+    width, height = page_dimensions[page]
+    if field_key in bottom_fields:
+        bbox = (width * 0.3, height * 0.4, width, height)
+    elif field_key in {"seller", "buyer"}:
+        bbox = (0.0, 0.0, width, height * 0.6)
+    elif field_key == "line_items":
+        bbox = (0.0, height * 0.12, width, height * 0.82)
+    else:
+        bbox = (0.0, 0.0, width, height * 0.42)
+    return page, bbox
+
+
+def _valid_page_number(
+    page: dict[str, Any],
+    page_dimensions: dict[int, tuple[float, float]],
+) -> bool:
+    try:
+        return int(page["page"]) in page_dimensions
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _ambiguity_reasons(field: dict[str, Any]) -> list[str]:
+    reasons = field.get("ambiguity_reasons")
+    if not isinstance(reasons, list):
+        return []
+    return [str(reason) for reason in reasons if reason]
 
 
 def _page_dimensions(pages: list[dict[str, Any]]) -> dict[int, tuple[float, float]]:
@@ -573,11 +732,13 @@ def _padded_bbox(
     dimensions: tuple[float, float] | None,
 ) -> tuple[float, float, float, float]:
     x0, top, x1, bottom = bbox
+    horizontal_padding = (x1 - x0) * max(0.0, padding)
+    vertical_padding = (bottom - top) * max(0.0, padding)
     padded = (
-        max(0.0, x0 - padding),
-        max(0.0, top - padding),
-        x1 + padding,
-        bottom + padding,
+        max(0.0, x0 - horizontal_padding),
+        max(0.0, top - vertical_padding),
+        x1 + horizontal_padding,
+        bottom + vertical_padding,
     )
     if dimensions is None:
         return padded
@@ -609,12 +770,51 @@ def _region_summary(candidate: OcrRegionCandidate, field: dict[str, Any] | None)
         "bbox": _round_bbox(candidate.bbox),
         "padded_bbox": _round_bbox(candidate.padded_bbox),
         "original_confidence": round(candidate.confidence, 3),
+        "candidate_reason": candidate.reason,
     }
     if field is not None:
         region["original_raw"] = field.get("raw")
         region["original_value"] = field.get("value")
         region["original_method"] = field.get("method")
     return region
+
+
+def _document_page_numbers(
+    page_count: int,
+    *,
+    pages: Iterable[int] | None,
+    max_pages: int | None,
+) -> list[int]:
+    if pages is None:
+        selected = list(range(1, page_count + 1))
+    else:
+        selected = []
+        for raw_page in pages:
+            try:
+                page = int(raw_page)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= page <= page_count and page not in selected:
+                selected.append(page)
+    if max_pages is not None:
+        selected = selected[: max(0, max_pages)]
+    return selected
+
+
+_FIELD_LABEL_HINTS: dict[str, tuple[str, ...]] = {
+    "invoice_number": ("invoice no", "invoice #", "invoice number", "bill no"),
+    "issue_date": ("invoice date", "issue date", "bill date"),
+    "due_date": ("due date", "pay by", "payment before"),
+    "purchase_order": ("purchase order", "po number", "po #", "po ref"),
+    "terms": ("payment terms", "terms", "net "),
+    "seller": ("seller", "supplier", "vendor", "from"),
+    "buyer": ("bill to", "buyer", "customer", "client"),
+    "subtotal": ("subtotal", "net amount"),
+    "tax": ("tax", "vat", "gst"),
+    "balance_due": ("balance due", "amount due", "grand total", "total"),
+    "payment_instructions": ("payment instructions", "bank", "iban", "swift", "remit"),
+    "line_items": ("description", "quantity", "qty", "unit price", "amount"),
+}
 
 
 def _normalize_update_result(result: bool | str | None) -> tuple[bool, str | None]:

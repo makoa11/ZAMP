@@ -104,3 +104,19 @@ class ConfigTests(unittest.TestCase):
                     load_config(root)
 
         self.assertIn("MAIL_PARSE_OCR_MAX_REGIONS", str(error.exception))
+
+    def test_mail_parse_ocr_document_page_limit_is_loaded_from_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {
+                    **self._base_env(),
+                    "MAIL_PARSE_OCR_MAX_DOCUMENT_PAGES": "2",
+                },
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        self.assertEqual(config.mail_parse_ocr_max_document_pages, 2)

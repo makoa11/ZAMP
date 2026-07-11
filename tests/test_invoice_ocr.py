@@ -12,7 +12,11 @@ from app.invoice_ocr import (
     apply_low_confidence_region_ocr,
     low_confidence_ocr_regions,
 )
-from app.invoice_parser import _replace_field_with_ocr_result, parse_invoice_pdf
+from app.invoice_parser import (
+    _merge_ocr_fields,
+    _replace_field_with_ocr_result,
+    parse_invoice_pdf,
+)
 from app.invoice_pdf import MM_TO_PT, _PdfCanvas, _build_pdf
 from tests.test_invoice_parser import _simple_invoice_pdf
 
@@ -87,6 +91,37 @@ class FakeFullDocumentOcrEngine:
             words=words,
             confidence=0.94,
             method="fake_document",
+        )
+
+
+class PageLimitedOcrEngine:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[int], int | None]] = []
+
+    def ocr_document(
+        self,
+        content: bytes,
+        *,
+        pages: list[int] | None = None,
+        max_pages: int | None = None,
+    ) -> DocumentOcrResult:
+        selected = list(pages or [])
+        self.calls.append((selected, max_pages))
+        words = _full_invoice_ocr_words()
+        return DocumentOcrResult(
+            pages=[
+                DocumentOcrPage(
+                    page=page,
+                    width=210 * MM_TO_PT,
+                    height=297 * MM_TO_PT,
+                    text="invoice" if page == 1 else "",
+                    confidence=0.94,
+                )
+                for page in selected
+            ],
+            words=words,
+            confidence=0.94,
+            method="page_limited_fake",
         )
 
 
@@ -170,7 +205,7 @@ def _full_invoice_ocr_words(*, include_due_date: bool = True) -> list[DocumentOc
 
 
 class InvoiceOcrTests(unittest.TestCase):
-    def test_low_confidence_regions_are_padded_clamped_and_attached_to_fields(self) -> None:
+    def test_low_confidence_regions_use_proportional_padding_and_clamp_to_page(self) -> None:
         fields = {
             "invoice_number": {
                 "raw": "old",
@@ -216,7 +251,7 @@ class InvoiceOcrTests(unittest.TestCase):
             fields=fields,
             pages=pages,
             warnings=warnings,
-            padding=5,
+            padding=0.15,
             engine=engine,
         )
 
@@ -225,9 +260,9 @@ class InvoiceOcrTests(unittest.TestCase):
         self.assertEqual(
             engine.calls,
             [
-                (1, (0.0, 0.0, 15.0, 17.0)),
-                (2, (0.0, 0.0, 10.0, 10.0)),
-                (1, (90.0, 91.0, 100.0, 100.0)),
+                (1, (0.0, 0.5, 11.35, 13.5)),
+                (2, (1.55, 1.55, 5.45, 5.45)),
+                (1, (94.4, 95.55, 99.6, 99.45)),
             ],
         )
         self.assertEqual([region["path"] for region in summary["regions"]], [
@@ -241,8 +276,9 @@ class InvoiceOcrTests(unittest.TestCase):
         self.assertEqual(fields["invoice_number"]["value"], "OCR page 1")
         self.assertEqual(fields["invoice_number"]["confidence"], 0.91)
         self.assertEqual(fields["invoice_number"]["method"], "fake_region")
-        self.assertEqual(fields["invoice_number"]["bbox"], [0.0, 0.0, 15.0, 17.0])
-        self.assertEqual(fields["line_items"][0]["quantity"]["bbox"], [90.0, 91.0, 100, 100])
+        self.assertEqual(fields["invoice_number"]["bbox"], [0.0, 0.5, 11.35, 13.5])
+        self.assertEqual(fields["line_items"][0]["quantity"]["bbox"], [94.4, 95.55, 99.6, 99.45])
+        self.assertEqual(summary["padding_percent"], 15.0)
 
     def test_ocr_attempts_are_capped_after_priority_sorting(self) -> None:
         fields = {
@@ -306,15 +342,50 @@ class InvoiceOcrTests(unittest.TestCase):
         candidates = low_confidence_ocr_regions(
             fields=fields,
             pages=[{"page": 1, "width": 20, "height": 20}],
-            padding=2,
+            padding=0.15,
         )
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].path, ("low_confidence",))
-        self.assertEqual(candidates[0].padded_bbox, (0.0, 0.0, 7.0, 7.0))
+        self.assertEqual(candidates[0].padded_bbox, (0.4, 0.4, 5.6, 5.6))
+
+    def test_targeted_ocr_creates_candidates_for_missing_and_confidenceless_fields(self) -> None:
+        fields = {
+            "invoice_number": None,
+            "due_date": {
+                "raw": "2026-07-10",
+                "value": "2026-07-10",
+                "page": 1,
+                "bbox": [60, 10, 90, 20],
+            },
+        }
+
+        candidates = low_confidence_ocr_regions(
+            fields=fields,
+            pages=[{"page": 1, "width": 100, "height": 100, "text": "Invoice No Due Date"}],
+            target_fields=("invoice_number", "due_date"),
+        )
+
+        self.assertEqual([candidate.path for candidate in candidates], [("invoice_number",), ("due_date",)])
+        self.assertEqual(candidates[0].reason, "missing_field")
+        self.assertEqual(candidates[1].reason, "missing_confidence")
+
+        engine = FakeOcrEngine()
+        summary = apply_low_confidence_region_ocr(
+            b"%PDF-1.4\nfixture",
+            fields=fields,
+            pages=[{"page": 1, "width": 100, "height": 100, "text": "Invoice No Due Date"}],
+            warnings=[],
+            target_fields=("invoice_number",),
+            max_regions=1,
+            engine=engine,
+        )
+        self.assertEqual(summary["regions"][0]["candidate_reason"], "missing_field")
+        self.assertEqual(fields["invoice_number"]["value"], "OCR page 1")
 
     def test_ocr_unavailable_returns_summary_and_warning_without_crashing_parse(self) -> None:
         fields = {
+            "invoice_number": {"value": "INV-O1D", "confidence": 0.96},
             "seller": {
                 "page": 1,
                 "bbox": [1, 1, 5, 5],
@@ -478,6 +549,63 @@ class InvoiceOcrTests(unittest.TestCase):
         self.assertEqual(applied, "ocr_confidence_missing")
         self.assertEqual(fields["invoice_number"]["value"], "INV-OLD")
 
+    def test_ambiguous_field_accepts_useful_ocr_below_general_threshold(self) -> None:
+        fields = {
+            "invoice_number": {
+                "raw": "INV-O1D",
+                "value": "INV-O1D",
+                "page": 1,
+                "bbox": [1, 1, 20, 8],
+                "confidence": 0.92,
+                "ambiguity_reasons": ["label_collision"],
+            }
+        }
+        candidate = OcrRegionCandidate(
+            path=("invoice_number",),
+            page=1,
+            bbox=(1, 1, 20, 8),
+            padded_bbox=(0, 0, 22, 10),
+            confidence=0.92,
+            reason="explicit_ambiguity",
+        )
+
+        applied = _replace_field_with_ocr_result(
+            fields,
+            fields["invoice_number"],
+            candidate,
+            RegionOcrText(text="INV-01D", confidence=0.80, method="fake_region"),
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(fields["invoice_number"]["value"], "INV-01D")
+        self.assertNotIn("ambiguity_reasons", fields["invoice_number"])
+
+    def test_full_ocr_can_correct_ambiguous_existing_fields_and_merge_optional_fields(self) -> None:
+        fields = {
+            "seller": {
+                "value": "Acme Supp1ies",
+                "confidence": 0.92,
+                "ambiguity_reasons": ["label_collision"],
+            },
+            "subtotal": None,
+        }
+        ocr_fields = {
+            "invoice_number": {"value": "INV-01D", "confidence": 0.97},
+            "seller": {"value": "Acme Supplies", "confidence": 0.90},
+            "subtotal": {"value": 100.0, "amount": 100.0, "confidence": 0.94},
+        }
+
+        applied = _merge_ocr_fields(
+            fields,
+            ocr_fields,
+            target_fields=("seller", "subtotal"),
+        )
+
+        self.assertEqual(applied, ["invoice_number", "seller", "subtotal"])
+        self.assertEqual(fields["invoice_number"]["value"], "INV-01D")
+        self.assertEqual(fields["seller"]["value"], "Acme Supplies")
+        self.assertEqual(fields["subtotal"]["amount"], 100.0)
+
     def test_parse_invoice_pdf_can_disable_ocr_explicitly(self) -> None:
         engine = FakeOcrEngine()
 
@@ -527,7 +655,7 @@ class InvoiceOcrTests(unittest.TestCase):
         )
 
         self.assertEqual(document_engine.calls, 1)
-        self.assertEqual(result["status"], "parsed")
+        self.assertEqual(result["status"], "needs_review")
         self.assertEqual(result["fields"]["invoice_number"]["value"], "INV-2026-0042")
         self.assertEqual(result["fields"]["due_date"]["value"], "2026-07-10")
         self.assertEqual(result["fields"]["balance_due"]["amount"], 216.0)
@@ -539,6 +667,7 @@ class InvoiceOcrTests(unittest.TestCase):
         self.assertTrue(result["fields"]["seller"]["method"].startswith("full_document_ocr:"))
         self.assertEqual(result["pages"][0]["source"], "full_document_ocr")
         self.assertEqual(result["ocr"]["full_document"]["trigger"], "no_text_layer")
+        self.assertEqual(result["review"]["reason"], "low_confidence_or_ambiguous_fields")
 
     def test_parse_invoice_pdf_uses_full_document_ocr_when_required_field_is_missing(self) -> None:
         document_engine = FakeFullDocumentOcrEngine()
@@ -551,7 +680,7 @@ class InvoiceOcrTests(unittest.TestCase):
         )
 
         self.assertEqual(document_engine.calls, 1)
-        self.assertEqual(result["status"], "parsed")
+        self.assertEqual(result["status"], "needs_review")
         self.assertEqual(result["fields"]["due_date"]["value"], "2026-07-10")
         self.assertTrue(result["ocr_used"])
         self.assertIn("due_date", result["ocr_parts"])
@@ -561,6 +690,7 @@ class InvoiceOcrTests(unittest.TestCase):
         self.assertIn("due_date", result["ocr"]["full_document"]["missing_fields_before"])
         self.assertIn("due_date", result["ocr"]["full_document"]["applied_fields"])
         self.assertEqual(result["ocr"]["full_document"]["missing_fields_after"], [])
+        self.assertEqual(result["review"]["reason"], "low_confidence_or_ambiguous_fields")
 
     def test_parse_invoice_pdf_routes_to_review_after_full_document_ocr_still_misses_required_data(self) -> None:
         document_engine = FakeFullDocumentOcrEngine(include_due_date=False)
@@ -575,12 +705,34 @@ class InvoiceOcrTests(unittest.TestCase):
         self.assertEqual(document_engine.calls, 1)
         self.assertEqual(result["status"], "needs_review")
         self.assertTrue(result["ocr_used"])
-        self.assertEqual(result["ocr_parts"], [])
+        self.assertIn("currency", result["ocr_parts"])
+        self.assertIn("line_items", result["ocr_parts"])
         self.assertIn("due_date", result["normal_model_failed_parts"])
         self.assertIn("due_date", result["ocr_failed_parts"])
         self.assertEqual(result["review"]["reason"], "missing_required_normalized_data")
         self.assertIn("due_date", result["review"]["missing_fields"])
         self.assertIn("due_date", result["ocr"]["full_document"]["missing_fields_after"])
+
+    def test_full_document_ocr_is_limited_to_important_pages(self) -> None:
+        canvases = []
+        for _index in range(5):
+            canvas = _PdfCanvas(
+                width_pt=210 * MM_TO_PT,
+                height_pt=297 * MM_TO_PT,
+                font_style="system",
+            )
+            canvas.rect(10, 10, 30, 20, fill="#ffffff", stroke="#111827")
+            canvases.append(canvas)
+        engine = PageLimitedOcrEngine()
+
+        result = parse_invoice_pdf(
+            _build_pdf(canvases),
+            document_ocr_engine=engine,
+            ocr_max_document_pages=2,
+        )
+
+        self.assertEqual(engine.calls, [([1, 5], 2)])
+        self.assertEqual(result["ocr"]["full_document"]["selected_pages"], [1, 5])
 
 
 if __name__ == "__main__":
