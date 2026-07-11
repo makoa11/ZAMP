@@ -6,6 +6,7 @@ import json
 import secrets
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -185,6 +186,23 @@ class MailIntegration:
     def list_accounts(self, *, owner_user_id: str) -> list[dict[str, Any]]:
         accounts = self.repo.list_accounts(owner_user_id=owner_user_id)
         return [_public_account(row) for row in accounts]
+
+    def list_invoice_review_items(self, *, owner_user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.repo.list_invoice_review_items(owner_user_id=owner_user_id, limit=limit)
+        return [_public_invoice_review_item(row) for row in rows]
+
+    def get_invoice_pdf_file(self, *, owner_user_id: str, pdf_file_id: int) -> dict[str, Any] | None:
+        row = self.repo.get_pdf_file_for_owner(owner_user_id=owner_user_id, pdf_file_id=pdf_file_id)
+        if not row:
+            return None
+        storage_path = str(row.get("storage_path") or "")
+        return {
+            "pdf_file_id": int(row["pdf_file_id"]),
+            "filename": str(row.get("filename") or f"invoice-{pdf_file_id}.pdf"),
+            "sha256": str(row.get("sha256") or ""),
+            "byte_size": int(row.get("byte_size") or 0),
+            "path": _storage_pdf_path(self.storage.root, storage_path),
+        }
 
     def get_invoice_match_patterns(self, *, owner_user_id: str) -> list[str]:
         return self.repo.get_invoice_match_patterns(owner_user_id=owner_user_id)
@@ -455,3 +473,104 @@ def _public_account(row: dict[str, Any]) -> dict[str, Any]:
         return value
 
     return {key: serialize(value) for key, value in row.items()}
+
+
+def _public_invoice_review_item(row: dict[str, Any]) -> dict[str, Any]:
+    parse_result = _json_dict(row.get("parse_result"))
+    fields = _json_dict(parse_result.get("fields"))
+    invoice_number = _scalar_field_value(fields.get("invoice_number"))
+    vendor = _party_display(fields.get("seller"))
+    amount = _money_display(fields.get("balance_due"))
+    pdf_file_id = int(row["pdf_file_id"])
+
+    return {
+        "attachment_id": int(row["attachment_id"]),
+        "pdf_file_id": pdf_file_id,
+        "filename": str(row.get("filename") or ""),
+        "invoice_number": invoice_number or str(row.get("filename") or ""),
+        "vendor": vendor,
+        "amount": amount,
+        "subject": row.get("subject"),
+        "sender": row.get("sender"),
+        "received_at": _serialize_datetime(row.get("received_at")),
+        "provider": row.get("provider"),
+        "account_email": row.get("account_email"),
+        "candidate_reason": row.get("candidate_reason"),
+        "parse_status": row.get("parse_status") or "pending",
+        "parsed_at": _serialize_datetime(row.get("parsed_at")),
+        "warnings": _json_list(row.get("parse_warnings")),
+        "pdf_url": f"/api/mail/pdfs/{pdf_file_id}",
+    }
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return decoded if isinstance(decoded, list) else []
+    return []
+
+
+def _scalar_field_value(field: Any) -> str | None:
+    if not isinstance(field, dict):
+        return None
+    value = field.get("value")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _party_display(field: Any) -> str | None:
+    if not isinstance(field, dict):
+        return None
+    raw = field.get("raw")
+    if not isinstance(raw, str):
+        return None
+    for line in raw.splitlines():
+        text = line.strip()
+        if text:
+            return text
+    return None
+
+
+def _money_display(field: Any) -> str | None:
+    if not isinstance(field, dict) or field.get("amount") is None:
+        return None
+    try:
+        amount = float(field["amount"])
+    except (TypeError, ValueError):
+        return None
+    currency = str(field.get("currency") or "").strip()
+    if currency:
+        return f"{currency} {amount:,.2f}"
+    return f"{amount:,.2f}"
+
+
+def _serialize_datetime(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
+    relative_path = Path(storage_path)
+    if not storage_path or relative_path.is_absolute() or ".." in relative_path.parts:
+        raise MailIntegrationError("PDF storage path must be relative to MAIL_PDF_STORAGE_DIR.")
+    return Path(root) / relative_path

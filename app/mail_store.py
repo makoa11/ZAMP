@@ -954,3 +954,66 @@ class MailRepository:
                 ),
             ).fetchone()
             return dict(row)
+
+    def list_invoice_review_items(self, *, owner_user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    attachments.id AS attachment_id,
+                    attachments.filename,
+                    attachments.candidate_reason,
+                    attachments.created_at AS attachment_created_at,
+                    pdf_files.id AS pdf_file_id,
+                    pdf_files.sha256,
+                    pdf_files.byte_size,
+                    pdf_files.storage_path,
+                    messages.id AS message_id,
+                    messages.sender,
+                    messages.subject,
+                    messages.received_at,
+                    accounts.provider,
+                    accounts.email AS account_email,
+                    parse_results.status AS parse_status,
+                    parse_results.result AS parse_result,
+                    parse_results.warnings AS parse_warnings,
+                    parse_results.updated_at AS parsed_at
+                FROM mail_attachments AS attachments
+                JOIN mail_accounts AS accounts ON accounts.id = attachments.account_id
+                JOIN mail_messages AS messages ON messages.id = attachments.message_id
+                JOIN mail_pdf_files AS pdf_files ON pdf_files.id = attachments.pdf_file_id
+                LEFT JOIN mail_pdf_parse_results AS parse_results
+                    ON parse_results.pdf_file_id = pdf_files.id
+                WHERE accounts.owner_user_id = %s
+                  AND LOWER(parse_results.status) LIKE '%%review%%'
+                ORDER BY
+                    messages.received_at DESC NULLS LAST,
+                    attachments.created_at DESC,
+                    attachments.id DESC
+                LIMIT %s
+                """,
+                (owner_user_id, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_pdf_file_for_owner(self, *, owner_user_id: str, pdf_file_id: int) -> dict[str, Any] | None:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    pdf_files.id AS pdf_file_id,
+                    pdf_files.sha256,
+                    pdf_files.byte_size,
+                    pdf_files.storage_path,
+                    attachments.filename
+                FROM mail_pdf_files AS pdf_files
+                JOIN mail_attachments AS attachments ON attachments.pdf_file_id = pdf_files.id
+                JOIN mail_accounts AS accounts ON accounts.id = attachments.account_id
+                WHERE accounts.owner_user_id = %s
+                  AND pdf_files.id = %s
+                ORDER BY attachments.created_at DESC, attachments.id DESC
+                LIMIT 1
+                """,
+                (owner_user_id, pdf_file_id),
+            ).fetchone()
+            return dict(row) if row else None

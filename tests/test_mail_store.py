@@ -12,11 +12,19 @@ from app.mail_store import MailRepository, PdfStorage, SCHEMA_SQL, TokenCipher
 
 
 class FakeResult:
-    def __init__(self, row: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        row: dict[str, Any] | None = None,
+        rows: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.row = row
+        self.rows = rows or []
 
     def fetchone(self) -> dict[str, Any] | None:
         return self.row
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        return self.rows
 
 
 class FakeTransaction:
@@ -89,6 +97,16 @@ class FakeMailConnection:
                 return FakeResult()
             return FakeResult()
 
+        if "FROM mail_attachments AS attachments" in sql:
+            self.database.last_sql = sql
+            self.database.last_params = params
+            return FakeResult(rows=self.database.review_rows)
+
+        if "FROM mail_pdf_files AS pdf_files" in sql:
+            self.database.last_sql = sql
+            self.database.last_params = params
+            return FakeResult(row=self.database.pdf_row)
+
         raise AssertionError(f"Unexpected SQL: {sql}")
 
 
@@ -97,6 +115,10 @@ class FakeMailDatabase:
         self.jobs: list[dict[str, Any]] = []
         self.dedupe_keys: dict[str, dict[str, Any]] = {}
         self.next_job_id = 1
+        self.review_rows: list[dict[str, Any]] = []
+        self.pdf_row: dict[str, Any] | None = None
+        self.last_sql = ""
+        self.last_params: tuple[object, ...] = ()
 
     def connect(self) -> FakeMailConnection:
         return FakeMailConnection(self)
@@ -179,6 +201,43 @@ class MailRepositoryJobQueueTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(database.jobs), 1)
+
+
+class MailRepositoryInvoiceReviewTests(unittest.TestCase):
+    def test_list_invoice_review_items_reads_owner_mail_attachment_rows(self) -> None:
+        database = FakeMailDatabase()
+        database.review_rows = [
+            {
+                "attachment_id": 30,
+                "filename": "invoice.pdf",
+                "pdf_file_id": 20,
+            }
+        ]
+        repo = MailRepository(database)  # type: ignore[arg-type]
+
+        rows = repo.list_invoice_review_items(owner_user_id="user-123", limit=25)
+
+        self.assertEqual(rows, database.review_rows)
+        self.assertEqual(database.last_params, ("user-123", 25))
+        self.assertIn("JOIN mail_accounts AS accounts", database.last_sql)
+        self.assertIn("LEFT JOIN mail_pdf_parse_results AS parse_results", database.last_sql)
+        self.assertNotIn("generate_invoice", database.last_sql)
+
+    def test_get_pdf_file_for_owner_filters_by_owner_and_pdf_id(self) -> None:
+        database = FakeMailDatabase()
+        database.pdf_row = {
+            "pdf_file_id": 20,
+            "filename": "invoice.pdf",
+            "storage_path": "stored.pdf",
+        }
+        repo = MailRepository(database)  # type: ignore[arg-type]
+
+        row = repo.get_pdf_file_for_owner(owner_user_id="user-123", pdf_file_id=20)
+
+        self.assertEqual(row, database.pdf_row)
+        self.assertEqual(database.last_params, ("user-123", 20))
+        self.assertIn("JOIN mail_attachments AS attachments", database.last_sql)
+        self.assertIn("accounts.owner_user_id = %s", database.last_sql)
 
 
 class MailSchemaSqlTests(unittest.TestCase):
