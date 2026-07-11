@@ -192,8 +192,7 @@ class MailIntegration:
     def update_invoice_match_patterns(self, *, owner_user_id: str, patterns: list[str]) -> list[str]:
         normalized = normalize_invoice_match_patterns(patterns)
         stored = self.repo.set_invoice_match_patterns(owner_user_id=owner_user_id, patterns=normalized)
-        if stored:
-            self._enqueue_owner_fallbacks(owner_user_id=owner_user_id, patterns=stored)
+        self._enqueue_owner_fallbacks(owner_user_id=owner_user_id, patterns=stored)
         return stored
 
     def suggest_invoice_match_pattern(self, *, filename: str) -> str:

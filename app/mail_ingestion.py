@@ -272,11 +272,6 @@ class MailIngestionService:
 
     def process_gmail_history(self, *, account_id: int, notification_history_id: str | None = None) -> None:
         account = self._active_account(account_id, "gmail")
-        invoice_match_regexes = self._invoice_match_regexes_for_account(account)
-        if not invoice_match_regexes:
-            if notification_history_id:
-                self.repo.update_gmail_history(account_id=account_id, history_id=notification_history_id)
-            return
         start_history_id = account.get("gmail_history_id")
         if not start_history_id:
             self.repo.enqueue_job(
@@ -341,9 +336,7 @@ class MailIngestionService:
             self.repo.update_gmail_history(account_id=account_id, history_id=str(latest_history_id))
 
     def process_gmail_fallback(self, *, account_id: int) -> None:
-        account = self._active_account(account_id, "gmail")
-        if not self._invoice_match_regexes_for_account(account):
-            return
+        self._active_account(account_id, "gmail")
         access_token = self.token_manager.access_token_for(account_id)
         page_token = None
         while True:
@@ -369,8 +362,6 @@ class MailIngestionService:
     def process_gmail_message(self, *, account_id: int, message_id: str) -> None:
         account = self._active_account(account_id, "gmail")
         invoice_match_regexes = self._invoice_match_regexes_for_account(account)
-        if not invoice_match_regexes:
-            return
         access_token = self.token_manager.access_token_for(account_id)
         message = self.gmail.message(access_token=access_token, message_id=message_id)
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
@@ -383,7 +374,8 @@ class MailIngestionService:
         matching_pdf_parts = [
             part
             for part in pdf_parts
-            if is_invoice_candidate(
+            if not invoice_match_regexes
+            or is_invoice_candidate(
                 subject=subject,
                 sender=sender,
                 filename=part.get("filename") if isinstance(part.get("filename"), str) else None,
@@ -466,8 +458,6 @@ class MailIngestionService:
     def process_outlook_message(self, *, account_id: int, message_id: str) -> None:
         account = self._active_account(account_id, "outlook")
         invoice_match_regexes = self._invoice_match_regexes_for_account(account)
-        if not invoice_match_regexes:
-            return
         access_token = self.token_manager.access_token_for(account_id)
         message = self.outlook.message(access_token=access_token, message_id=message_id)
         subject = message.get("subject") if isinstance(message.get("subject"), str) else None
@@ -493,7 +483,7 @@ class MailIngestionService:
                 mime_type=mime_type if isinstance(mime_type, str) else None,
             ):
                 continue
-            if not is_invoice_candidate(
+            if invoice_match_regexes and not is_invoice_candidate(
                 subject=subject,
                 sender=sender,
                 filename=filename if isinstance(filename, str) else None,
@@ -566,9 +556,7 @@ class MailIngestionService:
             )
 
     def process_outlook_delta(self, *, account_id: int) -> None:
-        account = self._active_account(account_id, "outlook")
-        if not self._invoice_match_regexes_for_account(account):
-            return
+        self._active_account(account_id, "outlook")
         access_token = self.token_manager.access_token_for(account_id)
         delta_link = account.get("outlook_delta_link") if isinstance(account.get("outlook_delta_link"), str) else None
 

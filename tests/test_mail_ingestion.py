@@ -234,7 +234,7 @@ class InvoiceCandidateTests(unittest.TestCase):
 
 
 class GmailIngestionTests(unittest.TestCase):
-    def test_gmail_fallback_does_nothing_without_user_patterns(self) -> None:
+    def test_gmail_fallback_uses_pdf_query_without_user_patterns(self) -> None:
         repo = TestRepo(patterns=[])
         gmail = TestGmail(b"%PDF-1.4\ninvoice")
 
@@ -248,7 +248,7 @@ class GmailIngestionTests(unittest.TestCase):
 
         service.process_gmail_fallback(account_id=1)
 
-        self.assertEqual(gmail.list_queries, [])
+        self.assertEqual(gmail.list_queries, [GMAIL_PDF_FALLBACK_QUERY])
 
     def test_gmail_fallback_uses_pdf_query_after_user_patterns_are_saved(self) -> None:
         repo = TestRepo(patterns=INVOICE_PATTERNS)
@@ -289,7 +289,7 @@ class GmailIngestionTests(unittest.TestCase):
         self.assertEqual(repo.jobs[0]["unique_key"], "parse-pdf:30")
         self.assertEqual(gmail.attachment_calls, 1)
 
-    def test_gmail_message_is_not_fetched_without_user_patterns(self) -> None:
+    def test_gmail_pdf_attachment_is_saved_without_user_patterns(self) -> None:
         repo = TestRepo(patterns=[])
         pdf_content = b"%PDF-1.4\ninvoice"
         gmail = TestGmail(pdf_content)
@@ -305,9 +305,10 @@ class GmailIngestionTests(unittest.TestCase):
 
             service.process_gmail_message(account_id=1, message_id="message-1")
 
-        self.assertEqual(gmail.message_calls, 0)
-        self.assertEqual(gmail.attachment_calls, 0)
-        self.assertEqual(repo.pdfs, [])
+        self.assertEqual(gmail.message_calls, 1)
+        self.assertEqual(gmail.attachment_calls, 1)
+        self.assertEqual(len(repo.pdfs), 1)
+        self.assertEqual(repo.attachments[0]["candidate_reason"], "pdf_attachment")
 
     def test_gmail_non_invoice_pdf_is_ignored_before_attachment_fetch(self) -> None:
         repo = TestRepo(patterns=INVOICE_PATTERNS)
@@ -390,7 +391,7 @@ class OutlookIngestionTests(unittest.TestCase):
         self.assertEqual(repo.jobs, [])
         self.assertEqual(outlook.attachment_calls, 1)
 
-    def test_outlook_message_is_not_fetched_without_user_patterns(self) -> None:
+    def test_outlook_pdf_attachment_is_saved_without_user_patterns(self) -> None:
         repo = TestRepo(provider="outlook", patterns=[])
         pdf_content = b"%PDF-1.4\ninvoice"
         outlook = TestOutlook(pdf_content)
@@ -406,6 +407,7 @@ class OutlookIngestionTests(unittest.TestCase):
 
             service.process_outlook_message(account_id=1, message_id="message-1")
 
-        self.assertEqual(outlook.message_calls, 0)
-        self.assertEqual(outlook.attachment_calls, 0)
-        self.assertEqual(repo.pdfs, [])
+        self.assertEqual(outlook.message_calls, 1)
+        self.assertEqual(outlook.attachment_calls, 1)
+        self.assertEqual(len(repo.pdfs), 1)
+        self.assertEqual(repo.attachments[0]["candidate_reason"], "pdf_attachment")

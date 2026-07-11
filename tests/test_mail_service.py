@@ -250,7 +250,7 @@ class InvoicePatternSettingsTests(unittest.TestCase):
 
         self.assertEqual(len(integration.repo.jobs), 2)
 
-    def test_update_invoice_patterns_allows_empty_list_without_catchup_jobs(
+    def test_update_invoice_patterns_empty_list_enqueues_catchup_jobs(
         self,
     ) -> None:
         integration = CapturingMailIntegration()
@@ -260,7 +260,10 @@ class InvoicePatternSettingsTests(unittest.TestCase):
         )
 
         self.assertEqual(patterns, [])
-        self.assertEqual(integration.repo.jobs, [])
+        self.assertEqual(
+            [job["job_type"] for job in integration.repo.jobs],
+            ["gmail_fallback_sync", "outlook_delta_sync"],
+        )
 
     def test_update_invoice_patterns_rejects_invalid_regex(self) -> None:
         integration = CapturingMailIntegration()
