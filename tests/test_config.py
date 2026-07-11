@@ -71,3 +71,36 @@ class ConfigTests(unittest.TestCase):
                     load_config(root)
 
         self.assertIn("MAIL_DB_POOL_MAX_SIZE", str(error.exception))
+
+    def test_mail_parse_ocr_region_limit_is_loaded_from_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {
+                    **self._base_env(),
+                    "MAIL_PARSE_OCR_MAX_REGIONS": "3",
+                },
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        self.assertEqual(config.mail_parse_ocr_max_regions, 3)
+
+    def test_mail_parse_ocr_max_regions_must_be_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {
+                    **self._base_env(),
+                    "MAIL_PARSE_OCR_MAX_REGIONS": "0",
+                },
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ConfigError) as error:
+                    load_config(root)
+
+        self.assertIn("MAIL_PARSE_OCR_MAX_REGIONS", str(error.exception))

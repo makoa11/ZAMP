@@ -189,3 +189,7 @@ class MailSchemaSqlTests(unittest.TestCase):
             SCHEMA_SQL,
         )
         self.assertIn("DELETE FROM ingestion_jobs\nWHERE status = 'completed'", SCHEMA_SQL)
+
+    def test_parse_result_status_schema_allows_review_queue(self) -> None:
+        self.assertIn("'needs_review'", SCHEMA_SQL)
+        self.assertIn("DROP CONSTRAINT IF EXISTS mail_pdf_parse_results_status_check", SCHEMA_SQL)

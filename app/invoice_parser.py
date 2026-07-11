@@ -7,8 +7,31 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
+from .invoice_ocr import (
+    DocumentOcrEngine,
+    DocumentOcrResult,
+    OCR_CONFIDENCE_THRESHOLD,
+    OCR_MAX_REGIONS,
+    OCR_REGION_PADDING,
+    OcrRegionCandidate,
+    RegionOcrEngine,
+    RegionOcrUnavailable,
+    RegionOcrText,
+    TesseractRegionOcrEngine,
+    apply_low_confidence_region_ocr,
+)
 
-PARSER_VERSION = "static-pdf-v1"
+PARSER_VERSION = "static-pdf-v2"
+OCR_MIN_REPLACEMENT_IMPROVEMENT = 0.03
+REQUIRED_NORMALIZED_FIELDS = (
+    "invoice_number",
+    "issue_date",
+    "due_date",
+    "currency",
+    "seller",
+    "buyer",
+    "balance_due",
+)
 
 FIELD_KEYS = (
     "invoice_number",
@@ -440,6 +463,7 @@ class Word:
     top: float
     x1: float
     bottom: float
+    confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -512,7 +536,18 @@ class WordTableRow:
     bbox: list[float]
 
 
-def parse_invoice_pdf(content: bytes, *, source_id: str | None = None) -> dict[str, Any]:
+def parse_invoice_pdf(
+    content: bytes,
+    *,
+    source_id: str | None = None,
+    enable_ocr: bool = True,
+    enable_full_ocr_fallback: bool = True,
+    ocr_confidence_threshold: float = OCR_CONFIDENCE_THRESHOLD,
+    ocr_padding: float = OCR_REGION_PADDING,
+    ocr_max_regions: int | None = OCR_MAX_REGIONS,
+    ocr_engine: RegionOcrEngine | None = None,
+    document_ocr_engine: DocumentOcrEngine | None = None,
+) -> dict[str, Any]:
     warnings: list[str] = []
     try:
         import pdfplumber  # type: ignore[import-not-found]
@@ -569,26 +604,381 @@ def parse_invoice_pdf(content: bytes, *, source_id: str | None = None) -> dict[s
         )
 
     if _has_no_text_layer(char_count, words):
+        if enable_ocr and enable_full_ocr_fallback:
+            full_ocr = _run_full_document_ocr(
+                content,
+                warnings=warnings,
+                ocr_engine=ocr_engine,
+                document_ocr_engine=document_ocr_engine,
+            )
+            if full_ocr is not None:
+                ocr_result, full_ocr_summary = full_ocr
+                pages = _ocr_pages_to_parser_pages(ocr_result)
+                words = _ocr_words_to_parser_words(ocr_result)
+                full_ocr_summary["trigger"] = "no_text_layer"
+                full_ocr_summary["missing_fields_before"] = list(REQUIRED_NORMALIZED_FIELDS)
+                return _parse_words_result(
+                    words=words,
+                    pages=pages,
+                    warnings=warnings,
+                    source_id=source_id,
+                    ocr_summary={"full_document": full_ocr_summary},
+                    tag_fields_as_full_ocr=True,
+                )
         return _empty_result(
-            "no_text_layer",
+            "needs_review" if enable_ocr and enable_full_ocr_fallback else "no_text_layer",
             pages=pages,
-            warnings=["PDF has no usable text layer; OCR is not attempted by this parser."],
+            warnings=[
+                (
+                    "PDF has no usable text layer; full-document OCR could not extract usable text."
+                    if enable_ocr and enable_full_ocr_fallback
+                    else "PDF has no usable text layer; OCR is disabled."
+                ),
+                *warnings,
+            ],
             source_id=source_id,
         )
 
-    lines = _build_lines(words)
-    fields = _extract_fields(lines=lines, words=words, warnings=warnings)
+    fields = _extract_fields_from_words(words, warnings)
+    ocr_summary = None
+    if enable_ocr:
+        region_ocr_summary = apply_low_confidence_region_ocr(
+            content,
+            fields=fields,
+            pages=pages,
+            warnings=warnings,
+            threshold=ocr_confidence_threshold,
+            padding=ocr_padding,
+            max_regions=ocr_max_regions,
+            engine=ocr_engine,
+            field_updater=lambda field, candidate, ocr_text: _replace_field_with_ocr_result(
+                fields,
+                field,
+                candidate,
+                ocr_text,
+            ),
+        )
+        ocr_summary = region_ocr_summary
+
+        missing_after_region_ocr = _missing_required_normalized_fields(fields)
+        if missing_after_region_ocr and enable_full_ocr_fallback:
+            full_ocr = _run_full_document_ocr(
+                content,
+                warnings=warnings,
+                ocr_engine=ocr_engine,
+                document_ocr_engine=document_ocr_engine,
+            )
+            if full_ocr is not None:
+                ocr_result, full_ocr_summary = full_ocr
+                full_ocr_summary["trigger"] = "missing_required_fields"
+                full_ocr_summary["missing_fields_before"] = missing_after_region_ocr
+                full_ocr_warnings: list[str] = []
+                full_ocr_fields = _extract_fields_from_words(
+                    _ocr_words_to_parser_words(ocr_result),
+                    full_ocr_warnings,
+                )
+                _tag_full_document_ocr_fields(full_ocr_fields)
+                applied_fields = _merge_missing_required_fields(fields, full_ocr_fields)
+                full_ocr_summary["applied_fields"] = applied_fields
+                full_ocr_summary["missing_fields_after"] = _missing_required_normalized_fields(fields)
+                for warning in full_ocr_warnings:
+                    _append_warning_once(warnings, f"Full-document OCR parse: {warning}")
+                ocr_summary["full_document"] = full_ocr_summary
+
+    return _finalize_parse_result(
+        fields=fields,
+        pages=pages,
+        warnings=warnings,
+        source_id=source_id,
+        ocr_summary=ocr_summary,
+    )
+
+
+def _parse_words_result(
+    *,
+    words: list[Word],
+    pages: list[dict[str, Any]],
+    warnings: list[str],
+    source_id: str | None,
+    ocr_summary: dict[str, Any] | None = None,
+    tag_fields_as_full_ocr: bool = False,
+) -> dict[str, Any]:
+    fields = _extract_fields_from_words(words, warnings)
+    if tag_fields_as_full_ocr:
+        _tag_full_document_ocr_fields(fields)
+    return _finalize_parse_result(
+        fields=fields,
+        pages=pages,
+        warnings=warnings,
+        source_id=source_id,
+        ocr_summary=ocr_summary,
+    )
+
+
+def _finalize_parse_result(
+    *,
+    fields: dict[str, Any],
+    pages: list[dict[str, Any]],
+    warnings: list[str],
+    source_id: str | None,
+    ocr_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    missing_required_fields = _missing_required_normalized_fields(fields)
     _add_missing_warnings(fields, warnings)
     result = {
-        "status": "parsed",
+        "status": "parsed" if not missing_required_fields else "needs_review",
         "parser_version": PARSER_VERSION,
         "fields": fields,
         "pages": pages,
         "warnings": warnings,
+        **_ocr_tracking_metadata(
+            fields=fields,
+            ocr_summary=ocr_summary,
+            missing_required_fields=missing_required_fields,
+        ),
     }
+    if missing_required_fields:
+        result["review"] = {
+            "required": True,
+            "reason": "missing_required_normalized_data",
+            "missing_fields": missing_required_fields,
+        }
+    if ocr_summary is not None:
+        result["ocr"] = ocr_summary
     if source_id:
         result["source_id"] = source_id
     return result
+
+
+def _ocr_tracking_metadata(
+    *,
+    fields: dict[str, Any],
+    ocr_summary: dict[str, Any] | None,
+    missing_required_fields: list[str],
+) -> dict[str, Any]:
+    ocr_used = _ocr_summary_indicates_use(ocr_summary)
+    return {
+        "ocr_used": ocr_used,
+        "ocr_parts": _ocr_parts(fields=fields, ocr_summary=ocr_summary),
+        "normal_model_failed_parts": _normal_model_failed_parts(
+            ocr_summary=ocr_summary,
+            missing_required_fields=missing_required_fields,
+        ),
+        "ocr_failed_parts": missing_required_fields if ocr_used else [],
+    }
+
+
+def _ocr_summary_indicates_use(ocr_summary: dict[str, Any] | None) -> bool:
+    if not isinstance(ocr_summary, dict):
+        return False
+    if isinstance(ocr_summary.get("full_document"), dict):
+        return True
+    try:
+        return int(ocr_summary.get("attempted_count") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _ocr_parts(*, fields: dict[str, Any], ocr_summary: dict[str, Any] | None) -> list[str]:
+    parts = set(_full_document_ocr_parts_from_fields(fields))
+    if isinstance(ocr_summary, dict):
+        parts.update(_applied_region_ocr_parts(ocr_summary))
+        full_document = ocr_summary.get("full_document")
+        if isinstance(full_document, dict):
+            applied_fields = full_document.get("applied_fields")
+            if isinstance(applied_fields, list):
+                parts.update(str(part) for part in applied_fields if part)
+    return sorted(parts)
+
+
+def _normal_model_failed_parts(
+    *,
+    ocr_summary: dict[str, Any] | None,
+    missing_required_fields: list[str],
+) -> list[str]:
+    parts: set[str] = set()
+    if isinstance(ocr_summary, dict):
+        full_document = ocr_summary.get("full_document")
+        if isinstance(full_document, dict):
+            before = full_document.get("missing_fields_before")
+            if isinstance(before, list):
+                parts.update(str(part) for part in before if part)
+    if not parts:
+        parts.update(missing_required_fields)
+    return sorted(parts)
+
+
+def _applied_region_ocr_parts(ocr_summary: dict[str, Any]) -> set[str]:
+    parts: set[str] = set()
+    regions = ocr_summary.get("regions")
+    if not isinstance(regions, list):
+        return parts
+    for region in regions:
+        if not isinstance(region, dict) or region.get("applied") is not True:
+            continue
+        path = region.get("path")
+        if isinstance(path, str):
+            part = _ocr_part_from_summary_path(path)
+            if part:
+                parts.add(part)
+    return parts
+
+
+def _full_document_ocr_parts_from_fields(value: Any, path: tuple[str | int, ...] = ()) -> set[str]:
+    parts: set[str] = set()
+    if isinstance(value, dict):
+        method = value.get("method")
+        if isinstance(method, str) and method.startswith("full_document_ocr:"):
+            part = _ocr_part_from_path(path)
+            if part:
+                parts.add(part)
+        for child_key, child_value in value.items():
+            parts.update(_full_document_ocr_parts_from_fields(child_value, (*path, str(child_key))))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            parts.update(_full_document_ocr_parts_from_fields(item, (*path, index)))
+    return parts
+
+
+def _ocr_part_from_summary_path(path: str) -> str | None:
+    if path.startswith("fields."):
+        path = path[len("fields.") :]
+    path = re.sub(r"\[\d+\]", "", path)
+    return _ocr_part_from_path(tuple(part for part in path.split(".") if part))
+
+
+def _ocr_part_from_path(path: tuple[str | int, ...]) -> str | None:
+    if not path:
+        return None
+    if path[0] != "line_items":
+        return str(path[0])
+    for part in reversed(path):
+        if isinstance(part, str) and part != "line_items":
+            return f"line_items.{part}"
+    return "line_items"
+
+
+def _extract_fields_from_words(words: list[Word], warnings: list[str]) -> dict[str, Any]:
+    lines = _build_lines(words)
+    return _extract_fields(lines=lines, words=words, warnings=warnings)
+
+
+def _run_full_document_ocr(
+    content: bytes,
+    *,
+    warnings: list[str],
+    ocr_engine: RegionOcrEngine | None,
+    document_ocr_engine: DocumentOcrEngine | None,
+) -> tuple[DocumentOcrResult, dict[str, Any]] | None:
+    engine = _document_ocr_engine(ocr_engine=ocr_engine, document_ocr_engine=document_ocr_engine)
+    try:
+        ocr_result = engine.ocr_document(content)
+    except RegionOcrUnavailable as exc:
+        _append_warning_once(warnings, f"Full-document OCR unavailable: {exc}")
+        return None
+    except Exception as exc:
+        _append_warning_once(warnings, f"Full-document OCR failed: {exc}")
+        return None
+
+    summary = {
+        "status": "completed" if ocr_result.words else "skipped",
+        "method": ocr_result.method,
+        "page_count": len(ocr_result.pages),
+        "word_count": len(ocr_result.words),
+        "confidence": round(ocr_result.confidence, 3) if ocr_result.confidence is not None else None,
+    }
+    if not ocr_result.words:
+        summary["reason"] = "no_ocr_words"
+        _append_warning_once(warnings, "Full-document OCR did not extract any words.")
+    return ocr_result, summary
+
+
+def _document_ocr_engine(
+    *,
+    ocr_engine: RegionOcrEngine | None,
+    document_ocr_engine: DocumentOcrEngine | None,
+) -> DocumentOcrEngine:
+    if document_ocr_engine is not None:
+        return document_ocr_engine
+    if ocr_engine is not None and hasattr(ocr_engine, "ocr_document"):
+        return ocr_engine  # type: ignore[return-value]
+    return TesseractRegionOcrEngine()
+
+
+def _ocr_pages_to_parser_pages(ocr_result: DocumentOcrResult) -> list[dict[str, Any]]:
+    return [
+        {
+            "page": page.page,
+            "width": page.width,
+            "height": page.height,
+            "text": page.text,
+            "ocr_confidence": round(page.confidence, 3) if page.confidence is not None else None,
+            "source": "full_document_ocr",
+        }
+        for page in ocr_result.pages
+    ]
+
+
+def _ocr_words_to_parser_words(ocr_result: DocumentOcrResult) -> list[Word]:
+    return [
+        Word(
+            text=word.text,
+            page=word.page,
+            x0=word.x0,
+            top=word.top,
+            x1=word.x1,
+            bottom=word.bottom,
+            confidence=word.confidence,
+        )
+        for word in ocr_result.words
+    ]
+
+
+def _tag_full_document_ocr_fields(value: Any) -> None:
+    if isinstance(value, dict):
+        if isinstance(value.get("method"), str):
+            value["method"] = f"full_document_ocr:{value['method']}"
+        for child in value.values():
+            _tag_full_document_ocr_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            _tag_full_document_ocr_fields(child)
+
+
+def _merge_missing_required_fields(fields: dict[str, Any], ocr_fields: dict[str, Any]) -> list[str]:
+    applied: list[str] = []
+    for key in REQUIRED_NORMALIZED_FIELDS:
+        if _has_required_normalized_field(fields, key):
+            continue
+        ocr_value = ocr_fields.get(key)
+        if not _has_required_normalized_field(ocr_fields, key):
+            continue
+        fields[key] = ocr_value
+        applied.append(key)
+    return applied
+
+
+def _missing_required_normalized_fields(fields: dict[str, Any]) -> list[str]:
+    return [
+        key
+        for key in REQUIRED_NORMALIZED_FIELDS
+        if not _has_required_normalized_field(fields, key)
+    ]
+
+
+def _has_required_normalized_field(fields: dict[str, Any], key: str) -> bool:
+    value = fields.get(key)
+    if not isinstance(value, dict):
+        return False
+    if key == "balance_due":
+        return value.get("amount") is not None
+    normalized_value = value.get("value")
+    return normalized_value is not None and normalized_value != ""
+
+
+def _append_warning_once(warnings: list[str], warning: str) -> None:
+    if warning not in warnings:
+        warnings.append(warning)
 
 
 def _empty_result(
@@ -606,7 +996,19 @@ def _empty_result(
         "fields": fields,
         "pages": pages or [],
         "warnings": warnings or [],
+        "ocr_used": False,
+        "ocr_parts": [],
+        "normal_model_failed_parts": list(REQUIRED_NORMALIZED_FIELDS)
+        if status in {"needs_review", "no_text_layer"}
+        else [],
+        "ocr_failed_parts": list(REQUIRED_NORMALIZED_FIELDS) if status == "needs_review" else [],
     }
+    if status == "needs_review":
+        result["review"] = {
+            "required": True,
+            "reason": "missing_required_normalized_data",
+            "missing_fields": list(REQUIRED_NORMALIZED_FIELDS),
+        }
     if source_id:
         result["source_id"] = source_id
     return result
@@ -2293,6 +2695,237 @@ def _money_field(
     }
 
 
+def _replace_field_with_ocr_result(
+    fields: dict[str, Any],
+    field: dict[str, Any],
+    candidate: OcrRegionCandidate,
+    ocr_text: RegionOcrText,
+) -> bool | str:
+    text = _clean_field_raw(ocr_text.text)
+    if not text:
+        return "empty_ocr_text"
+
+    rejection_reason = _ocr_replacement_rejection_reason(field, ocr_text)
+    if rejection_reason:
+        return rejection_reason
+
+    field_key = _ocr_field_key(candidate.path)
+    if field_key == "currency":
+        parsed_currency = _currency_from_ocr_text(text)
+        if parsed_currency is None:
+            return "ocr_currency_unparseable"
+        raw, value = parsed_currency
+        field["raw"] = raw
+        field["value"] = value
+    elif field_key in {"issue_date", "due_date"}:
+        parsed_date = _parse_date(text)
+        if parsed_date is None:
+            return "ocr_date_unparseable"
+        raw, value = parsed_date
+        field["raw"] = raw
+        field["value"] = value
+    elif field_key in {"subtotal", "discount", "tax", "shipping", "paid", "balance_due", "unit_price", "amount"}:
+        money_values = _parse_money_values(text)
+        if not money_values:
+            return "ocr_money_unparseable"
+        money = money_values[-1]
+        inferred_currency = _field_currency(field) or _top_level_currency(fields)
+        field["raw"] = money.raw
+        field["value"] = round(money.amount, 2)
+        field["amount"] = round(money.amount, 2)
+        field["currency"] = _currency_for_money(money, inferred_currency)
+    elif field_key == "quantity":
+        quantity = _quantity_from_ocr_text(text)
+        if quantity is None:
+            return "ocr_quantity_unparseable"
+        field["raw"] = text
+        field["value"] = quantity
+    elif field_key == "line_items":
+        _replace_line_item_row_with_ocr_text(field, text)
+    else:
+        raw = _clean_ocr_text_for_field(field_key, text)
+        value = _normalize_ocr_scalar_value(field_key, raw)
+        if value is None:
+            return "ocr_scalar_unusable"
+        field["raw"] = raw
+        field["value"] = value
+
+    field["page"] = candidate.page
+    field["bbox"] = _rounded_ocr_bbox(candidate)
+    field["method"] = ocr_text.method
+    if ocr_text.confidence is not None:
+        field["confidence"] = round(ocr_text.confidence, 3)
+    _sync_line_item_value_after_ocr(fields, candidate.path)
+    return True
+
+
+def _ocr_replacement_rejection_reason(field: dict[str, Any], ocr_text: RegionOcrText) -> str | None:
+    ocr_confidence = _normalized_confidence(ocr_text.confidence)
+    if ocr_confidence is None:
+        return "ocr_confidence_missing"
+    if ocr_confidence < OCR_CONFIDENCE_THRESHOLD:
+        return "ocr_confidence_below_threshold"
+    original_confidence = _normalized_confidence(field.get("confidence"))
+    if (
+        original_confidence is not None
+        and _has_usable_field_value(field)
+        and ocr_confidence < min(1.0, original_confidence + OCR_MIN_REPLACEMENT_IMPROVEMENT)
+    ):
+        return "ocr_confidence_not_improved"
+    return None
+
+
+def _normalized_confidence(value: Any) -> float | None:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if confidence < 0:
+        return None
+    if confidence > 1 and confidence <= 100:
+        return confidence / 100
+    return confidence
+
+
+def _has_usable_field_value(field: dict[str, Any]) -> bool:
+    for key in ("value", "raw", "amount"):
+        value = field.get(key)
+        if value is not None and value != "":
+            return True
+    return False
+
+
+def _ocr_field_key(path: tuple[str | int, ...]) -> str | None:
+    if not path:
+        return None
+    if path[0] != "line_items":
+        return str(path[0])
+    for part in reversed(path):
+        if isinstance(part, str) and part != "line_items":
+            return part
+    return "line_items"
+
+
+def _currency_from_ocr_text(text: str) -> tuple[str, str] | None:
+    for match in re.finditer(CURRENCY_PATTERN, text, re.IGNORECASE):
+        raw = match.group(0)
+        currency = _normalize_currency(raw)
+        if currency is not None:
+            return raw, currency
+    for money in _parse_money_values(text):
+        if money.currency is not None:
+            return money.raw, money.currency
+    return None
+
+
+def _quantity_from_ocr_text(text: str) -> int | float | None:
+    for token in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        quantity = _parse_quantity_token(token)
+        if quantity is not None:
+            return quantity
+    return None
+
+
+def _field_currency(field: dict[str, Any]) -> str | None:
+    currency = field.get("currency")
+    return currency if isinstance(currency, str) else None
+
+
+def _top_level_currency(fields: dict[str, Any]) -> str | None:
+    currency = fields.get("currency")
+    if not isinstance(currency, dict):
+        return None
+    value = currency.get("value")
+    return value if isinstance(value, str) else None
+
+
+def _normalize_ocr_scalar_value(field_key: str | None, raw: str) -> Any:
+    if field_key == "invoice_number":
+        return _normalize_scalar_value("invoice_number", _trim_at_known_label(raw))
+    if field_key == "purchase_order":
+        return _normalize_scalar_value("purchase_order", _trim_at_known_label(raw))
+    if field_key == "terms":
+        return _normalize_scalar_value("terms", _trim_at_known_label(raw))
+    if field_key == "payment_instructions":
+        return _normalize_scalar_value("payment_instructions", raw)
+    return raw if raw else None
+
+
+def _clean_ocr_text_for_field(field_key: str | None, text: str) -> str:
+    raw = _clean_line_item_description(text) if field_key == "description" else text
+    if field_key in {"invoice_number", "purchase_order", "terms", "payment_instructions", "seller", "buyer"}:
+        raw = _strip_leading_field_label(field_key, raw)
+    return raw
+
+
+def _strip_leading_field_label(field_key: str | None, raw: str) -> str:
+    if not field_key or field_key not in LABELS:
+        return raw.strip(" :")
+    value = raw.strip()
+    for label in sorted(LABELS[field_key], key=len, reverse=True):
+        pattern = _leading_label_pattern(label)
+        if pattern is None:
+            continue
+        stripped = pattern.sub("", value, count=1).strip(" :")
+        if stripped != value:
+            return stripped
+    return value.strip(" :")
+
+
+def _leading_label_pattern(label: str) -> re.Pattern[str] | None:
+    tokens = re.findall(r"[a-z0-9]+", label, re.IGNORECASE)
+    if not tokens:
+        return None
+    separator = r"[\s:#./_-]*"
+    return re.compile(
+        r"^\s*" + separator.join(re.escape(token) for token in tokens) + r"\s*[:#./_-]?\s*",
+        re.IGNORECASE,
+    )
+
+
+def _replace_line_item_row_with_ocr_text(field: dict[str, Any], text: str) -> None:
+    field["row_raw"] = text
+    money_values = _parse_money_values(text)
+    if money_values:
+        description = _description_before_amount(text, money_values[-1].raw)
+        field["raw"] = _clean_line_item_description(description) or field.get("raw") or text
+    else:
+        field["raw"] = _clean_line_item_description(text) or text
+
+
+def _rounded_ocr_bbox(candidate: OcrRegionCandidate) -> list[float]:
+    return [round(item, 2) for item in candidate.padded_bbox]
+
+
+def _sync_line_item_value_after_ocr(fields: dict[str, Any], path: tuple[str | int, ...]) -> None:
+    if len(path) < 3 or path[0] != "line_items" or not isinstance(path[1], int):
+        return
+    line_items = fields.get("line_items")
+    if not isinstance(line_items, list) or path[1] >= len(line_items):
+        return
+    item = line_items[path[1]]
+    if not isinstance(item, dict):
+        return
+    value = item.get("value")
+    if not isinstance(value, dict):
+        return
+    role = path[-1]
+    child = item.get(role)
+    if not isinstance(role, str) or not isinstance(child, dict):
+        return
+    if role == "description":
+        value["description"] = child.get("value")
+        if isinstance(child.get("value"), str):
+            item["raw"] = child["value"]
+    elif role == "quantity":
+        value["quantity"] = child.get("value")
+    elif role == "unit_price":
+        value["unit_price"] = child.get("amount")
+    elif role == "amount":
+        value["amount"] = child.get("amount")
+        value["currency"] = child.get("currency")
+
+
 def _best_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not candidates:
         return None
@@ -2437,11 +3070,8 @@ def _merge_bboxes(lines: Iterable[Line]) -> list[float]:
 
 
 def _add_missing_warnings(fields: dict[str, Any], warnings: list[str]) -> None:
-    for key in ("invoice_number", "issue_date", "due_date", "balance_due"):
-        if not fields.get(key):
-            warnings.append(f"Could not confidently extract {key}.")
-    if not (fields.get("seller") or fields.get("buyer") or fields.get("line_items")):
-        warnings.append("Could not confidently extract any invoice party or line item.")
+    for key in _missing_required_normalized_fields(fields):
+        _append_warning_once(warnings, f"Could not confidently extract required normalized field {key}.")
 
 
 def _add_line_item_total_warnings(fields: dict[str, Any], warnings: list[str]) -> None:

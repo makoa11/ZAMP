@@ -2,3 +2,6 @@ workos
 psycopg[binary,pool]
 pdfplumber
 pypdf
+pymupdf
+pillow
+pytesseract

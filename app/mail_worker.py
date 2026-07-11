@@ -117,6 +117,7 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
     result = parse_invoice_pdf(
         pdf_path.read_bytes(),
         source_id=f"mail_pdf_file:{pdf_file_id}",
+        ocr_max_regions=integration.config.mail_parse_ocr_max_regions,
     )
     warnings = result.get("warnings")
     integration.repo.upsert_pdf_parse_result(

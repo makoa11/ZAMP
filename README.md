@@ -36,6 +36,8 @@ Then run:
 .venv/bin/python main.py
 ```
 
+The invoice parser performs OCR by default when OCR dependencies are available. It first re-reads parsed evidence boxes whose confidence is below `0.85`; if required normalized fields are still missing, or if the PDF has no usable text layer, it runs full-document OCR and parses those OCR words through the same schema. Results that still miss required normalized fields are marked `needs_review`. Install the system `tesseract` binary as well as the Python requirements to enable OCR.
+
 Open `http://127.0.0.1:8000/login`.
 
 Signup is available at `http://127.0.0.1:8000/signup`.
@@ -155,4 +157,4 @@ Run the ingestion worker:
 .venv/bin/python -m app.mail_worker
 ```
 
-The worker claims provider jobs, refreshes OAuth tokens when needed, renews Gmail watches and Outlook subscriptions hourly, and enqueues polling fallback jobs every 15 minutes by default. PDFs are saved only when the signed-in user has added dashboard regex patterns and a pattern matches the PDF filename, subject, or body/snippet. The dashboard can generate a regex from a sample filename or dropped local PDF name. PDFs are stored under `MAIL_PDF_STORAGE_DIR` as SHA-256-named files; Postgres stores account, message, attachment, file, webhook event, active/retry/failed job state, lightweight job dedupe keys, invoice matching metadata, and static parse results. Saved PDFs enqueue `parse_pdf` jobs that run the non-OCR text-layer invoice parser.
+The worker claims provider jobs, refreshes OAuth tokens when needed, renews Gmail watches and Outlook subscriptions hourly, and enqueues polling fallback jobs every 15 minutes by default. PDFs are saved only when the signed-in user has added dashboard regex patterns and a pattern matches the PDF filename, subject, or body/snippet. The dashboard can generate a regex from a sample filename or dropped local PDF name. PDFs are stored under `MAIL_PDF_STORAGE_DIR` as SHA-256-named files; Postgres stores account, message, attachment, file, webhook event, active/retry/failed job state, lightweight job dedupe keys, invoice matching metadata, and static parse results. Saved PDFs enqueue `parse_pdf` jobs that run the static text-layer invoice parser, targeted OCR for low-confidence parsed boxes, full-document OCR fallback when required normalized fields are missing, and `needs_review` routing when OCR still cannot complete those required fields. `MAIL_PARSE_OCR_MAX_REGIONS` caps the number of targeted regions attempted per PDF.

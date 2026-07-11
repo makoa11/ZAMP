@@ -29,6 +29,9 @@ class TestRepo:
 
 class TestIntegration:
     def __init__(self, root: Path) -> None:
+        self.config = SimpleNamespace(
+            mail_parse_ocr_max_regions=8,
+        )
         self.repo = TestRepo()
         self.storage = SimpleNamespace(root=root)
 
@@ -56,12 +59,46 @@ class MailWorkerParsePdfTests(unittest.TestCase):
             with patch("app.mail_worker.parse_invoice_pdf", return_value=parser_result) as parser:
                 _handle_job(integration, job)  # type: ignore[arg-type]
 
-        parser.assert_called_once_with(b"%PDF-1.4\nfixture", source_id="mail_pdf_file:42")
+        parser.assert_called_once_with(
+            b"%PDF-1.4\nfixture",
+            source_id="mail_pdf_file:42",
+            ocr_max_regions=8,
+        )
         self.assertEqual(integration.repo.completed, [99])
         self.assertEqual(integration.repo.retries, [])
         self.assertEqual(integration.repo.parse_results[0]["pdf_file_id"], 42)
         self.assertEqual(integration.repo.parse_results[0]["status"], "parsed")
         self.assertEqual(integration.repo.parse_results[0]["warnings"], ["missing tax"])
+
+    def test_parse_pdf_job_passes_ocr_region_cap_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Path(root, "invoice.pdf").write_bytes(b"%PDF-1.4\nfixture")
+            integration = TestIntegration(root)
+            integration.config.mail_parse_ocr_max_regions = 3
+            job = {
+                "id": 99,
+                "type": "parse_pdf",
+                "attempts": 1,
+                "payload": json.dumps({"pdf_file_id": 42, "storage_path": "invoice.pdf"}),
+            }
+            parser_result = {
+                "status": "parsed",
+                "parser_version": "static-pdf-v2",
+                "fields": {"line_items": []},
+                "pages": [],
+                "warnings": [],
+            }
+
+            with patch("app.mail_worker.parse_invoice_pdf", return_value=parser_result) as parser:
+                _handle_job(integration, job)  # type: ignore[arg-type]
+
+        parser.assert_called_once_with(
+            b"%PDF-1.4\nfixture",
+            source_id="mail_pdf_file:42",
+            ocr_max_regions=3,
+        )
+        self.assertEqual(integration.repo.completed, [99])
 
     def test_parse_pdf_job_retries_when_parser_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -175,13 +175,18 @@ CREATE TABLE IF NOT EXISTS mail_pdf_files (
 
 CREATE TABLE IF NOT EXISTS mail_pdf_parse_results (
     pdf_file_id BIGINT PRIMARY KEY REFERENCES mail_pdf_files(id) ON DELETE CASCADE,
-    status TEXT NOT NULL CHECK (status IN ('parsed', 'no_text_layer', 'unsupported', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('parsed', 'needs_review', 'no_text_layer', 'unsupported', 'failed')),
     parser_version TEXT NOT NULL,
     result JSONB NOT NULL DEFAULT '{}'::jsonb,
     warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE mail_pdf_parse_results DROP CONSTRAINT IF EXISTS mail_pdf_parse_results_status_check;
+ALTER TABLE mail_pdf_parse_results
+ADD CONSTRAINT mail_pdf_parse_results_status_check
+CHECK (status IN ('parsed', 'needs_review', 'no_text_layer', 'unsupported', 'failed'));
 
 CREATE TABLE IF NOT EXISTS mail_attachments (
     id BIGSERIAL PRIMARY KEY,
