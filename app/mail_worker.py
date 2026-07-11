@@ -53,8 +53,8 @@ def run_forever(
                 _enqueue_polling_fallbacks(integration)
                 last_fallback_at = now
             if now - last_renewal_at >= 3600:
-                integration.ingestion.renew_mail_subscriptions()
                 last_renewal_at = now
+                _renew_subscriptions_safely(integration)
             jobs = integration.repo.claim_jobs(
                 worker_id=worker_name,
                 job_types=MAIL_JOB_TYPES,
@@ -88,14 +88,20 @@ def _handle_job(integration: MailIntegration, job: dict[str, Any]) -> None:
                 message_id=str(payload["message_id"]),
             )
         elif job_type == "gmail_fallback_sync":
-            integration.ingestion.process_gmail_fallback(account_id=int(payload["account_id"]))
+            integration.ingestion.process_gmail_fallback(
+                account_id=int(payload["account_id"]),
+                reprocess_key=_optional_string(payload.get("reprocess_key")),
+            )
         elif job_type == "outlook_message_fetch":
             integration.ingestion.process_outlook_message(
                 account_id=int(payload["account_id"]),
                 message_id=str(payload["message_id"]),
             )
         elif job_type == "outlook_delta_sync":
-            integration.ingestion.process_outlook_delta(account_id=int(payload["account_id"]))
+            integration.ingestion.process_outlook_delta(
+                account_id=int(payload["account_id"]),
+                reprocess_key=_optional_string(payload.get("reprocess_key")),
+            )
         elif job_type == "renew_mail_subscriptions":
             integration.ingestion.renew_mail_subscriptions()
         elif job_type == "parse_pdf":
@@ -111,6 +117,14 @@ def _handle_job(integration: MailIntegration, job: dict[str, Any]) -> None:
         return
 
     integration.repo.complete_job(job_id=int(job["id"]))
+
+
+def _renew_subscriptions_safely(integration: MailIntegration) -> bool:
+    try:
+        integration.ingestion.renew_mail_subscriptions()
+    except Exception:
+        return False
+    return True
 
 
 def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any]) -> None:
@@ -176,6 +190,10 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _owner_user_id_for_parse_job(integration: MailIntegration, payload: dict[str, Any]) -> str | None:

@@ -135,6 +135,8 @@ GOOGLE_OAUTH_CLIENT_ID=
 GOOGLE_OAUTH_CLIENT_SECRET=
 GMAIL_PUBSUB_TOPIC=projects/your-project/topics/gmail-inbound
 GMAIL_PUBSUB_SUBSCRIPTION=projects/your-project/subscriptions/gmail-inbound-push
+GMAIL_PUBSUB_OIDC_AUDIENCE=https://your-app.example/webhooks/gmail/pubsub
+GMAIL_PUBSUB_OIDC_SERVICE_ACCOUNT_EMAIL=gmail-push@your-project.iam.gserviceaccount.com
 GMAIL_WEBHOOK_SECRET=
 
 MICROSOFT_CLIENT_ID=
@@ -164,7 +166,7 @@ Frontend-facing APIs:
 
 Provider webhooks:
 
-- Gmail Pub/Sub push target: `POST /webhooks/gmail/pubsub` with `X-Zamp-Webhook-Secret`, `Authorization: Bearer ...`, or `?secret=...` when Pub/Sub cannot send a custom header.
+- Gmail Pub/Sub push target: `POST /webhooks/gmail/pubsub` with a Google-signed OIDC bearer token. Configure its audience and service-account email with `GMAIL_PUBSUB_OIDC_AUDIENCE` and `GMAIL_PUBSUB_OIDC_SERVICE_ACCOUNT_EMAIL`. `X-Zamp-Webhook-Secret` is available as a header-only fallback.
 - Outlook Graph notification target: `POST /webhooks/outlook`; notifications are validated with Graph `clientState`.
 
 Run the ingestion worker:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from cryptography.fernet import Fernet
 
@@ -211,6 +212,30 @@ class MailIntegrationLifecycleTests(unittest.TestCase):
         self.assertIsNone(integration._repo)
         self.assertIsNone(integration._cipher)
 
+    def test_outlook_disconnect_deletes_graph_subscription(self) -> None:
+        integration = MailIntegration(SimpleNamespace())
+        integration._ready = True
+        integration._repo = MagicMock()  # type: ignore[assignment]
+        integration._repo.get_account.return_value = {
+            "id": 7,
+            "owner_user_id": "user-123",
+            "provider": "outlook",
+            "status": "active",
+            "outlook_subscription_id": "subscription-7",
+        }
+        integration._repo.disconnect_account.return_value = True
+        integration._token_manager = MagicMock()  # type: ignore[assignment]
+        integration._token_manager.access_token_for.return_value = "access-token"
+        integration._outlook = MagicMock()  # type: ignore[assignment]
+
+        disconnected = integration.disconnect_account(owner_user_id="user-123", account_id=7)
+
+        self.assertTrue(disconnected)
+        integration.outlook.delete_subscription.assert_called_once_with(
+            access_token="access-token",
+            subscription_id="subscription-7",
+        )
+
     def test_close_resets_state_when_database_close_raises(self) -> None:
         class Database:
             def close(self) -> None:
@@ -229,16 +254,86 @@ class MailIntegrationLifecycleTests(unittest.TestCase):
         self.assertIsNone(integration._cipher)
 
 
+class MailOauthSetupTests(unittest.TestCase):
+    def _integration(self) -> MailIntegration:
+        integration = MailIntegration(
+            SimpleNamespace(
+                app_url="https://app.example",
+                mail_frontend_redirect_url="https://front.example/mail",
+            )
+        )
+        integration._ready = True
+        integration._repo = MagicMock()  # type: ignore[assignment]
+        integration._cipher = TokenCipher(Fernet.generate_key().decode("ascii"))  # type: ignore[assignment]
+        integration._gmail = MagicMock()  # type: ignore[assignment]
+        integration._outlook = MagicMock()  # type: ignore[assignment]
+        return integration
+
+    def test_gmail_watch_failure_does_not_write_active_account_and_lookup_is_owner_scoped(
+        self,
+    ) -> None:
+        integration = self._integration()
+        integration.gmail.exchange_code.return_value = {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "scope": "https://www.googleapis.com/auth/gmail.readonly",
+        }
+        integration.gmail.profile.return_value = {"emailAddress": "AP@example.com"}
+        integration.gmail.watch.side_effect = RuntimeError("watch failed")
+
+        with self.assertRaisesRegex(RuntimeError, "watch failed"):
+            integration._complete_gmail_oauth(
+                owner_user_id="user-123",
+                code="code-123",
+                code_verifier="verifier-123",
+            )
+
+        integration.repo.get_account_by_provider_email.assert_called_once_with(
+            owner_user_id="user-123",
+            provider="gmail",
+            email="ap@example.com",
+        )
+        integration.repo.upsert_account.assert_not_called()
+
+    def test_outlook_subscription_failure_does_not_write_active_account(self) -> None:
+        integration = self._integration()
+        integration.outlook.exchange_code.return_value = {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+        }
+        integration.outlook.me.return_value = {"mail": "ap@example.com"}
+        integration.outlook.create_subscription.side_effect = RuntimeError("subscription failed")
+
+        with self.assertRaisesRegex(RuntimeError, "subscription failed"):
+            integration._complete_outlook_oauth(owner_user_id="user-123", code="code-123")
+
+        integration.repo.upsert_account.assert_not_called()
+
+
+class GmailPubsubValidationTests(unittest.TestCase):
+    def test_configured_subscription_must_be_present_and_match(self) -> None:
+        integration = MailIntegration(
+            SimpleNamespace(gmail_pubsub_subscription="projects/p/subscriptions/expected")
+        )
+        integration._ready = True
+        integration._repo = MagicMock()  # type: ignore[assignment]
+
+        with self.assertRaisesRegex(MailIntegrationError, "did not match"):
+            integration.handle_gmail_pubsub(payload={"message": {}}, subscription=None)
+
+        integration.repo.list_accounts_by_provider_email.assert_not_called()
+
 class InvoicePatternSettingsTests(unittest.TestCase):
     def test_update_invoice_patterns_saves_patterns_and_enqueues_catchup_jobs(
         self,
     ) -> None:
         integration = CapturingMailIntegration()
 
-        patterns = integration.update_invoice_match_patterns(
-            owner_user_id="user-123",
-            patterns=[r"\binvoice\b", " ", r"^INV-\d+"],
-        )
+        with patch("app.mail_service.secrets.token_hex", side_effect=["generation1", "generation2"]):
+            patterns = integration.update_invoice_match_patterns(
+                owner_user_id="user-123",
+                patterns=[r"\binvoice\b", " ", r"^INV-\d+"],
+            )
 
         self.assertEqual(patterns, [r"\binvoice\b", r"^INV-\d+"])
         self.assertEqual(
@@ -251,17 +346,25 @@ class InvoicePatternSettingsTests(unittest.TestCase):
         self.assertEqual(
             [job["unique_key"] for job in integration.repo.jobs],
             [
-                "gmail-fallback:1:settings:d8f1065acdc2bfa2",
-                "outlook-delta:2:settings:d8f1065acdc2bfa2",
+                "gmail-fallback:1:settings:generation1",
+                "outlook-delta:2:settings:generation1",
             ],
         )
-
-        integration.update_invoice_match_patterns(
-            owner_user_id="user-123",
-            patterns=[r"\binvoice\b", " ", r"^INV-\d+"],
+        self.assertEqual(
+            [job["payload"]["reprocess_key"] for job in integration.repo.jobs],  # type: ignore[index]
+            ["generation1", "generation1"],
         )
 
-        self.assertEqual(len(integration.repo.jobs), 2)
+        with patch("app.mail_service.secrets.token_hex", return_value="generation2"):
+            integration.update_invoice_match_patterns(
+                owner_user_id="user-123",
+                patterns=[r"\binvoice\b", " ", r"^INV-\d+"],
+            )
+
+        self.assertEqual(len(integration.repo.jobs), 4)
+        self.assertTrue(
+            all("generation2" in str(job["unique_key"]) for job in integration.repo.jobs[2:])
+        )
 
     def test_update_invoice_patterns_empty_list_enqueues_catchup_jobs(
         self,

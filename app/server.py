@@ -28,6 +28,7 @@ from .invoice_generator import (
 from .invoice_pdf import render_invoice_pdf
 from .mail_service import MailIntegration
 from .mail_store import MailIntegrationError
+from .mail_webhook_auth import WebhookAuthenticationError, verify_google_oidc_token
 from .security import generate_csrf_token, sign_value, unsign_value, valid_signed_pair
 from .templates import dashboard_page, error_page, invoice_samples_page, login_page, signup_page
 from .workos_auth import (
@@ -1201,12 +1202,8 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_gmail_pubsub_webhook(self, parsed: Any) -> None:
-        if not self._valid_webhook_secret(
-            self.config.gmail_webhook_secret,
-            provider="gmail",
-            query=parsed.query,
-        ):
-            self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid webhook secret."})
+        if not self._valid_gmail_pubsub_auth():
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid Gmail webhook authentication."})
             return
         try:
             payload = self._json_body(max_bytes=1024 * 1024)
@@ -1788,24 +1785,34 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         separator = "&" if "?" in self.config.mail_frontend_redirect_url else "?"
         return self.config.mail_frontend_redirect_url + separator + urlencode(params)
 
-    def _valid_webhook_secret(
-        self,
-        expected_secret: str | None,
-        *,
-        provider: str,
-        query: str | None = None,
-    ) -> bool:
+    def _valid_gmail_pubsub_auth(self) -> bool:
+        authorization = self.headers.get("Authorization")
+        if authorization and authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+            audience = getattr(self.config, "gmail_pubsub_oidc_audience", None) or (
+                f"{self.config.app_url.rstrip('/')}/webhooks/gmail/pubsub"
+            )
+            try:
+                verify_google_oidc_token(
+                    token,
+                    audience=audience,
+                    service_account_email=getattr(
+                        self.config,
+                        "gmail_pubsub_oidc_service_account_email",
+                        None,
+                    ),
+                )
+                return True
+            except WebhookAuthenticationError:
+                return False
+
+        expected_secret = getattr(self.config, "gmail_webhook_secret", None)
         if not expected_secret:
             return False
         candidates = [
-            self.headers.get(f"X-Zamp-{provider.title()}-Webhook-Secret"),
+            self.headers.get("X-Zamp-Gmail-Webhook-Secret"),
             self.headers.get("X-Zamp-Webhook-Secret"),
         ]
-        if query:
-            candidates.extend(parse_qs(query, keep_blank_values=True).get("secret", []))
-        authorization = self.headers.get("Authorization")
-        if authorization and authorization.lower().startswith("bearer "):
-            candidates.append(authorization[7:].strip())
         return any(
             hmac.compare_digest(candidate, expected_secret)
             for candidate in candidates

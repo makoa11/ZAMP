@@ -285,6 +285,18 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     UNIQUE(provider, account_id, event_key)
 );
 
+DELETE FROM webhook_events AS duplicate
+USING webhook_events AS keeper
+WHERE duplicate.account_id IS NULL
+  AND keeper.account_id IS NULL
+  AND duplicate.provider = keeper.provider
+  AND duplicate.event_key = keeper.event_key
+  AND duplicate.id > keeper.id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_events_unknown_unique
+    ON webhook_events(provider, event_key)
+    WHERE account_id IS NULL;
+
 CREATE TABLE IF NOT EXISTS ingestion_jobs (
     id BIGSERIAL PRIMARY KEY,
     type TEXT NOT NULL,
@@ -509,15 +521,21 @@ class MailRepository:
         token_expires_at: datetime | None,
         scope: str | None,
         webhook_client_state: str | None = None,
+        gmail_history_id: str | None = None,
+        gmail_watch_expiration: datetime | None = None,
+        outlook_subscription_id: str | None = None,
+        outlook_subscription_expiration: datetime | None = None,
     ) -> dict[str, Any]:
         with self.database.connect() as conn:
             row = conn.execute(
                 """
                 INSERT INTO mail_accounts (
                     owner_user_id, provider, email, encrypted_access_token, encrypted_refresh_token,
-                    token_expires_at, scope, status, last_error, webhook_client_state
+                    token_expires_at, scope, status, last_error, webhook_client_state,
+                    gmail_history_id, gmail_watch_expiration,
+                    outlook_subscription_id, outlook_subscription_expiration
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', NULL, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', NULL, %s, %s, %s, %s, %s)
                 ON CONFLICT (owner_user_id, provider, lower(email))
                 DO UPDATE SET
                     encrypted_access_token = EXCLUDED.encrypted_access_token,
@@ -527,6 +545,19 @@ class MailRepository:
                     status = 'active',
                     last_error = NULL,
                     webhook_client_state = COALESCE(EXCLUDED.webhook_client_state, mail_accounts.webhook_client_state),
+                    gmail_history_id = COALESCE(EXCLUDED.gmail_history_id, mail_accounts.gmail_history_id),
+                    gmail_watch_expiration = COALESCE(
+                        EXCLUDED.gmail_watch_expiration,
+                        mail_accounts.gmail_watch_expiration
+                    ),
+                    outlook_subscription_id = COALESCE(
+                        EXCLUDED.outlook_subscription_id,
+                        mail_accounts.outlook_subscription_id
+                    ),
+                    outlook_subscription_expiration = COALESCE(
+                        EXCLUDED.outlook_subscription_expiration,
+                        mail_accounts.outlook_subscription_expiration
+                    ),
                     updated_at = now()
                 RETURNING *
                 """,
@@ -539,6 +570,10 @@ class MailRepository:
                     token_expires_at,
                     scope,
                     webhook_client_state,
+                    gmail_history_id,
+                    gmail_watch_expiration,
+                    outlook_subscription_id,
+                    outlook_subscription_expiration,
                 ),
             ).fetchone()
             return dict(row)
@@ -638,11 +673,23 @@ class MailRepository:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_account_by_provider_email(self, *, provider: str, email: str) -> dict[str, Any] | None:
+    def get_account_by_provider_email(
+        self,
+        *,
+        owner_user_id: str,
+        provider: str,
+        email: str,
+    ) -> dict[str, Any] | None:
         with self.database.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM mail_accounts WHERE provider = %s AND lower(email) = lower(%s)",
-                (provider, email),
+                """
+                SELECT *
+                FROM mail_accounts
+                WHERE owner_user_id = %s
+                  AND provider = %s
+                  AND lower(email) = lower(%s)
+                """,
+                (owner_user_id, provider, email),
             ).fetchone()
             return dict(row) if row else None
 
@@ -753,6 +800,7 @@ class MailRepository:
                 UPDATE mail_accounts
                 SET gmail_history_id = COALESCE(%s, gmail_history_id),
                     gmail_watch_expiration = %s,
+                    last_error = NULL,
                     updated_at = now()
                 WHERE id = %s
                 """,
@@ -779,6 +827,7 @@ class MailRepository:
                 UPDATE mail_accounts
                 SET outlook_subscription_id = %s,
                     outlook_subscription_expiration = %s,
+                    last_error = NULL,
                     updated_at = now()
                 WHERE id = %s
                 """,
@@ -803,6 +852,17 @@ class MailRepository:
                 (status, error[:1000], account_id),
             )
 
+    def record_active_account_error(self, *, account_id: int, error: str) -> None:
+        with self.database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE mail_accounts
+                SET last_error = %s, updated_at = now()
+                WHERE id = %s AND status = 'active'
+                """,
+                (error[:1000], account_id),
+            )
+
     def insert_webhook_event(
         self,
         *,
@@ -816,7 +876,7 @@ class MailRepository:
                 """
                 INSERT INTO webhook_events (provider, event_key, account_id, payload)
                 VALUES (%s, %s, %s, %s::jsonb)
-                ON CONFLICT (provider, account_id, event_key) DO NOTHING
+                ON CONFLICT DO NOTHING
                 RETURNING id
                 """,
                 (provider, event_key, account_id, json.dumps(payload, separators=(",", ":"))),

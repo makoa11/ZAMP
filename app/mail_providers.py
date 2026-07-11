@@ -287,9 +287,15 @@ class OutlookClient:
     ) -> dict[str, Any]:
         expiration = utc_now() + timedelta(days=2)
         return self.http.patch_json(
-            f"https://graph.microsoft.com/v1.0/subscriptions/{quote(subscription_id)}",
+            f"https://graph.microsoft.com/v1.0/subscriptions/{quote(subscription_id, safe='')}",
             access_token=access_token,
             payload={"expirationDateTime": expiration.isoformat().replace("+00:00", "Z")},
+        )
+
+    def delete_subscription(self, *, access_token: str, subscription_id: str) -> None:
+        self.http.delete_json(
+            f"https://graph.microsoft.com/v1.0/subscriptions/{quote(subscription_id, safe='')}",
+            access_token=access_token,
         )
 
     def message(self, *, access_token: str, message_id: str) -> dict[str, Any]:
@@ -314,14 +320,19 @@ class OutlookClient:
         )
 
     def attachments(self, *, access_token: str, message_id: str) -> list[dict[str, Any]]:
-        response = self.http.get_json(
-            f"https://graph.microsoft.com/v1.0/me/messages/{quote(message_id)}/attachments",
-            access_token=access_token,
+        url: str | None = (
+            f"https://graph.microsoft.com/v1.0/me/messages/{quote(message_id)}/attachments"
         )
-        value = response.get("value") if isinstance(response, dict) else None
-        if not isinstance(value, list):
-            raise MailIntegrationError("Outlook attachments response was not a list.")
-        return [item for item in value if isinstance(item, dict)]
+        attachments: list[dict[str, Any]] = []
+        while url:
+            response = self.http.get_json(url, access_token=access_token)
+            value = response.get("value") if isinstance(response, dict) else None
+            if not isinstance(value, list):
+                raise MailIntegrationError("Outlook attachments response was not a list.")
+            attachments.extend(item for item in value if isinstance(item, dict))
+            next_link = response.get("@odata.nextLink")
+            url = next_link if isinstance(next_link, str) and next_link else None
+        return attachments
 
     def delta_messages(self, *, access_token: str, delta_link: str | None = None) -> dict[str, Any]:
         url = delta_link or (

@@ -113,6 +113,11 @@ class FakeMailConnection:
             self.database.last_params = params
             return FakeResult(row=self.database.pdf_row)
 
+        if "FROM mail_accounts" in sql and "owner_user_id = %s" in sql:
+            self.database.last_sql = sql
+            self.database.last_params = params
+            return FakeResult(row={"id": 1, "owner_user_id": params[0]})
+
         raise AssertionError(f"Unexpected SQL: {sql}")
 
 
@@ -209,6 +214,22 @@ class MailRepositoryJobQueueTests(unittest.TestCase):
         self.assertEqual(len(database.jobs), 1)
 
 
+class MailRepositoryAccountTests(unittest.TestCase):
+    def test_provider_email_lookup_is_scoped_to_owner(self) -> None:
+        database = FakeMailDatabase()
+        repo = MailRepository(database)  # type: ignore[arg-type]
+
+        account = repo.get_account_by_provider_email(
+            owner_user_id="user-123",
+            provider="gmail",
+            email="ap@example.com",
+        )
+
+        self.assertEqual(account, {"id": 1, "owner_user_id": "user-123"})
+        self.assertIn("owner_user_id = %s", database.last_sql)
+        self.assertEqual(database.last_params, ("user-123", "gmail", "ap@example.com"))
+
+
 class MailRepositoryInvoiceReviewTests(unittest.TestCase):
     def test_list_invoice_review_items_reads_owner_decision_rows(self) -> None:
         database = FakeMailDatabase()
@@ -256,6 +277,11 @@ class MailSchemaSqlTests(unittest.TestCase):
             SCHEMA_SQL,
         )
         self.assertIn("DELETE FROM ingestion_jobs\nWHERE status = 'completed'", SCHEMA_SQL)
+
+    def test_schema_dedupes_webhook_events_without_known_account(self) -> None:
+        self.assertIn("idx_webhook_events_unknown_unique", SCHEMA_SQL)
+        self.assertIn("WHERE account_id IS NULL", SCHEMA_SQL)
+        self.assertIn("DELETE FROM webhook_events AS duplicate", SCHEMA_SQL)
 
     def test_schema_includes_invoice_extraction_decision_and_ap_context_tables(self) -> None:
         self.assertIn("CREATE TABLE IF NOT EXISTS mail_invoice_extractions", SCHEMA_SQL)

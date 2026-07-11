@@ -52,6 +52,15 @@ class JsonHttpClient:
             headers={"Content-Type": "application/json", **(headers or {})},
         )
 
+    def delete_json(
+        self,
+        url: str,
+        *,
+        access_token: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        return self._request_json("DELETE", url, access_token=access_token, headers=headers)
+
     def post_form(self, url: str, *, payload: dict[str, str]) -> dict[str, Any]:
         body = urlencode(payload).encode("utf-8")
         return self._request_json(

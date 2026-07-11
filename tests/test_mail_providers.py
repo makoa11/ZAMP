@@ -117,3 +117,56 @@ class ProviderAuthorizationUrlTests(unittest.TestCase):
         params = parse_qs(urlparse(http.get_urls[0]).query)
 
         self.assertIn("bodyPreview", params["$select"][0].split(","))
+
+    def test_outlook_attachments_follows_graph_next_link(self) -> None:
+        class PagedHttp(TestHttp):
+            def get_json(self, url: str, *, access_token: str) -> dict[str, object]:
+                self.get_urls.append(url)
+                if len(self.get_urls) == 1:
+                    return {
+                        "value": [{"id": "attachment-1"}],
+                        "@odata.nextLink": "https://graph.microsoft.com/next-page",
+                    }
+                return {"value": [{"id": "attachment-2"}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(root)
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        http = PagedHttp()
+        attachments = OutlookClient(config, http=http).attachments(
+            access_token="access-token",
+            message_id="message-123",
+        )
+
+        self.assertEqual([item["id"] for item in attachments], ["attachment-1", "attachment-2"])
+        self.assertEqual(http.get_urls[1], "https://graph.microsoft.com/next-page")
+
+    def test_outlook_subscription_delete_calls_graph(self) -> None:
+        class DeleteHttp(TestHttp):
+            def __init__(self) -> None:
+                super().__init__()
+                self.deleted: list[tuple[str, str]] = []
+
+            def delete_json(self, url: str, *, access_token: str) -> dict[str, object]:
+                self.deleted.append((url, access_token))
+                return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(root)
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        http = DeleteHttp()
+        OutlookClient(config, http=http).delete_subscription(
+            access_token="access-token",
+            subscription_id="subscription/123",
+        )
+
+        self.assertEqual(
+            http.deleted,
+            [("https://graph.microsoft.com/v1.0/subscriptions/subscription%2F123", "access-token")],
+        )

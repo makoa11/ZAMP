@@ -1,4 +1,6 @@
 workos
+google-auth
+requests
 psycopg[binary,pool]
 pdfplumber
 pypdf

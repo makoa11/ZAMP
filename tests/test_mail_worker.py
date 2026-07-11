@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.mail_worker import _handle_job, _storage_pdf_path
+from app.mail_worker import _handle_job, _renew_subscriptions_safely, _storage_pdf_path
 
 
 class TestRepo:
@@ -48,6 +48,17 @@ class TestIntegration:
         )
         self.repo = TestRepo()
         self.storage = SimpleNamespace(root=root)
+
+
+class MailWorkerRenewalTests(unittest.TestCase):
+    def test_scheduled_renewal_exception_is_contained(self) -> None:
+        integration = SimpleNamespace(
+            ingestion=SimpleNamespace(
+                renew_mail_subscriptions=lambda: (_ for _ in ()).throw(RuntimeError("database down"))
+            )
+        )
+
+        self.assertFalse(_renew_subscriptions_safely(integration))  # type: ignore[arg-type]
 
 
 def _field(value: object, *, confidence: float = 0.95) -> dict[str, object]:

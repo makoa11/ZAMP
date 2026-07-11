@@ -89,6 +89,8 @@ class AppConfig:
     google_oauth_client_secret: str | None
     gmail_pubsub_topic: str | None
     gmail_pubsub_subscription: str | None
+    gmail_pubsub_oidc_audience: str | None
+    gmail_pubsub_oidc_service_account_email: str | None
     gmail_webhook_secret: str | None
     microsoft_client_id: str | None
     microsoft_client_secret: str | None
@@ -211,6 +213,11 @@ def load_config(root: Path | None = None) -> AppConfig:
         google_oauth_client_secret=_env("GOOGLE_OAUTH_CLIENT_SECRET", env_file_values),
         gmail_pubsub_topic=_env("GMAIL_PUBSUB_TOPIC", env_file_values),
         gmail_pubsub_subscription=_env("GMAIL_PUBSUB_SUBSCRIPTION", env_file_values),
+        gmail_pubsub_oidc_audience=_env("GMAIL_PUBSUB_OIDC_AUDIENCE", env_file_values),
+        gmail_pubsub_oidc_service_account_email=_env(
+            "GMAIL_PUBSUB_OIDC_SERVICE_ACCOUNT_EMAIL",
+            env_file_values,
+        ),
         gmail_webhook_secret=_env("GMAIL_WEBHOOK_SECRET", env_file_values),
         microsoft_client_id=_env("MICROSOFT_CLIENT_ID", env_file_values),
         microsoft_client_secret=_env("MICROSOFT_CLIENT_SECRET", env_file_values),

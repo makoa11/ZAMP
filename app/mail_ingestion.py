@@ -22,7 +22,8 @@ MAIL_JOB_TYPES = {
     "parse_pdf",
 }
 
-GMAIL_PDF_FALLBACK_QUERY = "newer_than:1d has:attachment filename:pdf"
+GMAIL_PDF_FALLBACK_QUERY = "has:attachment filename:pdf"
+MAX_MAIL_PDF_BYTES = 25 * 1024 * 1024
 MAX_INVOICE_MATCH_PATTERNS = 25
 MAX_INVOICE_MATCH_PATTERN_LENGTH = 500
 MAX_INVOICE_SAMPLE_FILENAME_LENGTH = 255
@@ -35,7 +36,27 @@ def _b64decode_urlsafe(value: str) -> bytes:
 
 
 def _b64decode_standard(value: str) -> bytes:
-    return base64.b64decode(value)
+    return base64.b64decode(value, validate=True)
+
+
+def _declared_size_exceeds_limit(value: Any) -> bool:
+    try:
+        return int(value) > MAX_MAIL_PDF_BYTES
+    except (TypeError, ValueError):
+        return False
+
+
+def _encoded_content_exceeds_limit(value: str) -> bool:
+    return len(value) > ((MAX_MAIL_PDF_BYTES + 2) // 3) * 4
+
+
+def _valid_pdf_content(content: bytes) -> bool:
+    return len(content) <= MAX_MAIL_PDF_BYTES and content.startswith(b"%PDF-")
+
+
+def _message_job_key(provider: str, account_id: int, message_id: str, reprocess_key: str | None) -> str:
+    key = f"{provider}-message:{account_id}:{message_id}"
+    return f"{key}:reprocess:{reprocess_key}" if reprocess_key else key
 
 
 def _header(headers: Iterable[dict[str, Any]], name: str) -> str | None:
@@ -335,7 +356,7 @@ class MailIngestionService:
         if latest_history_id:
             self.repo.update_gmail_history(account_id=account_id, history_id=str(latest_history_id))
 
-    def process_gmail_fallback(self, *, account_id: int) -> None:
+    def process_gmail_fallback(self, *, account_id: int, reprocess_key: str | None = None) -> None:
         self._active_account(account_id, "gmail")
         access_token = self.token_manager.access_token_for(account_id)
         page_token = None
@@ -352,8 +373,12 @@ class MailIngestionService:
                 if isinstance(message_id, str):
                     self.repo.enqueue_job(
                         job_type="gmail_message_fetch",
-                        payload={"account_id": account_id, "message_id": message_id},
-                        unique_key=f"gmail-message:{account_id}:{message_id}",
+                        payload={
+                            "account_id": account_id,
+                            "message_id": message_id,
+                            **({"reprocess_key": reprocess_key} if reprocess_key else {}),
+                        },
+                        unique_key=_message_job_key("gmail", account_id, message_id, reprocess_key),
                     )
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -407,6 +432,8 @@ class MailIngestionService:
 
         for part in matching_pdf_parts:
             body = part.get("body") if isinstance(part.get("body"), dict) else {}
+            if _declared_size_exceeds_limit(body.get("size")):
+                continue
             attachment_id = body.get("attachmentId")
             raw_data = body.get("data")
             if isinstance(attachment_id, str):
@@ -418,7 +445,14 @@ class MailIngestionService:
                 raw_data = attachment_response.get("data")
             if not isinstance(raw_data, str):
                 continue
-            content = _b64decode_urlsafe(raw_data)
+            if _encoded_content_exceeds_limit(raw_data):
+                continue
+            try:
+                content = _b64decode_urlsafe(raw_data)
+            except (binascii.Error, ValueError):
+                continue
+            if not _valid_pdf_content(content):
+                continue
             filename = str(part.get("filename") or f"{message_id}.pdf")
             stored = self.storage.save_pdf(content)
             pdf_row = self.repo.upsert_pdf_file(stored)
@@ -484,6 +518,8 @@ class MailIngestionService:
                 mime_type=mime_type if isinstance(mime_type, str) else None,
             ):
                 continue
+            if _declared_size_exceeds_limit(attachment.get("size")):
+                continue
             if invoice_match_regexes and not is_invoice_candidate(
                 subject=subject,
                 sender=sender,
@@ -520,7 +556,14 @@ class MailIngestionService:
             raw_data = attachment.get("contentBytes")
             if not isinstance(raw_data, str):
                 continue
-            content = _b64decode_standard(raw_data)
+            if _encoded_content_exceeds_limit(raw_data):
+                continue
+            try:
+                content = _b64decode_standard(raw_data)
+            except (binascii.Error, ValueError):
+                continue
+            if not _valid_pdf_content(content):
+                continue
             stored = self.storage.save_pdf(content)
             pdf_row = self.repo.upsert_pdf_file(stored)
             provider_attachment_key = (
@@ -557,10 +600,14 @@ class MailIngestionService:
                 unique_key=f"parse-pdf:{attachment_row['id']}",
             )
 
-    def process_outlook_delta(self, *, account_id: int) -> None:
-        self._active_account(account_id, "outlook")
+    def process_outlook_delta(self, *, account_id: int, reprocess_key: str | None = None) -> None:
+        account = self._active_account(account_id, "outlook")
         access_token = self.token_manager.access_token_for(account_id)
-        delta_link = account.get("outlook_delta_link") if isinstance(account.get("outlook_delta_link"), str) else None
+        delta_link = (
+            account.get("outlook_delta_link")
+            if not reprocess_key and isinstance(account.get("outlook_delta_link"), str)
+            else None
+        )
 
         while True:
             response = self.outlook.delta_messages(access_token=access_token, delta_link=delta_link)
@@ -571,8 +618,12 @@ class MailIngestionService:
                 if isinstance(message_id, str) and message.get("hasAttachments"):
                     self.repo.enqueue_job(
                         job_type="outlook_message_fetch",
-                        payload={"account_id": account_id, "message_id": message_id},
-                        unique_key=f"outlook-message:{account_id}:{message_id}",
+                        payload={
+                            "account_id": account_id,
+                            "message_id": message_id,
+                            **({"reprocess_key": reprocess_key} if reprocess_key else {}),
+                        },
+                        unique_key=_message_job_key("outlook", account_id, message_id, reprocess_key),
                     )
 
             next_link = response.get("@odata.nextLink")
@@ -580,7 +631,7 @@ class MailIngestionService:
                 delta_link = next_link
                 continue
             final_delta = response.get("@odata.deltaLink")
-            if isinstance(final_delta, str):
+            if isinstance(final_delta, str) and not reprocess_key:
                 self.repo.update_outlook_delta(account_id=account_id, delta_link=final_delta)
             break
 
@@ -588,25 +639,40 @@ class MailIngestionService:
         for account in self.repo.list_accounts_due_for_renewal():
             account_id = int(account["id"])
             provider = account.get("provider")
-            if provider == "gmail":
-                access_token = self.token_manager.access_token_for(account_id)
-                watch = self.gmail.watch(access_token=access_token)
-                self.repo.update_gmail_watch(
-                    account_id=account_id,
-                    history_id=str(watch.get("historyId")) if watch.get("historyId") is not None else None,
-                    expiration=gmail_expiration_ms(watch.get("expiration")),
-                )
-            elif provider == "outlook" and account.get("outlook_subscription_id"):
-                access_token = self.token_manager.access_token_for(account_id)
-                subscription = self.outlook.renew_subscription(
-                    access_token=access_token,
-                    subscription_id=str(account["outlook_subscription_id"]),
-                )
-                self.repo.update_outlook_subscription(
-                    account_id=account_id,
-                    subscription_id=str(subscription.get("id") or account["outlook_subscription_id"]),
-                    expiration=parse_rfc3339(subscription.get("expirationDateTime")),
-                )
+            try:
+                if provider == "gmail":
+                    access_token = self.token_manager.access_token_for(account_id)
+                    watch = self.gmail.watch(access_token=access_token)
+                    self.repo.update_gmail_watch(
+                        account_id=account_id,
+                        history_id=(
+                            str(watch.get("historyId"))
+                            if watch.get("historyId") is not None
+                            else None
+                        ),
+                        expiration=gmail_expiration_ms(watch.get("expiration")),
+                    )
+                elif provider == "outlook" and account.get("outlook_subscription_id"):
+                    access_token = self.token_manager.access_token_for(account_id)
+                    subscription = self.outlook.renew_subscription(
+                        access_token=access_token,
+                        subscription_id=str(account["outlook_subscription_id"]),
+                    )
+                    self.repo.update_outlook_subscription(
+                        account_id=account_id,
+                        subscription_id=str(
+                            subscription.get("id") or account["outlook_subscription_id"]
+                        ),
+                        expiration=parse_rfc3339(subscription.get("expirationDateTime")),
+                    )
+            except Exception as exc:
+                try:
+                    self.repo.record_active_account_error(
+                        account_id=account_id,
+                        error=f"Subscription renewal failed: {exc}",
+                    )
+                except Exception:
+                    pass
 
     def _active_account(self, account_id: int, provider: str) -> dict[str, Any]:
         account = self.repo.get_account(account_id)

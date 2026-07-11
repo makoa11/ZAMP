@@ -465,7 +465,7 @@ class ServerRouteTests(unittest.TestCase):
             mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}}
         )
 
-    def test_gmail_webhook_accepts_query_secret(self) -> None:
+    def test_gmail_webhook_rejects_query_secret(self) -> None:
         class MailIntegration:
             def __init__(self) -> None:
                 self.payload: dict[str, object] | None = None
@@ -499,7 +499,56 @@ class ServerRouteTests(unittest.TestCase):
         Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
         response = test_socket.writer.getvalue().decode("iso-8859-1")
 
+        self.assertIn(" 403 ", response.splitlines()[0])
+        self.assertIsNone(mail.payload)
+
+    def test_gmail_webhook_accepts_verified_google_oidc_token(self) -> None:
+        class MailIntegration:
+            def __init__(self) -> None:
+                self.payload: dict[str, object] | None = None
+
+            def handle_gmail_pubsub(
+                self, *, payload: dict[str, object], subscription: str | None = None
+            ) -> dict[str, object]:
+                self.payload = payload
+                return {"accepted": True}
+
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        mail = MailIntegration()
+        Handler.config = SimpleNamespace(
+            app_url="https://app.example",
+            gmail_webhook_secret=None,
+            gmail_pubsub_oidc_audience="https://push.example/gmail",
+            gmail_pubsub_oidc_service_account_email="push@example.iam.gserviceaccount.com",
+        )
+        Handler.mail_integration = mail  # type: ignore[assignment]
+        body = json.dumps(
+            {"subscription": "projects/p/subscriptions/s", "message": {}}
+        ).encode("utf-8")
+        request = (
+            b"POST /webhooks/gmail/pubsub HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Authorization: Bearer signed-google-token\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"\r\n"
+            + body
+        )
+
+        with patch("app.server.verify_google_oidc_token", return_value={"email_verified": True}) as verify:
+            test_socket = TestSocket(request)
+            Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
+
         self.assertIn(" 200 ", response.splitlines()[0])
+        verify.assert_called_once_with(
+            "signed-google-token",
+            audience="https://push.example/gmail",
+            service_account_email="push@example.iam.gserviceaccount.com",
+        )
         self.assertEqual(
             mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}}
         )

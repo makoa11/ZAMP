@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import secrets
 import threading
@@ -262,13 +261,20 @@ class MailIntegration:
                 access_token = self.token_manager.access_token_for(account_id)
                 if account.get("provider") == "gmail":
                     self.gmail.stop_watch(access_token=access_token)
+                elif account.get("provider") == "outlook" and account.get(
+                    "outlook_subscription_id"
+                ):
+                    self.outlook.delete_subscription(
+                        access_token=access_token,
+                        subscription_id=str(account["outlook_subscription_id"]),
+                    )
             except Exception:
                 pass
         return self.repo.disconnect_account(account_id=account_id, owner_user_id=owner_user_id)
 
     def handle_gmail_pubsub(self, *, payload: dict[str, Any], subscription: str | None = None) -> dict[str, Any]:
         expected_subscription = self.config.gmail_pubsub_subscription
-        if expected_subscription and subscription and subscription != expected_subscription:
+        if expected_subscription and subscription != expected_subscription:
             raise MailIntegrationError("Gmail Pub/Sub subscription did not match configured subscription.")
 
         message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
@@ -379,27 +385,42 @@ class MailIntegration:
         profile = self.gmail.profile(access_token)
         email = _required_token(profile, "emailAddress").lower()
         refresh_token = token_response.get("refresh_token")
-        existing = self.repo.get_account_by_provider_email(provider="gmail", email=email)
-        if not refresh_token and existing and existing.get("owner_user_id") == owner_user_id:
+        existing = self.repo.get_account_by_provider_email(
+            owner_user_id=owner_user_id,
+            provider="gmail",
+            email=email,
+        )
+        if not refresh_token and existing:
             refresh_token = self.cipher.decrypt(existing.get("encrypted_refresh_token"))
         if not refresh_token:
             raise MailIntegrationError("Google did not return a refresh token; retry consent.")
 
-        account = self.repo.upsert_account(
-            owner_user_id=owner_user_id,
-            provider="gmail",
-            email=email,
-            encrypted_access_token=self.cipher.encrypt(access_token),
-            encrypted_refresh_token=self.cipher.encrypt(str(refresh_token)) or "",
-            token_expires_at=token_expires_at(token_response),
-            scope=token_response.get("scope") if isinstance(token_response.get("scope"), str) else None,
-        )
         watch = self.gmail.watch(access_token=access_token)
-        self.repo.update_gmail_watch(
-            account_id=int(account["id"]),
-            history_id=str(watch.get("historyId")) if watch.get("historyId") is not None else None,
-            expiration=gmail_expiration_ms(watch.get("expiration")),
-        )
+        try:
+            account = self.repo.upsert_account(
+                owner_user_id=owner_user_id,
+                provider="gmail",
+                email=email,
+                encrypted_access_token=self.cipher.encrypt(access_token),
+                encrypted_refresh_token=self.cipher.encrypt(str(refresh_token)) or "",
+                token_expires_at=token_expires_at(token_response),
+                scope=(
+                    token_response.get("scope")
+                    if isinstance(token_response.get("scope"), str)
+                    else None
+                ),
+                gmail_history_id=(
+                    str(watch.get("historyId")) if watch.get("historyId") is not None else None
+                ),
+                gmail_watch_expiration=gmail_expiration_ms(watch.get("expiration")),
+            )
+        except Exception:
+            if not existing:
+                try:
+                    self.gmail.stop_watch(access_token=access_token)
+                except Exception:
+                    pass
+            raise
         self.repo.enqueue_job(
             job_type="gmail_fallback_sync",
             payload={"account_id": int(account["id"])},
@@ -416,26 +437,40 @@ class MailIntegration:
             raise MailIntegrationError("Microsoft profile did not include an email address.")
 
         client_state = secrets.token_urlsafe(24)
-        account = self.repo.upsert_account(
-            owner_user_id=owner_user_id,
-            provider="outlook",
-            email=email,
-            encrypted_access_token=self.cipher.encrypt(access_token),
-            encrypted_refresh_token=self.cipher.encrypt(refresh_token) or "",
-            token_expires_at=token_expires_at(token_response),
-            scope=token_response.get("scope") if isinstance(token_response.get("scope"), str) else None,
-            webhook_client_state=client_state,
-        )
         subscription = self.outlook.create_subscription(
             access_token=access_token,
             notification_url=self._outlook_notification_url(),
             client_state=client_state,
         )
-        self.repo.update_outlook_subscription(
-            account_id=int(account["id"]),
-            subscription_id=_required_token(subscription, "id"),
-            expiration=parse_rfc3339(subscription.get("expirationDateTime")),
-        )
+        subscription_id = _required_token(subscription, "id")
+        try:
+            account = self.repo.upsert_account(
+                owner_user_id=owner_user_id,
+                provider="outlook",
+                email=email,
+                encrypted_access_token=self.cipher.encrypt(access_token),
+                encrypted_refresh_token=self.cipher.encrypt(refresh_token) or "",
+                token_expires_at=token_expires_at(token_response),
+                scope=(
+                    token_response.get("scope")
+                    if isinstance(token_response.get("scope"), str)
+                    else None
+                ),
+                webhook_client_state=client_state,
+                outlook_subscription_id=subscription_id,
+                outlook_subscription_expiration=parse_rfc3339(
+                    subscription.get("expirationDateTime")
+                ),
+            )
+        except Exception:
+            try:
+                self.outlook.delete_subscription(
+                    access_token=access_token,
+                    subscription_id=subscription_id,
+                )
+            except Exception:
+                pass
+            raise
         self.repo.enqueue_job(
             job_type="outlook_delta_sync",
             payload={"account_id": int(account["id"])},
@@ -446,9 +481,7 @@ class MailIntegration:
         return f"{self.config.app_url.rstrip('/')}/webhooks/outlook"
 
     def _enqueue_owner_fallbacks(self, *, owner_user_id: str, patterns: list[str]) -> None:
-        settings_fingerprint = hashlib.sha256(
-            json.dumps(patterns, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()[:16]
+        reprocess_key = secrets.token_hex(8)
         for account in self.repo.list_accounts(owner_user_id=owner_user_id):
             if account.get("status") != "active":
                 continue
@@ -456,14 +489,14 @@ class MailIntegration:
             if account.get("provider") == "gmail":
                 self.repo.enqueue_job(
                     job_type="gmail_fallback_sync",
-                    payload={"account_id": account_id},
-                    unique_key=f"gmail-fallback:{account_id}:settings:{settings_fingerprint}",
+                    payload={"account_id": account_id, "reprocess_key": reprocess_key},
+                    unique_key=f"gmail-fallback:{account_id}:settings:{reprocess_key}",
                 )
             elif account.get("provider") == "outlook":
                 self.repo.enqueue_job(
                     job_type="outlook_delta_sync",
-                    payload={"account_id": account_id},
-                    unique_key=f"outlook-delta:{account_id}:settings:{settings_fingerprint}",
+                    payload={"account_id": account_id, "reprocess_key": reprocess_key},
+                    unique_key=f"outlook-delta:{account_id}:settings:{reprocess_key}",
                 )
 
     def _frontend_redirect(self, params: dict[str, str]) -> str:

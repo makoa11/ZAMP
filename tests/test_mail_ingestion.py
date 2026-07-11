@@ -6,6 +6,7 @@ import unittest
 
 from app.mail_ingestion import (
     GMAIL_PDF_FALLBACK_QUERY,
+    MAX_MAIL_PDF_BYTES,
     MailIngestionService,
     compile_invoice_match_regexes,
     is_invoice_candidate,
@@ -249,6 +250,26 @@ class GmailIngestionTests(unittest.TestCase):
         service.process_gmail_fallback(account_id=1)
 
         self.assertEqual(gmail.list_queries, [GMAIL_PDF_FALLBACK_QUERY])
+        self.assertNotIn("newer_than:", GMAIL_PDF_FALLBACK_QUERY)
+
+    def test_gmail_fallback_replay_scopes_message_dedupe_key(self) -> None:
+        class Gmail(TestGmail):
+            def list_messages(self, **kwargs: object) -> dict[str, object]:
+                return {"messages": [{"id": "message-1"}]}
+
+        repo = TestRepo()
+        service = MailIngestionService(
+            repo=repo,  # type: ignore[arg-type]
+            storage=PdfStorage("/tmp"),
+            token_manager=TestTokenManager(),  # type: ignore[arg-type]
+            gmail=Gmail(b"%PDF-1.4\ninvoice"),  # type: ignore[arg-type]
+            outlook=object(),  # type: ignore[arg-type]
+        )
+
+        service.process_gmail_fallback(account_id=1, reprocess_key="rules-2")
+
+        self.assertEqual(repo.jobs[0]["unique_key"], "gmail-message:1:message-1:reprocess:rules-2")
+        self.assertEqual(repo.jobs[0]["payload"]["reprocess_key"], "rules-2")  # type: ignore[index]
 
     def test_gmail_fallback_uses_pdf_query_after_user_patterns_are_saved(self) -> None:
         repo = TestRepo(patterns=INVOICE_PATTERNS)
@@ -362,6 +383,47 @@ class GmailIngestionTests(unittest.TestCase):
         self.assertEqual(len(repo.pdfs), 1)
         self.assertEqual(repo.attachments[0]["candidate_reason"], "invoice_hint")
 
+    def test_gmail_rejects_non_pdf_content_before_storage(self) -> None:
+        repo = TestRepo(patterns=[])
+        gmail = TestGmail(b"not a pdf")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MailIngestionService(
+                repo=repo,  # type: ignore[arg-type]
+                storage=PdfStorage(tmp),
+                token_manager=TestTokenManager(),  # type: ignore[arg-type]
+                gmail=gmail,  # type: ignore[arg-type]
+                outlook=object(),  # type: ignore[arg-type]
+            )
+            service.process_gmail_message(account_id=1, message_id="message-1")
+
+        self.assertEqual(repo.pdfs, [])
+        self.assertEqual(repo.attachments, [])
+
+    def test_gmail_skips_declared_oversize_attachment_before_download(self) -> None:
+        class Gmail(TestGmail):
+            def message(self, **kwargs: object) -> dict[str, object]:
+                message = super().message(**kwargs)  # type: ignore[arg-type]
+                message["payload"]["parts"][0]["parts"][0]["body"]["size"] = (  # type: ignore[index]
+                    MAX_MAIL_PDF_BYTES + 1
+                )
+                return message
+
+        repo = TestRepo(patterns=[])
+        gmail = Gmail(b"%PDF-1.4\ninvoice")
+        service = MailIngestionService(
+            repo=repo,  # type: ignore[arg-type]
+            storage=PdfStorage("/tmp"),
+            token_manager=TestTokenManager(),  # type: ignore[arg-type]
+            gmail=gmail,  # type: ignore[arg-type]
+            outlook=object(),  # type: ignore[arg-type]
+        )
+
+        service.process_gmail_message(account_id=1, message_id="message-1")
+
+        self.assertEqual(gmail.attachment_calls, 0)
+        self.assertEqual(repo.pdfs, [])
+
 
 class OutlookIngestionTests(unittest.TestCase):
     def test_outlook_non_invoice_pdf_is_not_saved(self) -> None:
@@ -411,3 +473,104 @@ class OutlookIngestionTests(unittest.TestCase):
         self.assertEqual(outlook.attachment_calls, 1)
         self.assertEqual(len(repo.pdfs), 1)
         self.assertEqual(repo.attachments[0]["candidate_reason"], "pdf_attachment")
+
+    def test_outlook_delta_uses_account_and_replay_starts_fresh_scan(self) -> None:
+        class Repo(TestRepo):
+            def get_account(self, account_id: int) -> dict[str, object]:
+                return {
+                    **super().get_account(account_id),
+                    "outlook_delta_link": "saved-delta-link",
+                }
+
+            def update_outlook_delta(self, **kwargs: object) -> None:
+                raise AssertionError("Replay scans must not replace the live delta cursor")
+
+        class Outlook:
+            def __init__(self) -> None:
+                self.delta_links: list[str | None] = []
+
+            def delta_messages(
+                self, *, access_token: str, delta_link: str | None = None
+            ) -> dict[str, object]:
+                self.delta_links.append(delta_link)
+                return {
+                    "value": [{"id": "message-1", "hasAttachments": True}],
+                    "@odata.deltaLink": "new-delta-link",
+                }
+
+        repo = Repo(provider="outlook")
+        outlook = Outlook()
+        service = MailIngestionService(
+            repo=repo,  # type: ignore[arg-type]
+            storage=PdfStorage("/tmp"),
+            token_manager=TestTokenManager(),  # type: ignore[arg-type]
+            gmail=object(),  # type: ignore[arg-type]
+            outlook=outlook,  # type: ignore[arg-type]
+        )
+
+        service.process_outlook_delta(account_id=1, reprocess_key="rules-2")
+
+        self.assertEqual(outlook.delta_links, [None])
+        self.assertEqual(
+            repo.jobs[0]["unique_key"],
+            "outlook-message:1:message-1:reprocess:rules-2",
+        )
+
+    def test_outlook_rejects_non_pdf_content_before_storage(self) -> None:
+        repo = TestRepo(provider="outlook", patterns=[])
+        outlook = TestOutlook(b"not a pdf")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MailIngestionService(
+                repo=repo,  # type: ignore[arg-type]
+                storage=PdfStorage(tmp),
+                token_manager=TestTokenManager(),  # type: ignore[arg-type]
+                gmail=object(),  # type: ignore[arg-type]
+                outlook=outlook,  # type: ignore[arg-type]
+            )
+            service.process_outlook_message(account_id=1, message_id="message-1")
+
+        self.assertEqual(repo.pdfs, [])
+        self.assertEqual(repo.attachments, [])
+
+
+class SubscriptionRenewalTests(unittest.TestCase):
+    def test_one_account_renewal_failure_does_not_stop_later_accounts(self) -> None:
+        class Repo:
+            def __init__(self) -> None:
+                self.updated: list[int] = []
+                self.errors: list[int] = []
+
+            def list_accounts_due_for_renewal(self) -> list[dict[str, object]]:
+                return [
+                    {"id": 1, "provider": "gmail"},
+                    {"id": 2, "provider": "outlook", "outlook_subscription_id": "sub-2"},
+                ]
+
+            def record_active_account_error(self, *, account_id: int, error: str) -> None:
+                self.errors.append(account_id)
+
+            def update_outlook_subscription(self, *, account_id: int, **kwargs: object) -> None:
+                self.updated.append(account_id)
+
+        class Gmail:
+            def watch(self, *, access_token: str) -> dict[str, object]:
+                raise RuntimeError("gmail unavailable")
+
+        class Outlook:
+            def renew_subscription(self, **kwargs: object) -> dict[str, object]:
+                return {"id": "sub-2", "expirationDateTime": "2026-07-14T00:00:00Z"}
+
+        repo = Repo()
+        service = MailIngestionService(
+            repo=repo,  # type: ignore[arg-type]
+            storage=PdfStorage("/tmp"),
+            token_manager=TestTokenManager(),  # type: ignore[arg-type]
+            gmail=Gmail(),  # type: ignore[arg-type]
+            outlook=Outlook(),  # type: ignore[arg-type]
+        )
+
+        service.renew_mail_subscriptions()
+
+        self.assertEqual(repo.errors, [1])
+        self.assertEqual(repo.updated, [2])
