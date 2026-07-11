@@ -12,6 +12,7 @@ from .ap_context import load_db_procurement_context, summarize_procurement_conte
 from .config import ConfigError, load_config
 from .invoice_decision import decide_invoice
 from .invoice_normalizer import normalize_invoice_parse
+from .invoice_ocr import OCR_MAX_DOCUMENT_PAGES, OCR_REGION_PADDING
 from .invoice_parser import PARSER_VERSION, parse_invoice_pdf
 from .mail_ingestion import MAIL_JOB_TYPES
 from .mail_service import MailIntegration
@@ -21,6 +22,9 @@ def run_once(*, limit: int = 10, worker_id: str | None = None) -> int:
     config = load_config()
     integration = MailIntegration(config)
     try:
+        integration.repo.enqueue_stale_pdf_parse_jobs(
+            parser_revision=_parser_revision(integration),
+        )
         worker_name = worker_id or f"{socket.gethostname()}:{time.time_ns()}"
         jobs = integration.repo.claim_jobs(
             worker_id=worker_name,
@@ -46,9 +50,15 @@ def run_forever(
     integration = MailIntegration(config)
     last_fallback_at = 0.0
     last_renewal_at = 0.0
+    last_reprocess_scan_at = 0.0
     try:
         while True:
             now = time.time()
+            if now - last_reprocess_scan_at >= 3600:
+                integration.repo.enqueue_stale_pdf_parse_jobs(
+                    parser_revision=_parser_revision(integration),
+                )
+                last_reprocess_scan_at = now
             if now - last_fallback_at >= fallback_seconds:
                 _enqueue_polling_fallbacks(integration)
                 last_fallback_at = now
@@ -136,12 +146,19 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
         pdf_path.read_bytes(),
         source_id=f"mail_pdf_file:{pdf_file_id}",
         ocr_max_regions=integration.config.mail_parse_ocr_max_regions,
+        ocr_max_document_pages=getattr(
+            integration.config,
+            "mail_parse_ocr_max_document_pages",
+            OCR_MAX_DOCUMENT_PAGES,
+        ),
     )
+    parser_revision = _parser_revision(integration)
+    result["parser_revision"] = parser_revision
     warnings = result.get("warnings")
     integration.repo.upsert_pdf_parse_result(
         pdf_file_id=pdf_file_id,
         status=str(result.get("status") or "failed"),
-        parser_version=str(result.get("parser_version") or PARSER_VERSION),
+        parser_version=parser_revision,
         result=result,
         warnings=warnings if isinstance(warnings, list) else [],
     )
@@ -181,6 +198,21 @@ def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
     if relative_path.is_absolute() or ".." in relative_path.parts:
         raise RuntimeError("PDF storage path must be relative to MAIL_PDF_STORAGE_DIR.")
     return Path(root) / relative_path
+
+
+def _parser_revision(integration: MailIntegration) -> str:
+    max_regions = int(integration.config.mail_parse_ocr_max_regions)
+    max_pages = int(
+        getattr(
+            integration.config,
+            "mail_parse_ocr_max_document_pages",
+            OCR_MAX_DOCUMENT_PAGES,
+        )
+    )
+    return (
+        f"{PARSER_VERSION}:ocr-regions={max_regions}:ocr-pages={max_pages}:"
+        f"padding={OCR_REGION_PADDING:.2f}"
+    )
 
 
 def _optional_int(value: Any) -> int | None:

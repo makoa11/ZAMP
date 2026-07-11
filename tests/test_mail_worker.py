@@ -45,6 +45,7 @@ class TestIntegration:
     def __init__(self, root: Path) -> None:
         self.config = SimpleNamespace(
             mail_parse_ocr_max_regions=8,
+            mail_parse_ocr_max_document_pages=3,
         )
         self.repo = TestRepo()
         self.storage = SimpleNamespace(root=root)
@@ -176,6 +177,7 @@ class MailWorkerParsePdfTests(unittest.TestCase):
             b"%PDF-1.4\nfixture",
             source_id="mail_pdf_file:42",
             ocr_max_regions=8,
+            ocr_max_document_pages=3,
         )
         self.assertEqual(integration.repo.completed, [99])
         self.assertEqual(integration.repo.retries, [])
@@ -270,6 +272,7 @@ class MailWorkerParsePdfTests(unittest.TestCase):
             b"%PDF-1.4\nfixture",
             source_id="mail_pdf_file:42",
             ocr_max_regions=3,
+            ocr_max_document_pages=3,
         )
         self.assertEqual(integration.repo.completed, [99])
 

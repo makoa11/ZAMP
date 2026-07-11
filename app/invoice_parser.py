@@ -11,6 +11,7 @@ from .invoice_ocr import (
     DocumentOcrEngine,
     DocumentOcrResult,
     OCR_CONFIDENCE_THRESHOLD,
+    OCR_MAX_DOCUMENT_PAGES,
     OCR_MAX_REGIONS,
     OCR_REGION_PADDING,
     OcrRegionCandidate,
@@ -21,8 +22,9 @@ from .invoice_ocr import (
     apply_low_confidence_region_ocr,
 )
 
-PARSER_VERSION = "static-pdf-v2"
-OCR_MIN_REPLACEMENT_IMPROVEMENT = 0.03
+PARSER_VERSION = "static-pdf-v3"
+OCR_AMBIGUOUS_MIN_CONFIDENCE = 0.70
+PARSER_REVIEW_CONFIDENCE_THRESHOLD = OCR_CONFIDENCE_THRESHOLD
 REQUIRED_NORMALIZED_FIELDS = (
     "invoice_number",
     "issue_date",
@@ -50,6 +52,7 @@ FIELD_KEYS = (
     "balance_due",
     "payment_instructions",
 )
+OCR_FALLBACK_FIELDS = (*FIELD_KEYS, "line_items")
 
 LABELS: dict[str, tuple[str, ...]] = {
     "invoice_number": (
@@ -545,6 +548,7 @@ def parse_invoice_pdf(
     ocr_confidence_threshold: float = OCR_CONFIDENCE_THRESHOLD,
     ocr_padding: float = OCR_REGION_PADDING,
     ocr_max_regions: int | None = OCR_MAX_REGIONS,
+    ocr_max_document_pages: int | None = OCR_MAX_DOCUMENT_PAGES,
     ocr_engine: RegionOcrEngine | None = None,
     document_ocr_engine: DocumentOcrEngine | None = None,
 ) -> dict[str, Any]:
@@ -610,6 +614,12 @@ def parse_invoice_pdf(
                 warnings=warnings,
                 ocr_engine=ocr_engine,
                 document_ocr_engine=document_ocr_engine,
+                page_numbers=_important_ocr_pages(
+                    pages,
+                    target_fields=OCR_FALLBACK_FIELDS,
+                    max_pages=ocr_max_document_pages,
+                ),
+                max_pages=ocr_max_document_pages,
             )
             if full_ocr is not None:
                 ocr_result, full_ocr_summary = full_ocr
@@ -642,6 +652,7 @@ def parse_invoice_pdf(
     fields = _extract_fields_from_words(words, warnings)
     ocr_summary = None
     if enable_ocr:
+        targeted_fields = _ocr_escalation_fields(fields, pages)
         region_ocr_summary = apply_low_confidence_region_ocr(
             content,
             fields=fields,
@@ -650,6 +661,7 @@ def parse_invoice_pdf(
             threshold=ocr_confidence_threshold,
             padding=ocr_padding,
             max_regions=ocr_max_regions,
+            target_fields=targeted_fields,
             engine=ocr_engine,
             field_updater=lambda field, candidate, ocr_text: _replace_field_with_ocr_result(
                 fields,
@@ -660,25 +672,40 @@ def parse_invoice_pdf(
         )
         ocr_summary = region_ocr_summary
 
+        escalation_fields = _ocr_escalation_fields(fields, pages)
         missing_after_region_ocr = _missing_required_normalized_fields(fields)
-        if missing_after_region_ocr and enable_full_ocr_fallback:
+        if escalation_fields and enable_full_ocr_fallback:
+            selected_pages = _important_ocr_pages(
+                pages,
+                target_fields=escalation_fields,
+                max_pages=ocr_max_document_pages,
+            )
             full_ocr = _run_full_document_ocr(
                 content,
                 warnings=warnings,
                 ocr_engine=ocr_engine,
                 document_ocr_engine=document_ocr_engine,
+                page_numbers=selected_pages,
+                max_pages=ocr_max_document_pages,
             )
             if full_ocr is not None:
                 ocr_result, full_ocr_summary = full_ocr
-                full_ocr_summary["trigger"] = "missing_required_fields"
+                full_ocr_summary["trigger"] = (
+                    "missing_required_fields" if missing_after_region_ocr else "unresolved_fields"
+                )
                 full_ocr_summary["missing_fields_before"] = missing_after_region_ocr
+                full_ocr_summary["target_fields"] = escalation_fields
                 full_ocr_warnings: list[str] = []
                 full_ocr_fields = _extract_fields_from_words(
                     _ocr_words_to_parser_words(ocr_result),
                     full_ocr_warnings,
                 )
                 _tag_full_document_ocr_fields(full_ocr_fields)
-                applied_fields = _merge_missing_required_fields(fields, full_ocr_fields)
+                applied_fields = _merge_ocr_fields(
+                    fields,
+                    full_ocr_fields,
+                    target_fields=escalation_fields,
+                )
                 full_ocr_summary["applied_fields"] = applied_fields
                 full_ocr_summary["missing_fields_after"] = _missing_required_normalized_fields(fields)
                 for warning in full_ocr_warnings:
@@ -724,9 +751,11 @@ def _finalize_parse_result(
     ocr_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     missing_required_fields = _missing_required_normalized_fields(fields)
+    field_issues = _field_review_issues(fields)
     _add_missing_warnings(fields, warnings)
+    needs_review = bool(missing_required_fields or field_issues)
     result = {
-        "status": "parsed" if not missing_required_fields else "needs_review",
+        "status": "needs_review" if needs_review else "parsed",
         "parser_version": PARSER_VERSION,
         "fields": fields,
         "pages": pages,
@@ -737,17 +766,56 @@ def _finalize_parse_result(
             missing_required_fields=missing_required_fields,
         ),
     }
-    if missing_required_fields:
+    if needs_review:
         result["review"] = {
             "required": True,
-            "reason": "missing_required_normalized_data",
+            "reason": (
+                "missing_required_normalized_data"
+                if missing_required_fields
+                else "low_confidence_or_ambiguous_fields"
+            ),
             "missing_fields": missing_required_fields,
+            "field_issues": field_issues,
         }
     if ocr_summary is not None:
         result["ocr"] = ocr_summary
     if source_id:
         result["source_id"] = source_id
     return result
+
+
+def _field_review_issues(fields: dict[str, Any]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for key in REQUIRED_NORMALIZED_FIELDS:
+        field = fields.get(key)
+        if not isinstance(field, dict):
+            continue
+        _append_field_review_issue(issues, key, field)
+    return issues
+
+
+def _append_field_review_issue(
+    issues: list[dict[str, Any]],
+    path: str,
+    field: dict[str, Any],
+) -> None:
+    confidence = _normalized_confidence(field.get("confidence"))
+    reasons = _field_ambiguity_reasons(field)
+    material_reasons = [reason for reason in reasons if reason != "weak_geometry"]
+    if (
+        confidence is not None
+        and confidence >= PARSER_REVIEW_CONFIDENCE_THRESHOLD
+        and not material_reasons
+    ):
+        return
+    issues.append(
+        {
+            "field": path,
+            "confidence": round(confidence, 3) if confidence is not None else None,
+            "reasons": material_reasons
+            or ["missing_confidence" if confidence is None else "low_confidence"],
+        }
+    )
 
 
 def _ocr_tracking_metadata(
@@ -869,10 +937,24 @@ def _run_full_document_ocr(
     warnings: list[str],
     ocr_engine: RegionOcrEngine | None,
     document_ocr_engine: DocumentOcrEngine | None,
+    page_numbers: list[int],
+    max_pages: int | None,
 ) -> tuple[DocumentOcrResult, dict[str, Any]] | None:
     engine = _document_ocr_engine(ocr_engine=ocr_engine, document_ocr_engine=document_ocr_engine)
     try:
-        ocr_result = engine.ocr_document(content)
+        try:
+            ocr_result = engine.ocr_document(
+                content,
+                pages=page_numbers,
+                max_pages=max_pages,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            ocr_result = _filter_document_ocr_result(
+                engine.ocr_document(content),
+                page_numbers=page_numbers,
+            )
     except RegionOcrUnavailable as exc:
         _append_warning_once(warnings, f"Full-document OCR unavailable: {exc}")
         return None
@@ -884,6 +966,8 @@ def _run_full_document_ocr(
         "status": "completed" if ocr_result.words else "skipped",
         "method": ocr_result.method,
         "page_count": len(ocr_result.pages),
+        "selected_pages": [page.page for page in ocr_result.pages],
+        "max_pages": max_pages,
         "word_count": len(ocr_result.words),
         "confidence": round(ocr_result.confidence, 3) if ocr_result.confidence is not None else None,
     }
@@ -891,6 +975,25 @@ def _run_full_document_ocr(
         summary["reason"] = "no_ocr_words"
         _append_warning_once(warnings, "Full-document OCR did not extract any words.")
     return ocr_result, summary
+
+
+def _filter_document_ocr_result(
+    result: DocumentOcrResult,
+    *,
+    page_numbers: list[int],
+) -> DocumentOcrResult:
+    selected = set(page_numbers)
+    if not selected:
+        return result
+    result_pages = [page for page in result.pages if page.page in selected]
+    result_words = [word for word in result.words if word.page in selected]
+    confidences = [word.confidence for word in result_words if word.confidence is not None]
+    return DocumentOcrResult(
+        pages=result_pages,
+        words=result_words,
+        confidence=(sum(confidences) / len(confidences) if confidences else result.confidence),
+        method=result.method,
+    )
 
 
 def _document_ocr_engine(
@@ -945,17 +1048,50 @@ def _tag_full_document_ocr_fields(value: Any) -> None:
             _tag_full_document_ocr_fields(child)
 
 
-def _merge_missing_required_fields(fields: dict[str, Any], ocr_fields: dict[str, Any]) -> list[str]:
+def _merge_ocr_fields(
+    fields: dict[str, Any],
+    ocr_fields: dict[str, Any],
+    *,
+    target_fields: Iterable[str],
+) -> list[str]:
     applied: list[str] = []
-    for key in REQUIRED_NORMALIZED_FIELDS:
-        if _has_required_normalized_field(fields, key):
-            continue
+    targets = set(target_fields)
+    for key in OCR_FALLBACK_FIELDS:
         ocr_value = ocr_fields.get(key)
-        if not _has_required_normalized_field(ocr_fields, key):
+        if not _has_normalized_field(ocr_fields, key):
             continue
+        current = fields.get(key)
+        if _has_normalized_field(fields, key):
+            if isinstance(current, list) and key not in targets:
+                continue
+            if not _should_replace_with_full_ocr(current, ocr_value):
+                continue
         fields[key] = ocr_value
         applied.append(key)
     return applied
+
+
+def _should_replace_with_full_ocr(current: Any, ocr_value: Any) -> bool:
+    if not isinstance(ocr_value, dict | list):
+        return False
+    if isinstance(current, list) or isinstance(ocr_value, list):
+        return isinstance(ocr_value, list) and bool(ocr_value) and ocr_value != current
+    if not isinstance(current, dict) or not isinstance(ocr_value, dict):
+        return True
+    if _field_comparison_value(current) == _field_comparison_value(ocr_value):
+        return bool(_field_ambiguity_reasons(current))
+    current_confidence = _normalized_confidence(current.get("confidence")) or 0.0
+    ocr_confidence = _normalized_confidence(ocr_value.get("confidence")) or 0.0
+    if _field_ambiguity_reasons(current):
+        return ocr_confidence >= OCR_AMBIGUOUS_MIN_CONFIDENCE and ocr_confidence >= current_confidence - 0.05
+    if current_confidence < OCR_CONFIDENCE_THRESHOLD:
+        return ocr_confidence >= current_confidence
+    return ocr_confidence >= OCR_CONFIDENCE_THRESHOLD and ocr_confidence >= current_confidence
+
+
+def _field_comparison_value(field: dict[str, Any]) -> str:
+    value = field.get("amount", field.get("value", field.get("raw")))
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
 def _missing_required_normalized_fields(fields: dict[str, Any]) -> list[str]:
@@ -966,11 +1102,104 @@ def _missing_required_normalized_fields(fields: dict[str, Any]) -> list[str]:
     ]
 
 
+def _ocr_escalation_fields(
+    fields: dict[str, Any],
+    pages: list[dict[str, Any]],
+) -> list[str]:
+    targets: list[str] = []
+    for key in OCR_FALLBACK_FIELDS:
+        value = fields.get(key)
+        if not _has_normalized_field(fields, key):
+            if key in REQUIRED_NORMALIZED_FIELDS or _pages_mention_field(pages, key):
+                targets.append(key)
+            continue
+        if isinstance(value, dict):
+            confidence = _normalized_confidence(value.get("confidence"))
+            if confidence is None or confidence < OCR_CONFIDENCE_THRESHOLD or _field_ambiguity_reasons(value):
+                targets.append(key)
+        elif key == "line_items" and _line_items_need_review(value):
+            targets.append(key)
+    return targets
+
+
+def _pages_mention_field(pages: list[dict[str, Any]], key: str) -> bool:
+    if key == "line_items":
+        labels = ("description", "item", "quantity", "qty", "unit price", "amount")
+    else:
+        labels = LABELS.get(key, (key.replace("_", " "),))
+    page_text = "\n".join(str(page.get("text") or "").casefold() for page in pages)
+    return any(label.casefold() in page_text for label in labels)
+
+
+def _important_ocr_pages(
+    pages: list[dict[str, Any]],
+    *,
+    target_fields: Iterable[str],
+    max_pages: int | None,
+) -> list[int]:
+    available: list[int] = []
+    for page in pages:
+        try:
+            page_number = int(page["page"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if page_number not in available:
+            available.append(page_number)
+    if not available:
+        return []
+
+    selected: list[int] = []
+    targets = list(target_fields)
+    for page in pages:
+        try:
+            page_number = int(page["page"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        page_view = [page]
+        if any(_pages_mention_field(page_view, key) for key in targets) and page_number not in selected:
+            selected.append(page_number)
+    for page_number in (available[0], available[-1], *available):
+        if page_number not in selected:
+            selected.append(page_number)
+    if max_pages is not None:
+        return selected[: max(0, max_pages)]
+    return selected
+
+
+def _field_ambiguity_reasons(field: dict[str, Any]) -> list[str]:
+    reasons = field.get("ambiguity_reasons")
+    if not isinstance(reasons, list):
+        return []
+    return [str(reason) for reason in reasons if reason]
+
+
+def _line_items_need_review(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        for role in ("description", "quantity", "unit_price", "amount"):
+            field = item.get(role)
+            if not isinstance(field, dict):
+                continue
+            confidence = _normalized_confidence(field.get("confidence"))
+            if confidence is None or confidence < OCR_CONFIDENCE_THRESHOLD or _field_ambiguity_reasons(field):
+                return True
+    return False
+
+
 def _has_required_normalized_field(fields: dict[str, Any], key: str) -> bool:
+    return _has_normalized_field(fields, key)
+
+
+def _has_normalized_field(fields: dict[str, Any], key: str) -> bool:
     value = fields.get(key)
+    if key == "line_items":
+        return isinstance(value, list) and bool(value)
     if not isinstance(value, dict):
         return False
-    if key == "balance_due":
+    if key in {"subtotal", "discount", "tax", "shipping", "paid", "balance_due"}:
         return value.get("amount") is not None
     normalized_value = value.get("value")
     return normalized_value is not None and normalized_value != ""
@@ -1137,7 +1366,11 @@ def _best_scalar_field(lines: list[Line], key: str) -> dict[str, Any] | None:
             )
         )
 
-    return _best_candidate(candidates)
+    return _best_candidate(
+        candidates,
+        ambiguity_reason="multiple_scalar_values",
+        ambiguity_confidence_ceiling=0.95,
+    )
 
 
 def _best_money_field(lines: list[Line], key: str, inferred_currency: str | None) -> dict[str, Any] | None:
@@ -1181,7 +1414,10 @@ def _best_money_field(lines: list[Line], key: str, inferred_currency: str | None
                 method=f"money_label_{method}",
             )
         )
-    return _best_candidate(candidates)
+    return _best_candidate(
+        candidates,
+        ambiguity_reason="multiple_totals" if key == "balance_due" else "multiple_amounts",
+    )
 
 
 def _generic_total_match(line: Line) -> LabelMatch | None:
@@ -1270,7 +1506,7 @@ def _party_field(lines: list[Line], key: str) -> dict[str, Any] | None:
         )
 
     if candidates:
-        return _best_candidate(candidates)
+        return _best_candidate(candidates, ambiguity_reason="label_collision")
     if key == "seller":
         return _seller_fallback(lines)
     return None
@@ -1474,7 +1710,7 @@ def _payment_field(lines: list[Line]) -> dict[str, Any] | None:
                 method="payment_block",
             )
         )
-    return _best_candidate(candidates)
+    return _best_candidate(candidates, ambiguity_reason="multiple_payment_blocks")
 
 
 def _infer_currency(lines: list[Line]) -> dict[str, Any] | None:
@@ -2661,7 +2897,7 @@ def _field_value(
     confidence: float,
     method: str,
 ) -> dict[str, Any]:
-    return {
+    field = {
         "raw": raw,
         "value": value,
         "page": page,
@@ -2670,6 +2906,9 @@ def _field_value(
         "confidence": round(confidence, 3),
         "method": method,
     }
+    if confidence < OCR_CONFIDENCE_THRESHOLD:
+        field["ambiguity_reasons"] = ["weak_geometry"]
+    return field
 
 
 def _money_field(
@@ -2682,7 +2921,7 @@ def _money_field(
     confidence: float,
     method: str,
 ) -> dict[str, Any]:
-    return {
+    field = {
         "raw": money.raw,
         "value": round(money.amount, 2),
         "amount": round(money.amount, 2),
@@ -2693,6 +2932,9 @@ def _money_field(
         "confidence": round(confidence, 3),
         "method": method,
     }
+    if confidence < OCR_CONFIDENCE_THRESHOLD:
+        field["ambiguity_reasons"] = ["weak_geometry"]
+    return field
 
 
 def _replace_field_with_ocr_result(
@@ -2755,6 +2997,7 @@ def _replace_field_with_ocr_result(
     field["method"] = ocr_text.method
     if ocr_text.confidence is not None:
         field["confidence"] = round(ocr_text.confidence, 3)
+    field.pop("ambiguity_reasons", None)
     _sync_line_item_value_after_ocr(fields, candidate.path)
     return True
 
@@ -2763,13 +3006,21 @@ def _ocr_replacement_rejection_reason(field: dict[str, Any], ocr_text: RegionOcr
     ocr_confidence = _normalized_confidence(ocr_text.confidence)
     if ocr_confidence is None:
         return "ocr_confidence_missing"
-    if ocr_confidence < OCR_CONFIDENCE_THRESHOLD:
+    has_usable_value = _has_usable_field_value(field)
+    ambiguous = bool(_field_ambiguity_reasons(field))
+    minimum_confidence = (
+        OCR_AMBIGUOUS_MIN_CONFIDENCE
+        if ambiguous or not has_usable_value
+        else OCR_CONFIDENCE_THRESHOLD
+    )
+    if ocr_confidence < minimum_confidence:
         return "ocr_confidence_below_threshold"
     original_confidence = _normalized_confidence(field.get("confidence"))
     if (
         original_confidence is not None
-        and _has_usable_field_value(field)
-        and ocr_confidence < min(1.0, original_confidence + OCR_MIN_REPLACEMENT_IMPROVEMENT)
+        and has_usable_value
+        and not ambiguous
+        and ocr_confidence < original_confidence
     ):
         return "ocr_confidence_not_improved"
     return None
@@ -2926,16 +3177,43 @@ def _sync_line_item_value_after_ocr(fields: dict[str, Any], path: tuple[str | in
         value["currency"] = child.get("currency")
 
 
-def _best_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _best_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    ambiguity_reason: str,
+    ambiguity_confidence_ceiling: float | None = None,
+) -> dict[str, Any] | None:
     if not candidates:
         return None
-    return max(
+    ranked = sorted(
         candidates,
         key=lambda item: (
             float(item.get("confidence") or 0),
             float((item.get("bbox") or [0, 0, 0, 0])[3]),
         ),
+        reverse=True,
     )
+    selected = ranked[0]
+    if len(ranked) > 1:
+        selected_confidence = _normalized_confidence(selected.get("confidence")) or 0.0
+        runner_up_confidence = _normalized_confidence(ranked[1].get("confidence")) or 0.0
+        distinct_values = {
+            _field_comparison_value(candidate)
+            for candidate in ranked
+            if _field_comparison_value(candidate)
+        }
+        if (
+            len(distinct_values) > 1
+            and (
+                ambiguity_confidence_ceiling is None
+                or selected_confidence < ambiguity_confidence_ceiling
+            )
+            and selected_confidence - runner_up_confidence <= 0.08
+        ):
+            reasons = _field_ambiguity_reasons(selected)
+            if ambiguity_reason not in reasons:
+                selected["ambiguity_reasons"] = [*reasons, ambiguity_reason]
+    return selected
 
 
 def _normalize_scalar_value(key: str, raw: str) -> str | None:

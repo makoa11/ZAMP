@@ -307,7 +307,8 @@ class GmailIngestionTests(unittest.TestCase):
         self.assertEqual(repo.attachments[0]["provider_attachment_id"], "attachment-1")
         self.assertEqual(repo.attachments[0]["candidate_reason"], "invoice_hint")
         self.assertEqual(repo.jobs[0]["job_type"], "parse_pdf")
-        self.assertEqual(repo.jobs[0]["unique_key"], "parse-pdf:30")
+        self.assertEqual(repo.jobs[0]["unique_key"], "parse-pdf:30:static-pdf-v3")
+        self.assertEqual(repo.jobs[0]["payload"]["parser_version"], "static-pdf-v3")
         self.assertEqual(gmail.attachment_calls, 1)
 
     def test_gmail_pdf_attachment_is_saved_without_user_patterns(self) -> None:

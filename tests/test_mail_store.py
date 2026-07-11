@@ -55,6 +55,11 @@ class FakeMailConnection:
         return FakeTransaction()
 
     def execute(self, sql: str, params: tuple[object, ...] = ()) -> FakeResult:
+        if "WITH stale AS" in sql and "parser_version IS DISTINCT FROM" in sql:
+            self.database.last_sql = sql
+            self.database.last_params = params
+            return FakeResult(rows=[{"id": index + 1} for index in range(self.database.stale_enqueue_count)])
+
         if "INSERT INTO ingestion_job_dedupe_keys (unique_key, type)" in sql:
             unique_key, job_type = str(params[0]), str(params[1])
             if unique_key in self.database.dedupe_keys:
@@ -130,6 +135,7 @@ class FakeMailDatabase:
         self.pdf_row: dict[str, Any] | None = None
         self.last_sql = ""
         self.last_params: tuple[object, ...] = ()
+        self.stale_enqueue_count = 0
 
     def connect(self) -> FakeMailConnection:
         return FakeMailConnection(self)
@@ -164,6 +170,29 @@ class PdfStorageTests(unittest.TestCase):
 
 
 class MailRepositoryJobQueueTests(unittest.TestCase):
+    def test_stale_parser_revisions_are_reenqueued_with_versioned_keys(self) -> None:
+        database = FakeMailDatabase()
+        database.stale_enqueue_count = 2
+        repo = MailRepository(database)  # type: ignore[arg-type]
+
+        count = repo.enqueue_stale_pdf_parse_jobs(
+            parser_revision="static-pdf-v3:ocr-pages=3",
+            limit=25,
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            database.last_params,
+            (
+                "static-pdf-v3:ocr-pages=3",
+                25,
+                "static-pdf-v3:ocr-pages=3",
+                "static-pdf-v3:ocr-pages=3",
+            ),
+        )
+        self.assertIn("parse_results.parser_version IS DISTINCT FROM %s", database.last_sql)
+        self.assertIn("'parse-pdf:' || stale.attachment_id || ':' || %s", database.last_sql)
+
     def test_completed_durable_job_leaves_queue_and_blocks_reenqueue(self) -> None:
         database = FakeMailDatabase()
         repo = MailRepository(database)  # type: ignore[arg-type]
