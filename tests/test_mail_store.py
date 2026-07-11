@@ -263,3 +263,14 @@ class MailSchemaSqlTests(unittest.TestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS ap_context_records", SCHEMA_SQL)
         self.assertIn("parser_method TEXT NOT NULL DEFAULT 'static_text'", SCHEMA_SQL)
         self.assertIn("idx_ap_context_records_owner_vendor_po", SCHEMA_SQL)
+
+    def test_parse_result_status_schema_allows_review_queue(self) -> None:
+        self.assertIn("'needs_review'", SCHEMA_SQL)
+        self.assertIn("DROP CONSTRAINT IF EXISTS mail_pdf_parse_results_status_check", SCHEMA_SQL)
+
+    def test_invoice_extraction_parse_status_schema_allows_review_queue(self) -> None:
+        self.assertIn("DROP CONSTRAINT IF EXISTS mail_invoice_extractions_parse_status_check", SCHEMA_SQL)
+        self.assertIn(
+            "parse_status IN ('parsed', 'needs_review', 'no_text_layer', 'unsupported', 'failed')",
+            SCHEMA_SQL,
+        )

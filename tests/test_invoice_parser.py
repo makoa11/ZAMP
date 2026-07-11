@@ -491,7 +491,7 @@ class InvoiceParserTests(unittest.TestCase):
         self.assertIn("88 Market Lane", fields["buyer"]["raw"])
         self.assertNotIn("Invoice No.", fields["buyer"]["raw"])
 
-    def test_parse_invoice_pdf_returns_no_text_layer_without_ocr(self) -> None:
+    def test_parse_invoice_pdf_returns_no_text_layer_when_ocr_is_disabled(self) -> None:
         canvas = _PdfCanvas(
             width_pt=210 * MM_TO_PT,
             height_pt=297 * MM_TO_PT,
@@ -499,11 +499,11 @@ class InvoiceParserTests(unittest.TestCase):
         )
         canvas.rect(10, 10, 30, 20, fill="#ffffff", stroke="#111827")
 
-        result = parse_invoice_pdf(_build_pdf([canvas]))
+        result = parse_invoice_pdf(_build_pdf([canvas]), enable_ocr=False)
 
         self.assertEqual(result["status"], "no_text_layer")
         self.assertEqual(result["fields"]["line_items"], [])
-        self.assertIn("OCR is not attempted", result["warnings"][0])
+        self.assertIn("OCR is disabled", result["warnings"][0])
 
     def test_generated_invoice_fixture_parses_required_acceptance_fields(self) -> None:
         sample = generate_invoice(
@@ -579,7 +579,7 @@ class InvoiceParserTests(unittest.TestCase):
                 )
                 visible_text = "\n".join(str(page.get("text") or "") for page in result["pages"])
 
-                self.assertEqual(result["status"], "parsed")
+                self.assertIn(result["status"], {"parsed", "needs_review"})
                 for fragment in _forbidden_visible_ap_fragments(ap_context):
                     self.assertNotIn(fragment, visible_text)
 
