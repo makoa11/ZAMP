@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -135,6 +137,100 @@ class ServerRouteTests(unittest.TestCase):
         self.assertIn(b"Content-Type: application/pdf", header)
         self.assertTrue(body.startswith(b"%PDF-1.4"))
         self.assertTrue(body.rstrip().endswith(b"%%EOF"))
+
+    def test_dashboard_uses_database_invoice_queue_not_generated_samples(self) -> None:
+        class MailIntegration:
+            def __init__(self) -> None:
+                self.owner_user_id: str | None = None
+
+            def list_invoice_review_items(
+                self, *, owner_user_id: str, limit: int = 50
+            ) -> list[dict[str, object]]:
+                self.owner_user_id = owner_user_id
+                return [
+                    {
+                        "pdf_file_id": 20,
+                        "filename": "vendor-invoice.pdf",
+                        "invoice_number": "INV-DB-100",
+                        "amount": "USD 216.00",
+                        "vendor": "Database Vendor LLC",
+                        "subject": "July invoice",
+                        "received_at": "2026-07-10T10:00:00+00:00",
+                        "pdf_url": "/api/mail/pdfs/20",
+                    }
+                ]
+
+        mail = MailIntegration()
+
+        class Handler(ZampRequestHandler):
+            mail_integration = mail  # type: ignore[assignment]
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def _session(self) -> tuple[object, None, list[str]]:
+                return object(), None, []
+
+            def _session_payload(self, session: object) -> dict[str, object]:
+                return {"user": {"id": "user-123"}}
+
+            def _csrf_cookie(self, cookie_values: dict[str, str]) -> tuple[str, None]:
+                return "csrf-token", None
+
+        request = b"GET /dashboard HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn(" 200 ", response.splitlines()[0])
+        self.assertEqual(mail.owner_user_id, "user-123")
+        self.assertIn("INV-DB-100", response)
+        self.assertIn("Database Vendor LLC", response)
+        self.assertIn('/api/mail/pdfs/20', response)
+        self.assertNotIn("/api/invoices/samples.pdf", response)
+        self.assertNotIn("Unknown Seller", response)
+
+    def test_mail_pdf_endpoint_serves_owned_stored_pdf(self) -> None:
+        class MailIntegration:
+            def __init__(self, pdf_path: Path) -> None:
+                self.pdf_path = pdf_path
+                self.owner_user_id: str | None = None
+                self.pdf_file_id: int | None = None
+
+            def get_invoice_pdf_file(
+                self, *, owner_user_id: str, pdf_file_id: int
+            ) -> dict[str, object]:
+                self.owner_user_id = owner_user_id
+                self.pdf_file_id = pdf_file_id
+                return {"path": self.pdf_path, "filename": "invoice.pdf"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp, "invoice.pdf")
+            pdf_path.write_bytes(b"%PDF-1.4\nfrom-db\n%%EOF")
+            mail = MailIntegration(pdf_path)
+
+            class Handler(ZampRequestHandler):
+                mail_integration = mail  # type: ignore[assignment]
+
+                def log_message(self, format: str, *args: object) -> None:
+                    pass
+
+                def _authenticated_api_user(self) -> tuple[str, list[str]]:
+                    return "user-123", ["zamp_session=refreshed; Path=/"]
+
+            request = b"GET /api/mail/pdfs/20 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            test_socket = TestSocket(request)
+            Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+            response = test_socket.writer.getvalue()
+
+        header, body = response.split(b"\r\n\r\n", 1)
+        self.assertIn(b" 200 ", header.splitlines()[0])
+        self.assertIn(b"Content-Type: application/pdf", header)
+        self.assertIn(b'Content-Disposition: inline; filename="invoice.pdf"', header)
+        self.assertIn(b"Set-Cookie: zamp_session=refreshed; Path=/", header)
+        self.assertEqual(body, b"%PDF-1.4\nfrom-db\n%%EOF")
+        self.assertEqual(mail.owner_user_id, "user-123")
+        self.assertEqual(mail.pdf_file_id, 20)
 
     def test_gmail_webhook_accepts_header_secret(self) -> None:
         class MailIntegration:

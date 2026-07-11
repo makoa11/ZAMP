@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hmac
+import html as html_lib
 import time
 from datetime import date, datetime
 from http import HTTPStatus
@@ -71,6 +72,34 @@ def _redact_log_value(value: Any) -> Any:
     return " ".join(_redact_query_parameters(part) for part in value.split(" "))
 
 
+def _display_value(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return text
+
+
+def _app_header_html(*, csrf_token: str, active: str) -> str:
+    review_class = ' class="active"' if active == "review" else ""
+    settings_class = ' class="active"' if active == "settings" else ""
+    review_current = ' aria-current="page"' if active == "review" else ""
+    settings_current = ' aria-current="page"' if active == "settings" else ""
+    return f"""
+  <header class="app-header">
+    <div class="app-brand">
+      <div class="brand-mark app-brand-mark" aria-hidden="true">Z</div>
+      <nav class="nav-links" aria-label="Primary">
+        <a href="/dashboard"{review_class}{review_current}>Review</a>
+        <a href="/settings"{settings_class}{settings_current}>Settings</a>
+      </nav>
+    </div>
+    <form class="logout-form" method="post" action="/logout">
+      <input type="hidden" name="_csrf" value="{html_lib.escape(csrf_token)}">
+      <button class="secondary compact-button" type="submit">Log out</button>
+    </form>
+  </header>"""
+
+
 class ZampHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
@@ -121,6 +150,9 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/dashboard":
             self._handle_dashboard_get(parsed.query)
             return
+        if parsed.path == "/settings":
+            self._handle_settings_get(parsed.query)
+            return
         if parsed.path == "/invoice-samples":
             self._handle_invoice_samples_get(parsed.query)
             return
@@ -138,6 +170,9 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/mail/accounts":
             self._handle_mail_accounts_get()
+            return
+        if parsed.path.startswith("/api/mail/pdfs/"):
+            self._handle_mail_pdf_get(parsed)
             return
         if parsed.path == "/api/mail/invoice-patterns":
             self._handle_mail_invoice_patterns_get()
@@ -286,6 +321,161 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         cookies = self._cookies()
         csrf, csrf_cookie = self._csrf_cookie(cookies)
         response_cookies = [cookie for cookie in [set_session_cookie, csrf_cookie] if cookie]
+
+        payload = self._session_payload(session)
+        user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+        owner_user_id = user.get("id")
+        if not isinstance(owner_user_id, str) or not owner_user_id:
+            self._send_html(
+                HTTPStatus.UNAUTHORIZED,
+                error_page(401, "Signed-in user could not be resolved."),
+                cookies=response_cookies,
+            )
+            return
+
+        mail_notice = None
+        mail_notice_kind = "success"
+        try:
+            review_items = self.mail_integration.list_invoice_review_items(
+                owner_user_id=owner_user_id,
+                limit=50,
+            )
+        except (ConfigError, MailIntegrationError) as exc:
+            review_items = []
+            mail_notice = str(exc)
+            mail_notice_kind = "error"
+
+        selected_pdf_id = parse_qs(query).get("pdf_id", [""])[0]
+        selected_item = next(
+            (
+                item
+                for item in review_items
+                if str(item.get("pdf_file_id") or "") == selected_pdf_id
+            ),
+            review_items[0] if review_items else None,
+        )
+
+        queue_items_html = self._review_queue_html(review_items, selected_item)
+        evidence_html = self._review_evidence_html(selected_item)
+        queue_count = len(review_items)
+        queue_label = "invoice" if queue_count == 1 else "invoices"
+        notice_html = (
+            f'<div class="queue-notice"><div class="notice notice-{html_lib.escape(mail_notice_kind)}" role="status">'
+            f"{html_lib.escape(mail_notice)}</div></div>"
+            if mail_notice
+            else ""
+        )
+
+        html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard - ZAMP</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="app-body">
+{_app_header_html(csrf_token=csrf, active="review")}
+
+  <main class="workbench" aria-label="Invoice review workspace">
+    <aside class="queue-pane" aria-label="Invoice review queue">
+      <div class="queue-pane-header">
+        <p class="eyebrow">Review queue</p>
+        <h1>Invoices</h1>
+        <p>{queue_count} {queue_label} pending</p>
+      </div>
+      {notice_html}
+      <div class="queue-list">
+      {queue_items_html}
+      </div>
+    </aside>
+
+    <section class="evidence-pane" aria-label="Invoice evidence">
+      {evidence_html}
+    </section>
+  </main>
+</body>
+</html>"""
+
+        self._send_html(
+            HTTPStatus.OK,
+            html,
+            cookies=response_cookies,
+        )
+
+    def _review_queue_html(
+        self,
+        review_items: list[dict[str, Any]],
+        selected_item: dict[str, Any] | None,
+    ) -> str:
+        if not review_items:
+            return '<div class="empty-state">No action needed. You are all caught up.</div>'
+        selected_pdf_id = selected_item.get("pdf_file_id") if selected_item else None
+        return "\n".join(
+            self._review_queue_item_html(item, active=item.get("pdf_file_id") == selected_pdf_id)
+            for item in review_items
+        )
+
+    def _review_queue_item_html(self, item: dict[str, Any], *, active: bool) -> str:
+        title = _display_value(item.get("invoice_number") or item.get("filename"))
+        amount = _display_value(item.get("amount") or "")
+        vendor = _display_value(item.get("vendor") or item.get("sender") or item.get("account_email"))
+        subject = _display_value(item.get("subject"))
+        received = _display_value(item.get("received_at"))
+        pdf_file_id = html_lib.escape(str(item.get("pdf_file_id") or ""))
+        active_attr = ' aria-current="page"' if active else ""
+        amount_label = amount or "Review"
+        title_label = title or "Untitled invoice"
+        return f"""
+        <a class="queue-item{' active' if active else ''}" href="/dashboard?pdf_id={pdf_file_id}"{active_attr}>
+          <div class="queue-header">
+            <span class="queue-vendor">{html_lib.escape(vendor or "Unknown vendor")}</span>
+            <span class="queue-amount">{html_lib.escape(amount_label)}</span>
+          </div>
+          <div class="queue-title">{html_lib.escape(title_label)}</div>
+          <div class="queue-subject">{html_lib.escape(subject)}</div>
+          <div class="queue-meta">
+            <span>{html_lib.escape(received)}</span>
+          </div>
+        </a>"""
+
+    def _review_evidence_html(self, selected_item: dict[str, Any] | None) -> str:
+        if not selected_item:
+            return """
+      <div class="evidence-empty">
+        <div>
+          <p class="eyebrow">Invoice preview</p>
+          <strong>No invoice selected</strong>
+        </div>
+      </div>"""
+
+        filename = _display_value(selected_item.get("filename"))
+        subject = _display_value(selected_item.get("subject"))
+        pdf_url = html_lib.escape(str(selected_item.get("pdf_url") or ""))
+        return f"""
+      <div class="evidence-header">
+        <div class="evidence-title">
+          <strong>{html_lib.escape(filename)}</strong>
+          <span>{html_lib.escape(subject)}</span>
+        </div>
+        <div class="actions review-actions">
+          <button type="button" class="secondary compact-button">Hold</button>
+          <button type="button" class="secondary compact-button">Ask</button>
+          <button type="button" class="compact-button">Approve</button>
+        </div>
+      </div>
+      <div class="pdf-stage">
+        <iframe class="pdf-viewer" src="{pdf_url}" title="{html_lib.escape(filename)}"></iframe>
+      </div>"""
+
+    def _handle_settings_get(self, query: str) -> None:
+        session, set_session_cookie, clear_cookies = self._session()
+        if not session:
+            self._redirect("/login", cookies=clear_cookies)
+            return
+        cookies = self._cookies()
+        csrf, csrf_cookie = self._csrf_cookie(cookies)
+        response_cookies = [cookie for cookie in [set_session_cookie, csrf_cookie] if cookie]
         params = parse_qs(query)
         mail_notice = None
         mail_notice_kind = "success"
@@ -295,14 +485,33 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         elif params.get("mail_error"):
             mail_notice = params.get("mail_error", ["Mail connection failed."])[0]
             mail_notice_kind = "error"
+
+        original_html = dashboard_page(
+            csrf_token=csrf,
+            session=self._session_payload(session),
+            mail_notice=mail_notice,
+            mail_notice_kind=mail_notice_kind,
+        )
+
+        import re
+
+        app_header = _app_header_html(csrf_token=csrf, active="settings")
+
+        html = original_html.replace('<body>', '<body class="app-body settings-body">\n' + app_header)
+        html = html.replace('<main class="dashboard-shell">', '<main class="dashboard-shell settings-shell">')
+        html = re.sub(r'<header class="topbar">.*?</header>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<section class="summary">.*?</section>', '', html, flags=re.DOTALL)
+        html = re.sub(
+            r'<section class="data-panel">\s*<h2>Session data.*?^  </section>',
+            '',
+            html,
+            flags=re.DOTALL | re.MULTILINE,
+        )
+        html = html.replace('<title>Dashboard - ZAMP</title>', '<title>Settings - ZAMP</title>')
+
         self._send_html(
             HTTPStatus.OK,
-            dashboard_page(
-                csrf_token=csrf,
-                session=self._session_payload(session),
-                mail_notice=mail_notice,
-                mail_notice_kind=mail_notice_kind,
-            ),
+            html,
             cookies=response_cookies,
         )
 
@@ -484,6 +693,46 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
             return
         self._send_json(HTTPStatus.OK, {"accounts": accounts}, cookies=cookies)
+
+    def _handle_mail_pdf_get(self, parsed: Any) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        pdf_file_id_raw = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            pdf_file_id = int(pdf_file_id_raw)
+        except ValueError:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid PDF file id."}, cookies=cookies)
+            return
+
+        try:
+            pdf_file = self.mail_integration.get_invoice_pdf_file(
+                owner_user_id=owner_user_id,
+                pdf_file_id=pdf_file_id,
+            )
+        except (ConfigError, MailIntegrationError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        if not pdf_file:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "PDF file not found."}, cookies=cookies)
+            return
+
+        pdf_path = pdf_file["path"]
+        try:
+            content = pdf_path.read_bytes()
+        except FileNotFoundError:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "PDF file is missing from storage."}, cookies=cookies)
+            return
+
+        filename = str(pdf_file.get("filename") or f"invoice-{pdf_file_id}.pdf").replace('"', "")
+        self._send_binary(
+            HTTPStatus.OK,
+            content,
+            content_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+            cookies=cookies,
+        )
 
     def _handle_mail_invoice_patterns_get(self) -> None:
         context = self._authenticated_api_user()
@@ -1371,12 +1620,15 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         *,
         content_type: str,
         headers: dict[str, str] | None = None,
+        cookies: list[str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
         for name, value in (headers or {}).items():
             self.send_header(name, value)
+        for cookie in cookies or []:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(content)
 

@@ -15,6 +15,8 @@ class TestRepo:
         self.encrypted_code_verifier: str | None = None
         self.invoice_patterns: list[str] = []
         self.jobs: list[dict[str, object]] = []
+        self.review_items: list[dict[str, object]] = []
+        self.pdf_row: dict[str, object] | None = None
 
     def create_oauth_state(
         self,
@@ -56,6 +58,16 @@ class TestRepo:
             {"id": 2, "provider": "outlook", "status": "active"},
             {"id": 3, "provider": "gmail", "status": "disconnected"},
         ]
+
+    def list_invoice_review_items(
+        self, *, owner_user_id: str, limit: int = 50
+    ) -> list[dict[str, object]]:
+        return self.review_items[:limit]
+
+    def get_pdf_file_for_owner(
+        self, *, owner_user_id: str, pdf_file_id: int
+    ) -> dict[str, object] | None:
+        return self.pdf_row
 
     def enqueue_job(self, **kwargs: object) -> bool:
         if any(job["unique_key"] == kwargs["unique_key"] for job in self.jobs):
@@ -101,6 +113,7 @@ class CapturingMailIntegration(MailIntegration):
         self._cipher = TokenCipher(Fernet.generate_key().decode("ascii"))  # type: ignore[assignment]
         self._gmail = TestGmail()  # type: ignore[assignment]
         self._outlook = TestOutlook()  # type: ignore[assignment]
+        self._storage = SimpleNamespace(root="/tmp")  # type: ignore[assignment]
         self.completed_gmail: dict[str, str | None] = {}
 
     def _complete_gmail_oauth(
@@ -279,6 +292,69 @@ class InvoicePatternSettingsTests(unittest.TestCase):
         pattern = integration.suggest_invoice_match_pattern(filename="Bill_889.pdf")
 
         self.assertEqual(pattern, r"^Bill[\s._:#-]*\d+(?:\.pdf)?$")
+
+
+class InvoiceReviewQueueTests(unittest.TestCase):
+    def test_list_invoice_review_items_maps_database_rows_for_frontend(self) -> None:
+        integration = CapturingMailIntegration()
+        integration.repo.review_items = [
+            {
+                "attachment_id": 30,
+                "pdf_file_id": 20,
+                "filename": "vendor-invoice.pdf",
+                "subject": "July invoice",
+                "sender": "billing@example.com",
+                "provider": "gmail",
+                "account_email": "ap@example.com",
+                "candidate_reason": "filename",
+                "parse_status": "parsed",
+                "parse_result": {
+                    "fields": {
+                        "invoice_number": {"value": "INV-DB-100"},
+                        "seller": {"raw": "Database Vendor LLC\n1 Main St"},
+                        "balance_due": {"amount": 216, "currency": "USD"},
+                    }
+                },
+                "parse_warnings": ["missing tax"],
+            }
+        ]
+
+        items = integration.list_invoice_review_items(owner_user_id="user-123")
+
+        self.assertEqual(items[0]["invoice_number"], "INV-DB-100")
+        self.assertEqual(items[0]["vendor"], "Database Vendor LLC")
+        self.assertEqual(items[0]["amount"], "USD 216.00")
+        self.assertEqual(items[0]["pdf_url"], "/api/mail/pdfs/20")
+        self.assertEqual(items[0]["warnings"], ["missing tax"])
+
+    def test_get_invoice_pdf_file_resolves_relative_storage_path(self) -> None:
+        integration = CapturingMailIntegration()
+        integration.repo.pdf_row = {
+            "pdf_file_id": 20,
+            "filename": "invoice.pdf",
+            "sha256": "abc",
+            "byte_size": 12,
+            "storage_path": "abc.pdf",
+        }
+
+        pdf_file = integration.get_invoice_pdf_file(
+            owner_user_id="user-123",
+            pdf_file_id=20,
+        )
+
+        self.assertEqual(pdf_file["filename"], "invoice.pdf")
+        self.assertEqual(str(pdf_file["path"]), "/tmp/abc.pdf")
+
+    def test_get_invoice_pdf_file_rejects_absolute_storage_path(self) -> None:
+        integration = CapturingMailIntegration()
+        integration.repo.pdf_row = {
+            "pdf_file_id": 20,
+            "filename": "invoice.pdf",
+            "storage_path": "/tmp/abc.pdf",
+        }
+
+        with self.assertRaises(MailIntegrationError):
+            integration.get_invoice_pdf_file(owner_user_id="user-123", pdf_file_id=20)
 
 
 class ScopeValidationTests(unittest.TestCase):

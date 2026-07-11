@@ -20,6 +20,18 @@ def page(title: str, body: str) -> str:
 </head>
 <body>
   {body}
+  <script>
+    document.addEventListener("wheel", function (event) {{
+      var target = event.target;
+      if (
+        target instanceof HTMLInputElement &&
+        target.type === "number" &&
+        document.activeElement === target
+      ) {{
+        target.blur();
+      }}
+    }}, true);
+  </script>
 </body>
 </html>"""
 
@@ -248,7 +260,7 @@ def dashboard_page(
         <h2 id="mail-title">Connected mailboxes</h2>
       </div>
       <div class="mail-actions">
-        <button type="button" data-connect-provider="gmail">Connect Gmail</button>
+        <button class="secondary" type="button" data-connect-provider="gmail">Connect Gmail</button>
         <button class="secondary" type="button" data-connect-provider="outlook">Connect Outlook</button>
       </div>
     </div>
@@ -263,16 +275,21 @@ def dashboard_page(
         <p class="label">Invoice matching</p>
         <h2 id="invoice-patterns-title">Regex patterns</h2>
       </div>
-      <button type="button" data-save-invoice-patterns>Save patterns</button>
     </div>
     <div class="mail-status" data-invoice-pattern-status role="status"></div>
     <div class="pattern-helper" data-invoice-pattern-dropzone>
       <label for="invoice-pattern-filename">Sample filename</label>
       <div class="pattern-helper-row">
         <input id="invoice-pattern-filename" data-invoice-pattern-filename type="text" autocomplete="off" placeholder="INV-2024-001.pdf">
-        <button class="secondary" type="button" data-generate-invoice-pattern>Generate regex</button>
+        <div class="pattern-actions">
+          <button class="secondary" type="button" data-generate-invoice-pattern>Generate regex</button>
+          <button type="button" data-save-invoice-patterns>Save patterns</button>
+        </div>
       </div>
-      <input data-invoice-pattern-file type="file" accept="application/pdf,.pdf">
+      <label class="file-picker" for="invoice-pattern-file">
+        <span data-invoice-pattern-file-label>Choose PDF</span>
+      </label>
+      <input id="invoice-pattern-file" class="sr-only-file" data-invoice-pattern-file type="file" accept="application/pdf,.pdf">
     </div>
     <label for="invoice-patterns">Patterns</label>
     <textarea id="invoice-patterns" class="pattern-input" data-invoice-patterns rows="6" spellcheck="false" placeholder="^INV-\\d+"></textarea>
@@ -291,6 +308,7 @@ def dashboard_page(
     var invoicePatternsEl = document.querySelector("[data-invoice-patterns]");
     var invoicePatternFilenameEl = document.querySelector("[data-invoice-pattern-filename]");
     var invoicePatternFileEl = document.querySelector("[data-invoice-pattern-file]");
+    var invoicePatternFileLabelEl = document.querySelector("[data-invoice-pattern-file-label]");
     var invoicePatternDropzoneEl = document.querySelector("[data-invoice-pattern-dropzone]");
     var generateInvoicePatternButton = document.querySelector("[data-generate-invoice-pattern]");
     var saveInvoicePatternsButton = document.querySelector("[data-save-invoice-patterns]");
@@ -315,6 +333,9 @@ def dashboard_page(
 
     function renderAccounts(accounts) {{
       if (!accountsEl) return;
+      accounts = (accounts || []).filter(function (account) {{
+        return account.status !== "disconnected";
+      }});
       accountsEl.innerHTML = "";
       if (!accounts.length) {{
         var empty = document.createElement("p");
@@ -550,6 +571,7 @@ def dashboard_page(
         var file = invoicePatternFileEl.files && invoicePatternFileEl.files[0];
         if (!file) return;
         if (invoicePatternFilenameEl) invoicePatternFilenameEl.value = file.name;
+        if (invoicePatternFileLabelEl) invoicePatternFileLabelEl.textContent = file.name;
         suggestInvoicePattern(file.name);
       }});
     }}
@@ -568,6 +590,7 @@ def dashboard_page(
         var file = event.dataTransfer.files && event.dataTransfer.files[0];
         var filename = file ? file.name : event.dataTransfer.getData("text");
         if (invoicePatternFilenameEl) invoicePatternFilenameEl.value = filename || "";
+        if (invoicePatternFileLabelEl && filename) invoicePatternFileLabelEl.textContent = filename;
         suggestInvoicePattern(filename || "");
       }});
     }}
