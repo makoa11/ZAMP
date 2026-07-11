@@ -158,6 +158,7 @@ Frontend-facing APIs:
 - `GET /api/mail/invoices`
 - `GET /api/mail/invoices/{pdf_file_id}`
 - `GET /api/mail/invoices/{pdf_file_id}/overlay.pdf`
+- `GET /api/mail/pdfs/{pdf_file_id}`
 
 Provider webhooks:
 

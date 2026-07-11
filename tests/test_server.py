@@ -142,12 +142,14 @@ class ServerRouteTests(unittest.TestCase):
         class MailIntegration:
             def __init__(self) -> None:
                 self.list_owner_user_id: str | None = None
+                self.list_limit: int | None = None
                 self.detail_request: tuple[str, int] | None = None
 
-            def list_invoices(
-                self, *, owner_user_id: str, limit: int = 100, offset: int = 0
+            def list_invoice_review_items(
+                self, *, owner_user_id: str, limit: int = 50
             ) -> list[dict[str, object]]:
                 self.list_owner_user_id = owner_user_id
+                self.list_limit = limit
                 return [
                     {
                         "pdf_file_id": 20,
@@ -161,13 +163,6 @@ class ServerRouteTests(unittest.TestCase):
                         "decision": "needs_review",
                         "confidence": "medium",
                         "next_action": "Route to AP review.",
-                    },
-                    {
-                        "pdf_file_id": 21,
-                        "filename": "approved.pdf",
-                        "invoice_number": "INV-APPROVED",
-                        "vendor": "Auto Approved LLC",
-                        "decision": "approve",
                     }
                 ]
 
@@ -246,6 +241,7 @@ class ServerRouteTests(unittest.TestCase):
 
         self.assertIn(" 200 ", response.splitlines()[0])
         self.assertEqual(mail.list_owner_user_id, "user-123")
+        self.assertEqual(mail.list_limit, 50)
         self.assertEqual(mail.detail_request, ("user-123", 20))
         self.assertIn("INV-DB-100", response)
         self.assertIn("Database Vendor LLC", response)
@@ -348,6 +344,47 @@ class ServerRouteTests(unittest.TestCase):
         self.assertIn(" 200 ", response.splitlines()[0])
         self.assertEqual(mail.owner_user_id, "user-123")
         self.assertEqual(payload["invoices"][0]["pdf_file_id"], 42)
+
+    def test_mail_invoices_api_rejects_invalid_pagination(self) -> None:
+        class MailIntegration:
+            def __init__(self) -> None:
+                self.called = False
+
+            def list_invoices(
+                self, *, owner_user_id: str, limit: int = 100, offset: int = 0
+            ) -> list[dict[str, object]]:
+                self.called = True
+                return []
+
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def _authenticated_api_user(self) -> tuple[str, list[str]] | None:
+                return "user-123", []
+
+        for query, message in (
+            ("limit=0", "limit must be between 1 and 500."),
+            ("limit=501", "limit must be between 1 and 500."),
+            ("offset=-1", "offset must be greater than or equal to 0."),
+        ):
+            with self.subTest(query=query):
+                mail = MailIntegration()
+                Handler.mail_integration = mail  # type: ignore[assignment]
+                request = (
+                    f"GET /api/mail/invoices?{query} HTTP/1.1\r\n"
+                    "Host: localhost\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                test_socket = TestSocket(request)
+                Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+                response = test_socket.writer.getvalue().decode("iso-8859-1")
+                _, body = response.split("\r\n\r\n", 1)
+                payload = json.loads(body)
+
+                self.assertIn(" 400 ", response.splitlines()[0])
+                self.assertEqual(payload["error"], message)
+                self.assertFalse(mail.called)
 
     def test_mail_invoice_overlay_api_returns_pdf(self) -> None:
         class MailIntegration:

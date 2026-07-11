@@ -27,7 +27,7 @@ from .invoice_generator import (
 )
 from .invoice_pdf import render_invoice_pdf
 from .mail_service import MailIntegration
-from .mail_store import MailIntegrationError, REVIEW_QUEUE_DECISIONS
+from .mail_store import MailIntegrationError
 from .security import generate_csrf_token, sign_value, unsign_value, valid_signed_pair
 from .templates import dashboard_page, error_page, invoice_samples_page, login_page, signup_page
 from .workos_auth import (
@@ -44,7 +44,6 @@ from .workos_auth import (
 
 STATIC_CSS = Path(__file__).parent / "static" / "styles.css"
 SENSITIVE_QUERY_PARAMETERS = {"secret"}
-ACTIONABLE_DASHBOARD_DECISIONS = set(REVIEW_QUEUE_DECISIONS)
 
 
 def _redact_query_parameters(target: str) -> str:
@@ -85,13 +84,6 @@ def _safe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _invoice_needs_dashboard_review(item: dict[str, Any]) -> bool:
-    decision = _display_value(item.get("decision")).lower()
-    if not decision:
-        return True
-    return decision in ACTIONABLE_DASHBOARD_DECISIONS
 
 
 def _humanize_token(value: Any) -> str:
@@ -422,16 +414,10 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         mail_notice = None
         mail_notice_kind = "success"
         try:
-            invoices = self.mail_integration.list_invoices(
+            review_items = self.mail_integration.list_invoice_review_items(
                 owner_user_id=owner_user_id,
                 limit=50,
-                offset=0,
             )
-            review_items = [
-                item
-                for item in invoices
-                if _invoice_needs_dashboard_review(item)
-            ]
         except (ConfigError, MailIntegrationError) as exc:
             review_items = []
             mail_notice = str(exc)
@@ -1067,6 +1053,10 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         try:
             limit = int(params.get("limit", ["100"])[0])
             offset = int(params.get("offset", ["0"])[0])
+            if limit < 1 or limit > 500:
+                raise ValueError("limit must be between 1 and 500.")
+            if offset < 0:
+                raise ValueError("offset must be greater than or equal to 0.")
             invoices = self.mail_integration.list_invoices(
                 owner_user_id=owner_user_id,
                 limit=limit,
