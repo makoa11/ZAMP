@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from .config import AppConfig
+from .invoice_overlay import render_invoice_parse_overlay_pdf
 from .mail_ingestion import (
     MailIngestionService,
     TokenManager,
@@ -215,6 +216,44 @@ class MailIntegration:
 
     def suggest_invoice_match_pattern(self, *, filename: str) -> str:
         return suggest_invoice_match_pattern_from_filename(filename)
+
+    def list_invoices(self, *, owner_user_id: str, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        rows = self.repo.list_mail_invoices(
+            owner_user_id=owner_user_id,
+            limit=limit,
+            offset=offset,
+        )
+        return [_public_invoice_queue_row(row) for row in rows]
+
+    def get_invoice(self, *, owner_user_id: str, pdf_file_id: int) -> dict[str, Any] | None:
+        row = self.repo.get_mail_invoice_detail(
+            owner_user_id=owner_user_id,
+            pdf_file_id=pdf_file_id,
+        )
+        return _public_invoice_detail(row) if row else None
+
+    def invoice_overlay_pdf(
+        self,
+        *,
+        owner_user_id: str,
+        pdf_file_id: int,
+        box_mode: str = "parsed",
+    ) -> bytes | None:
+        source = self.repo.get_mail_invoice_overlay_source(
+            owner_user_id=owner_user_id,
+            pdf_file_id=pdf_file_id,
+        )
+        if not source:
+            return None
+        storage_path = source.get("storage_path")
+        if not isinstance(storage_path, str):
+            return None
+        pdf_path = _storage_pdf_path(self.storage.root, storage_path)
+        return render_invoice_parse_overlay_pdf(
+            pdf_path.read_bytes(),
+            source.get("raw_parse_result") if isinstance(source.get("raw_parse_result"), dict) else {},
+            box_mode=box_mode,
+        )
 
     def disconnect_account(self, *, owner_user_id: str, account_id: int) -> bool:
         account = self.repo.get_account(account_id)
@@ -466,24 +505,20 @@ def _message_id_from_resource(resource: Any) -> str | None:
 
 
 def _public_account(row: dict[str, Any]) -> dict[str, Any]:
-    def serialize(value: Any) -> Any:
-        if isinstance(value, datetime):
-            return value.isoformat()
-        return value
-
-    return {key: serialize(value) for key, value in row.items()}
+    return {key: _serialize_public_value(value) for key, value in row.items()}
 
 
 def _public_invoice_review_item(row: dict[str, Any]) -> dict[str, Any]:
     parse_result = _json_dict(row.get("parse_result"))
     fields = _json_dict(parse_result.get("fields"))
-    invoice_number = _scalar_field_value(fields.get("invoice_number"))
-    vendor = _party_display(fields.get("seller"))
-    amount = _money_display(fields.get("balance_due"))
+    invoice_number = row.get("invoice_number") or _scalar_field_value(fields.get("invoice_number"))
+    vendor = row.get("vendor") or _party_display(fields.get("seller"))
+    amount = _amount_display(row.get("amount_due"), row.get("currency")) or _money_display(fields.get("balance_due"))
     pdf_file_id = int(row["pdf_file_id"])
+    attachment_id = row.get("attachment_id")
 
     return {
-        "attachment_id": int(row["attachment_id"]),
+        "attachment_id": int(attachment_id) if attachment_id is not None else None,
         "pdf_file_id": pdf_file_id,
         "filename": str(row.get("filename") or ""),
         "invoice_number": invoice_number or str(row.get("filename") or ""),
@@ -491,14 +526,17 @@ def _public_invoice_review_item(row: dict[str, Any]) -> dict[str, Any]:
         "amount": amount,
         "subject": row.get("subject"),
         "sender": row.get("sender"),
-        "received_at": _serialize_datetime(row.get("received_at")),
+        "received_at": _serialize_public_value(row.get("received_at")),
         "provider": row.get("provider"),
         "account_email": row.get("account_email"),
         "candidate_reason": row.get("candidate_reason"),
         "parse_status": row.get("parse_status") or "pending",
-        "parsed_at": _serialize_datetime(row.get("parsed_at")),
+        "parsed_at": _serialize_public_value(row.get("parsed_at")),
         "warnings": _json_list(row.get("parse_warnings")),
-        "pdf_url": f"/api/mail/pdfs/{pdf_file_id}",
+        "decision": row.get("decision"),
+        "confidence": row.get("decision_confidence"),
+        "next_action": row.get("next_action"),
+        "pdf_url": f"/api/mail/invoices/{pdf_file_id}/overlay.pdf?boxes=all",
     }
 
 
@@ -552,20 +590,105 @@ def _party_display(field: Any) -> str | None:
 def _money_display(field: Any) -> str | None:
     if not isinstance(field, dict) or field.get("amount") is None:
         return None
+    return _amount_display(field.get("amount"), field.get("currency"))
+
+
+def _amount_display(amount_value: Any, currency_value: Any = None) -> str | None:
+    if amount_value is None:
+        return None
     try:
-        amount = float(field["amount"])
+        amount = float(amount_value)
     except (TypeError, ValueError):
         return None
-    currency = str(field.get("currency") or "").strip()
+    currency = str(currency_value or "").strip()
     if currency:
         return f"{currency} {amount:,.2f}"
     return f"{amount:,.2f}"
 
 
-def _serialize_datetime(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return value
+
+def _public_invoice_queue_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "pdf_file_id": row.get("pdf_file_id"),
+        "attachment_id": row.get("attachment_id"),
+        "vendor": row.get("vendor"),
+        "invoice_number": row.get("invoice_number"),
+        "purchase_order": row.get("purchase_order"),
+        "amount_due": row.get("amount_due"),
+        "currency": row.get("currency"),
+        "received_date": _serialize_public_value(row.get("received_at")),
+        "parse_status": row.get("parse_status"),
+        "parser_method": row.get("parser_method"),
+        "parse_confidence": row.get("parse_confidence"),
+        "decision": row.get("decision"),
+        "confidence": row.get("decision_confidence"),
+        "next_action": row.get("next_action"),
+        "filename": row.get("filename"),
+        "sender": row.get("sender"),
+        "subject": row.get("subject"),
+    }
+
+
+def _public_invoice_detail(row: dict[str, Any]) -> dict[str, Any]:
+    normalized_invoice = row.get("normalized_invoice") if isinstance(row.get("normalized_invoice"), dict) else {}
+    checks = row.get("decision_checks") if isinstance(row.get("decision_checks"), list) else []
+    audit = row.get("decision_audit") if isinstance(row.get("decision_audit"), dict) else {}
+    decision = None
+    if row.get("decision"):
+        decision = {
+            "decision": row.get("decision"),
+            "confidence": row.get("decision_confidence"),
+            "summary": row.get("decision_summary"),
+            "next_action": row.get("decision_next_action"),
+        }
+    return {
+        "pdf_file_id": row.get("pdf_file_id"),
+        "owner_user_id": row.get("owner_user_id"),
+        "message": {
+            "provider": row.get("provider"),
+            "provider_message_id": row.get("provider_message_id"),
+            "thread_id": row.get("thread_id"),
+            "conversation_id": row.get("conversation_id"),
+            "sender": row.get("sender"),
+            "subject": row.get("subject"),
+            "received_at": _serialize_public_value(row.get("received_at")),
+            "metadata": row.get("message_metadata") if isinstance(row.get("message_metadata"), dict) else {},
+        },
+        "attachment": {
+            "id": row.get("attachment_id"),
+            "filename": row.get("filename"),
+            "mime_type": row.get("mime_type"),
+            "candidate_reason": row.get("candidate_reason"),
+            "metadata": row.get("attachment_metadata")
+            if isinstance(row.get("attachment_metadata"), dict)
+            else {},
+        },
+        "pdf": {
+            "sha256": row.get("sha256"),
+            "byte_size": row.get("byte_size"),
+        },
+        "raw_parse": _raw_parse_summary(row),
+        "normalized_invoice": normalized_invoice,
+        "decision": decision,
+        "checks": checks,
+        "audit": audit,
+        "ap_context": audit.get("ap_context_summary") if isinstance(audit.get("ap_context_summary"), dict) else None,
+        "parser_warnings": row.get("raw_parse_warnings") if isinstance(row.get("raw_parse_warnings"), list) else [],
+    }
+
+
+def _raw_parse_summary(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw_parse_result") if isinstance(row.get("raw_parse_result"), dict) else {}
+    pages = raw.get("pages") if isinstance(raw.get("pages"), list) else []
+    fields = raw.get("fields") if isinstance(raw.get("fields"), dict) else {}
+    return {
+        "status": row.get("raw_parse_status") or row.get("parse_status"),
+        "parser_version": row.get("raw_parser_version"),
+        "parser_method": row.get("parser_method"),
+        "page_count": len(pages),
+        "field_keys": sorted(fields.keys()),
+        "warnings": row.get("raw_parse_warnings") if isinstance(row.get("raw_parse_warnings"), list) else [],
+    }
 
 
 def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
@@ -573,3 +696,9 @@ def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
     if not storage_path or relative_path.is_absolute() or ".." in relative_path.parts:
         raise MailIntegrationError("PDF storage path must be relative to MAIL_PDF_STORAGE_DIR.")
     return Path(root) / relative_path
+
+
+def _serialize_public_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value

@@ -141,24 +141,85 @@ class ServerRouteTests(unittest.TestCase):
     def test_dashboard_uses_database_invoice_queue_not_generated_samples(self) -> None:
         class MailIntegration:
             def __init__(self) -> None:
-                self.owner_user_id: str | None = None
+                self.list_owner_user_id: str | None = None
+                self.detail_request: tuple[str, int] | None = None
 
-            def list_invoice_review_items(
-                self, *, owner_user_id: str, limit: int = 50
+            def list_invoices(
+                self, *, owner_user_id: str, limit: int = 100, offset: int = 0
             ) -> list[dict[str, object]]:
-                self.owner_user_id = owner_user_id
+                self.list_owner_user_id = owner_user_id
                 return [
                     {
                         "pdf_file_id": 20,
                         "filename": "vendor-invoice.pdf",
                         "invoice_number": "INV-DB-100",
-                        "amount": "USD 216.00",
+                        "amount_due": "216.00",
+                        "currency": "USD",
                         "vendor": "Database Vendor LLC",
                         "subject": "July invoice",
-                        "received_at": "2026-07-10T10:00:00+00:00",
-                        "pdf_url": "/api/mail/pdfs/20",
+                        "received_date": "2026-07-10T10:00:00+00:00",
+                        "decision": "needs_review",
+                        "confidence": "medium",
+                        "next_action": "Route to AP review.",
+                    },
+                    {
+                        "pdf_file_id": 21,
+                        "filename": "approved.pdf",
+                        "invoice_number": "INV-APPROVED",
+                        "vendor": "Auto Approved LLC",
+                        "decision": "approve",
                     }
                 ]
+
+            def get_invoice(
+                self, *, owner_user_id: str, pdf_file_id: int
+            ) -> dict[str, object]:
+                self.detail_request = (owner_user_id, pdf_file_id)
+                return {
+                    "pdf_file_id": pdf_file_id,
+                    "message": {
+                        "sender": "billing@example.com",
+                        "subject": "July invoice",
+                        "received_at": "2026-07-10T10:00:00+00:00",
+                    },
+                    "attachment": {"filename": "vendor-invoice.pdf"},
+                    "raw_parse": {
+                        "status": "parsed",
+                        "parser_method": "static_text",
+                        "page_count": 2,
+                    },
+                    "normalized_invoice": {
+                        "vendor": {"name": "Database Vendor LLC"},
+                        "invoice_number": {"value": "INV-DB-100"},
+                        "purchase_order": {"value": "PO-42"},
+                        "issue_date": {"value": "2026-07-01"},
+                        "amount_due": {"amount": "216.00", "currency": "USD"},
+                    },
+                    "decision": {
+                        "decision": "needs_review",
+                        "confidence": "medium",
+                        "summary": "Invoice amount is outside tolerance.",
+                        "next_action": "Route to AP review for variance approval.",
+                    },
+                    "checks": [
+                        {
+                            "id": "amount_match",
+                            "status": "fail",
+                            "summary": "Amount exceeded configured tolerance.",
+                        }
+                    ],
+                    "audit": {
+                        "normalized_vendor": "DATABASE VENDOR LLC",
+                        "normalized_invoice_number": "DB100",
+                        "purchase_order": "PO42",
+                        "amount_due": "216.00",
+                    },
+                    "ap_context": {
+                        "available": True,
+                        "scenario": "amount_variance",
+                        "source": {"type": "ap_context_records", "record_id": 5},
+                    },
+                }
 
         mail = MailIntegration()
 
@@ -183,10 +244,16 @@ class ServerRouteTests(unittest.TestCase):
         response = test_socket.writer.getvalue().decode("iso-8859-1")
 
         self.assertIn(" 200 ", response.splitlines()[0])
-        self.assertEqual(mail.owner_user_id, "user-123")
+        self.assertEqual(mail.list_owner_user_id, "user-123")
+        self.assertEqual(mail.detail_request, ("user-123", 20))
         self.assertIn("INV-DB-100", response)
         self.assertIn("Database Vendor LLC", response)
-        self.assertIn('/api/mail/pdfs/20', response)
+        self.assertIn("Invoice amount is outside tolerance.", response)
+        self.assertIn("Amount match", response)
+        self.assertIn("DATABASE VENDOR LLC", response)
+        self.assertIn('/api/mail/invoices/20/overlay.pdf?boxes=all', response)
+        self.assertNotIn('/api/mail/pdfs/20', response)
+        self.assertNotIn("Auto Approved LLC", response)
         self.assertNotIn("/api/invoices/samples.pdf", response)
         self.assertNotIn("Unknown Seller", response)
 
@@ -231,6 +298,84 @@ class ServerRouteTests(unittest.TestCase):
         self.assertEqual(body, b"%PDF-1.4\nfrom-db\n%%EOF")
         self.assertEqual(mail.owner_user_id, "user-123")
         self.assertEqual(mail.pdf_file_id, 20)
+
+    def test_mail_invoices_api_returns_authenticated_queue_rows(self) -> None:
+        class MailIntegration:
+            def __init__(self) -> None:
+                self.owner_user_id: str | None = None
+
+            def list_invoices(
+                self, *, owner_user_id: str, limit: int = 100, offset: int = 0
+            ) -> list[dict[str, object]]:
+                self.owner_user_id = owner_user_id
+                return [
+                    {
+                        "pdf_file_id": 42,
+                        "vendor": "Acme Supplies LLC",
+                        "invoice_number": "INV-1045",
+                        "parse_status": "parsed",
+                        "decision": "approve",
+                    }
+                ]
+
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def _authenticated_api_user(self) -> tuple[str, list[str]] | None:
+                return "user-123", []
+
+        mail = MailIntegration()
+        Handler.mail_integration = mail  # type: ignore[assignment]
+        request = b"GET /api/mail/invoices?limit=10 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
+        _, body = response.split("\r\n\r\n", 1)
+        payload = json.loads(body)
+
+        self.assertIn(" 200 ", response.splitlines()[0])
+        self.assertEqual(mail.owner_user_id, "user-123")
+        self.assertEqual(payload["invoices"][0]["pdf_file_id"], 42)
+
+    def test_mail_invoice_overlay_api_returns_pdf(self) -> None:
+        class MailIntegration:
+            def __init__(self) -> None:
+                self.request: dict[str, object] | None = None
+
+            def invoice_overlay_pdf(
+                self, *, owner_user_id: str, pdf_file_id: int, box_mode: str = "parsed"
+            ) -> bytes:
+                self.request = {
+                    "owner_user_id": owner_user_id,
+                    "pdf_file_id": pdf_file_id,
+                    "box_mode": box_mode,
+                }
+                return b"%PDF-1.4\n%%EOF\n"
+
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def _authenticated_api_user(self) -> tuple[str, list[str]] | None:
+                return "user-123", ["refreshed=1"]
+
+        mail = MailIntegration()
+        Handler.mail_integration = mail  # type: ignore[assignment]
+        request = b"GET /api/mail/invoices/42/overlay.pdf?boxes=all HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue()
+        header, body = response.split(b"\r\n\r\n", 1)
+
+        self.assertIn(b" 200 ", header.splitlines()[0])
+        self.assertIn(b"Content-Type: application/pdf", header)
+        self.assertIn(b"Set-Cookie: refreshed=1", header)
+        self.assertEqual(body, b"%PDF-1.4\n%%EOF\n")
+        self.assertEqual(
+            mail.request,
+            {"owner_user_id": "user-123", "pdf_file_id": 42, "box_mode": "all"},
+        )
 
     def test_gmail_webhook_accepts_header_secret(self) -> None:
         class MailIntegration:

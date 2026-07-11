@@ -8,7 +8,13 @@ from typing import Any
 
 from cryptography.fernet import Fernet
 
-from app.mail_store import MailRepository, PdfStorage, SCHEMA_SQL, TokenCipher
+from app.mail_store import (
+    MailRepository,
+    PdfStorage,
+    REVIEW_QUEUE_DECISIONS,
+    SCHEMA_SQL,
+    TokenCipher,
+)
 
 
 class FakeResult:
@@ -97,7 +103,7 @@ class FakeMailConnection:
                 return FakeResult()
             return FakeResult()
 
-        if "FROM mail_attachments AS attachments" in sql:
+        if "FROM mail_invoice_extractions extraction" in sql:
             self.database.last_sql = sql
             self.database.last_params = params
             return FakeResult(rows=self.database.review_rows)
@@ -204,7 +210,7 @@ class MailRepositoryJobQueueTests(unittest.TestCase):
 
 
 class MailRepositoryInvoiceReviewTests(unittest.TestCase):
-    def test_list_invoice_review_items_reads_owner_mail_attachment_rows(self) -> None:
+    def test_list_invoice_review_items_reads_owner_decision_rows(self) -> None:
         database = FakeMailDatabase()
         database.review_rows = [
             {
@@ -218,9 +224,11 @@ class MailRepositoryInvoiceReviewTests(unittest.TestCase):
         rows = repo.list_invoice_review_items(owner_user_id="user-123", limit=25)
 
         self.assertEqual(rows, database.review_rows)
-        self.assertEqual(database.last_params, ("user-123", 25))
-        self.assertIn("JOIN mail_accounts AS accounts", database.last_sql)
-        self.assertIn("LEFT JOIN mail_pdf_parse_results AS parse_results", database.last_sql)
+        self.assertEqual(database.last_params, ("user-123", list(REVIEW_QUEUE_DECISIONS), 25))
+        self.assertIn("FROM mail_invoice_extractions extraction", database.last_sql)
+        self.assertIn("LEFT JOIN mail_invoice_decisions decision", database.last_sql)
+        self.assertIn("decision.decision = ANY(%s)", database.last_sql)
+        self.assertNotIn("LOWER(parse_results.status)", database.last_sql)
         self.assertNotIn("generate_invoice", database.last_sql)
 
     def test_get_pdf_file_for_owner_filters_by_owner_and_pdf_id(self) -> None:
@@ -248,3 +256,10 @@ class MailSchemaSqlTests(unittest.TestCase):
             SCHEMA_SQL,
         )
         self.assertIn("DELETE FROM ingestion_jobs\nWHERE status = 'completed'", SCHEMA_SQL)
+
+    def test_schema_includes_invoice_extraction_decision_and_ap_context_tables(self) -> None:
+        self.assertIn("CREATE TABLE IF NOT EXISTS mail_invoice_extractions", SCHEMA_SQL)
+        self.assertIn("CREATE TABLE IF NOT EXISTS mail_invoice_decisions", SCHEMA_SQL)
+        self.assertIn("CREATE TABLE IF NOT EXISTS ap_context_records", SCHEMA_SQL)
+        self.assertIn("parser_method TEXT NOT NULL DEFAULT 'static_text'", SCHEMA_SQL)
+        self.assertIn("idx_ap_context_records_owner_vendor_po", SCHEMA_SQL)

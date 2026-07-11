@@ -324,7 +324,7 @@ class InvoiceReviewQueueTests(unittest.TestCase):
         self.assertEqual(items[0]["invoice_number"], "INV-DB-100")
         self.assertEqual(items[0]["vendor"], "Database Vendor LLC")
         self.assertEqual(items[0]["amount"], "USD 216.00")
-        self.assertEqual(items[0]["pdf_url"], "/api/mail/pdfs/20")
+        self.assertEqual(items[0]["pdf_url"], "/api/mail/invoices/20/overlay.pdf?boxes=all")
         self.assertEqual(items[0]["warnings"], ["missing tax"])
 
     def test_get_invoice_pdf_file_resolves_relative_storage_path(self) -> None:

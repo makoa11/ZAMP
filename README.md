@@ -76,6 +76,14 @@ To visualize parser evidence boxes on top of a PDF, generate a highlighted overl
 ```
 
 The output keeps the original PDF pages and appends transparent yellow rectangle overlays. By default it highlights accepted parsed field evidence only. Use `--boxes words` to highlight every extracted text word box, or `--boxes all` to include both parser evidence and word geometry.
+
+To run the synthetic static-parser decision pipeline against generated PDFs and manifests:
+
+```bash
+.venv/bin/python scripts/run_test_invoice_pipeline.py --input-dir storage/test_pdfs --output-dir storage/test_invoice_pipeline
+```
+
+This writes parsed JSON, overlay PDFs, normalized invoice JSON, decision JSON, and audit JSON per PDF, plus a summary comparing actual decisions with manifest expected decisions.
 Some full A4 layouts place the payable total as the last row of the item table, with total quantity populated, the rate cell intentionally blank, and the amount cell using the final payable value. Currency can render as a code or a symbol such as `$`, `Rs`, `€`, `£`, `¥`, `A$`, or `S$`.
 Template metadata also includes `font_style`, and rendered samples rotate through system, serif, slab, mono, condensed, rounded, formal, industrial, humanist, geometric, courier, book, narrow, typewriter, and neo-grotesque font stacks.
 
@@ -143,6 +151,9 @@ Frontend-facing APIs:
 - `GET /api/mail/oauth/{provider}/callback`
 - `GET /api/mail/accounts`
 - `DELETE /api/mail/accounts/{id}`
+- `GET /api/mail/invoices`
+- `GET /api/mail/invoices/{pdf_file_id}`
+- `GET /api/mail/invoices/{pdf_file_id}/overlay.pdf`
 
 Provider webhooks:
 
@@ -155,4 +166,10 @@ Run the ingestion worker:
 .venv/bin/python -m app.mail_worker
 ```
 
-The worker claims provider jobs, refreshes OAuth tokens when needed, renews Gmail watches and Outlook subscriptions hourly, and enqueues polling fallback jobs every 15 minutes by default. PDFs are saved when no dashboard regex patterns are configured; once patterns are added, a pattern must match the PDF filename, subject, or body/snippet. The dashboard can generate a regex from a sample filename or dropped local PDF name. PDFs are stored under `MAIL_PDF_STORAGE_DIR` as SHA-256-named files; Postgres stores account, message, attachment, file, webhook event, active/retry/failed job state, lightweight job dedupe keys, invoice matching metadata, and static parse results. Saved PDFs enqueue `parse_pdf` jobs that run the non-OCR text-layer invoice parser.
+The worker claims provider jobs, refreshes OAuth tokens when needed, renews Gmail watches and Outlook subscriptions hourly, and enqueues polling fallback jobs every 15 minutes by default. PDFs are saved when no dashboard regex patterns are configured; once patterns are added, a pattern must match the PDF filename, subject, or body/snippet. The dashboard can generate a regex from a sample filename or dropped local PDF name. PDFs are stored under `MAIL_PDF_STORAGE_DIR` as SHA-256-named files; Postgres stores account, message, attachment, file, webhook event, active/retry/failed job state, lightweight job dedupe keys, invoice matching metadata, static parse results, normalized extractions, decisions, and simulated AP context records. Saved PDFs enqueue `parse_pdf` jobs that run the non-OCR text-layer invoice parser, normalize the result, match DB-backed AP context, decide, and persist the review payload.
+
+To seed local simulated AP context from generated manifests:
+
+```bash
+.venv/bin/python scripts/seed_ap_context_records.py --owner-user-id demo-user --manifest-dir storage/test_pdfs
+```

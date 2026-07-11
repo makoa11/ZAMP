@@ -7,13 +7,23 @@ import secrets
 import tempfile
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from cryptography.fernet import Fernet
 
 from .config import AppConfig, ConfigError
+
+
+REVIEW_QUEUE_DECISIONS = (
+    "needs_review",
+    "request_missing_info",
+    "flag_possible_duplicate",
+    "block_or_escalate",
+    "apply_credit_or_route_review",
+)
 
 
 class MailIntegrationError(RuntimeError):
@@ -198,6 +208,62 @@ CREATE TABLE IF NOT EXISTS mail_attachments (
     UNIQUE(message_id, provider_attachment_id)
 );
 
+CREATE TABLE IF NOT EXISTS mail_invoice_extractions (
+    owner_user_id TEXT NOT NULL,
+    pdf_file_id BIGINT NOT NULL REFERENCES mail_pdf_files(id) ON DELETE CASCADE,
+    attachment_id BIGINT REFERENCES mail_attachments(id) ON DELETE SET NULL,
+    parse_status TEXT NOT NULL CHECK (parse_status IN ('parsed', 'no_text_layer', 'unsupported', 'failed')),
+    parser_method TEXT NOT NULL DEFAULT 'static_text',
+    confidence NUMERIC(5,3),
+    vendor_name TEXT,
+    normalized_vendor TEXT,
+    invoice_number TEXT,
+    normalized_invoice_number TEXT,
+    purchase_order TEXT,
+    normalized_purchase_order TEXT,
+    issue_date DATE,
+    amount_due NUMERIC(12,2),
+    currency TEXT,
+    normalized_invoice JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner_user_id, pdf_file_id)
+);
+
+CREATE TABLE IF NOT EXISTS mail_invoice_decisions (
+    owner_user_id TEXT NOT NULL,
+    pdf_file_id BIGINT NOT NULL REFERENCES mail_pdf_files(id) ON DELETE CASCADE,
+    decision TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    next_action TEXT NOT NULL,
+    checks JSONB NOT NULL DEFAULT '[]'::jsonb,
+    audit JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner_user_id, pdf_file_id)
+);
+
+CREATE TABLE IF NOT EXISTS ap_context_records (
+    id BIGSERIAL PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    source_key TEXT,
+    vendor_name TEXT NOT NULL,
+    normalized_vendor TEXT NOT NULL,
+    purchase_order TEXT,
+    normalized_purchase_order TEXT,
+    invoice_number TEXT,
+    normalized_invoice_number TEXT,
+    invoice_total NUMERIC(12,2),
+    issue_date DATE,
+    scenario TEXT,
+    context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(owner_user_id, source_key)
+);
+
 CREATE TABLE IF NOT EXISTS webhook_events (
     id BIGSERIAL PRIMARY KEY,
     provider TEXT NOT NULL,
@@ -253,7 +319,56 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_accounts_owner_provider_email_unique
     ON mail_accounts(owner_user_id, provider, lower(email));
 CREATE INDEX IF NOT EXISTS idx_mail_messages_account ON mail_messages(account_id);
 CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_claim ON ingestion_jobs(status, available_at, id);
+CREATE INDEX IF NOT EXISTS idx_mail_invoice_extractions_owner_updated
+    ON mail_invoice_extractions(owner_user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mail_invoice_extractions_owner_decision
+    ON mail_invoice_extractions(owner_user_id, parse_status, normalized_vendor);
+CREATE INDEX IF NOT EXISTS idx_mail_invoice_decisions_owner_decision
+    ON mail_invoice_decisions(owner_user_id, decision);
+CREATE INDEX IF NOT EXISTS idx_ap_context_records_owner_vendor_po
+    ON ap_context_records(owner_user_id, normalized_vendor, normalized_purchase_order);
+CREATE INDEX IF NOT EXISTS idx_ap_context_records_owner_vendor_invoice
+    ON ap_context_records(owner_user_id, normalized_vendor, normalized_invoice_number);
+CREATE INDEX IF NOT EXISTS idx_ap_context_records_owner_vendor_amount_date
+    ON ap_context_records(owner_user_id, normalized_vendor, invoice_total, issue_date);
 """
+
+
+def _json_from_db(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return fallback
+    return value
+
+
+def _decimal_from_value(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.01"))
+    except Exception:
+        return None
+
+
+def _date_from_value(value: Any) -> date | None:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
+
+
+def _nested_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 class MailDatabase:
@@ -910,6 +1025,408 @@ class MailRepository:
             ).fetchone()
             return dict(row)
 
+    def upsert_mail_invoice_extraction(
+        self,
+        *,
+        owner_user_id: str,
+        pdf_file_id: int,
+        attachment_id: int | None,
+        normalized_invoice: dict[str, Any],
+        parse_status: str,
+        parser_method: str = "static_text",
+    ) -> dict[str, Any]:
+        vendor = _nested_dict(normalized_invoice.get("vendor"))
+        invoice_number = _nested_dict(normalized_invoice.get("invoice_number"))
+        purchase_order = _nested_dict(normalized_invoice.get("purchase_order"))
+        issue_date = _date_from_value(_nested_dict(normalized_invoice.get("issue_date")).get("value"))
+        amount_due = _nested_dict(normalized_invoice.get("amount_due"))
+        confidence = _nested_dict(normalized_invoice.get("confidence")).get("score")
+        confidence_value = None
+        try:
+            confidence_value = round(float(confidence), 3)
+        except (TypeError, ValueError):
+            pass
+
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO mail_invoice_extractions (
+                    owner_user_id, pdf_file_id, attachment_id, parse_status, parser_method,
+                    confidence, vendor_name, normalized_vendor, invoice_number,
+                    normalized_invoice_number, purchase_order, normalized_purchase_order,
+                    issue_date, amount_due, currency, normalized_invoice
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s::jsonb
+                )
+                ON CONFLICT (owner_user_id, pdf_file_id)
+                DO UPDATE SET
+                    attachment_id = EXCLUDED.attachment_id,
+                    parse_status = EXCLUDED.parse_status,
+                    parser_method = EXCLUDED.parser_method,
+                    confidence = EXCLUDED.confidence,
+                    vendor_name = EXCLUDED.vendor_name,
+                    normalized_vendor = EXCLUDED.normalized_vendor,
+                    invoice_number = EXCLUDED.invoice_number,
+                    normalized_invoice_number = EXCLUDED.normalized_invoice_number,
+                    purchase_order = EXCLUDED.purchase_order,
+                    normalized_purchase_order = EXCLUDED.normalized_purchase_order,
+                    issue_date = EXCLUDED.issue_date,
+                    amount_due = EXCLUDED.amount_due,
+                    currency = EXCLUDED.currency,
+                    normalized_invoice = EXCLUDED.normalized_invoice,
+                    updated_at = now()
+                RETURNING *
+                """,
+                (
+                    owner_user_id,
+                    pdf_file_id,
+                    attachment_id,
+                    parse_status,
+                    parser_method,
+                    confidence_value,
+                    vendor.get("name"),
+                    vendor.get("normalized_name"),
+                    invoice_number.get("value"),
+                    invoice_number.get("normalized"),
+                    purchase_order.get("value"),
+                    purchase_order.get("normalized"),
+                    issue_date,
+                    _decimal_from_value(amount_due.get("amount")),
+                    amount_due.get("currency")
+                    or _nested_dict(normalized_invoice.get("currency")).get("value"),
+                    json.dumps(normalized_invoice, separators=(",", ":")),
+                ),
+            ).fetchone()
+            return dict(row)
+
+    def upsert_mail_invoice_decision(
+        self,
+        *,
+        owner_user_id: str,
+        pdf_file_id: int,
+        decision_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO mail_invoice_decisions (
+                    owner_user_id, pdf_file_id, decision, confidence, summary,
+                    next_action, checks, audit
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                ON CONFLICT (owner_user_id, pdf_file_id)
+                DO UPDATE SET
+                    decision = EXCLUDED.decision,
+                    confidence = EXCLUDED.confidence,
+                    summary = EXCLUDED.summary,
+                    next_action = EXCLUDED.next_action,
+                    checks = EXCLUDED.checks,
+                    audit = EXCLUDED.audit,
+                    updated_at = now()
+                RETURNING *
+                """,
+                (
+                    owner_user_id,
+                    pdf_file_id,
+                    str(decision_result.get("decision") or "needs_review"),
+                    str(decision_result.get("confidence") or "low"),
+                    str(decision_result.get("summary") or ""),
+                    str(decision_result.get("next_action") or ""),
+                    json.dumps(decision_result.get("checks") or [], separators=(",", ":")),
+                    json.dumps(decision_result.get("audit") or {}, separators=(",", ":")),
+                ),
+            ).fetchone()
+            return dict(row)
+
+    def upsert_ap_context_record(
+        self,
+        *,
+        owner_user_id: str,
+        source_key: str | None,
+        vendor_name: str,
+        normalized_vendor: str,
+        purchase_order: str | None,
+        normalized_purchase_order: str | None,
+        invoice_number: str | None,
+        normalized_invoice_number: str | None,
+        invoice_total: Decimal | str | float | int | None,
+        issue_date: date | datetime | str | None,
+        scenario: str | None,
+        context: dict[str, Any],
+        source_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO ap_context_records (
+                    owner_user_id, source_key, vendor_name, normalized_vendor,
+                    purchase_order, normalized_purchase_order, invoice_number,
+                    normalized_invoice_number, invoice_total, issue_date, scenario,
+                    context, source_metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                ON CONFLICT (owner_user_id, source_key)
+                DO UPDATE SET
+                    vendor_name = EXCLUDED.vendor_name,
+                    normalized_vendor = EXCLUDED.normalized_vendor,
+                    purchase_order = EXCLUDED.purchase_order,
+                    normalized_purchase_order = EXCLUDED.normalized_purchase_order,
+                    invoice_number = EXCLUDED.invoice_number,
+                    normalized_invoice_number = EXCLUDED.normalized_invoice_number,
+                    invoice_total = EXCLUDED.invoice_total,
+                    issue_date = EXCLUDED.issue_date,
+                    scenario = EXCLUDED.scenario,
+                    context = EXCLUDED.context,
+                    source_metadata = EXCLUDED.source_metadata,
+                    updated_at = now()
+                RETURNING *
+                """,
+                (
+                    owner_user_id,
+                    source_key,
+                    vendor_name,
+                    normalized_vendor,
+                    purchase_order,
+                    normalized_purchase_order,
+                    invoice_number,
+                    normalized_invoice_number,
+                    _decimal_from_value(invoice_total),
+                    _date_from_value(issue_date),
+                    scenario,
+                    json.dumps(context, separators=(",", ":")),
+                    json.dumps(source_metadata or {}, separators=(",", ":")),
+                ),
+            ).fetchone()
+            return dict(row)
+
+    def find_ap_context_record(
+        self,
+        *,
+        owner_user_id: str,
+        normalized_vendor: str | None,
+        normalized_purchase_order: str | None,
+        normalized_invoice_number: str | None,
+        amount_due: Decimal | str | float | int | None,
+        issue_date: date | datetime | str | None,
+    ) -> dict[str, Any] | None:
+        if not normalized_vendor:
+            return None
+
+        with self.database.connect() as conn:
+            if normalized_purchase_order:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM ap_context_records
+                    WHERE owner_user_id = %s
+                      AND normalized_vendor = %s
+                      AND normalized_purchase_order = %s
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (owner_user_id, normalized_vendor, normalized_purchase_order),
+                ).fetchone()
+                if row:
+                    result = dict(row)
+                    result["_match_strategy"] = "vendor_po"
+                    return self._hydrate_ap_context_record(result)
+
+            if normalized_invoice_number:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM ap_context_records
+                    WHERE owner_user_id = %s
+                      AND normalized_vendor = %s
+                      AND normalized_invoice_number = %s
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (owner_user_id, normalized_vendor, normalized_invoice_number),
+                ).fetchone()
+                if row:
+                    result = dict(row)
+                    result["_match_strategy"] = "vendor_invoice_number"
+                    return self._hydrate_ap_context_record(result)
+
+            amount = _decimal_from_value(amount_due)
+            parsed_date = _date_from_value(issue_date)
+            if amount is not None:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM ap_context_records
+                    WHERE owner_user_id = %s
+                      AND normalized_vendor = %s
+                      AND invoice_total = %s
+                      AND (%s::date IS NULL OR issue_date = %s::date OR issue_date IS NULL)
+                    ORDER BY
+                        CASE WHEN issue_date = %s::date THEN 0 ELSE 1 END,
+                        updated_at DESC,
+                        id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        owner_user_id,
+                        normalized_vendor,
+                        amount,
+                        parsed_date,
+                        parsed_date,
+                        parsed_date,
+                    ),
+                ).fetchone()
+                if row:
+                    result = dict(row)
+                    result["_match_strategy"] = "vendor_amount_date"
+                    return self._hydrate_ap_context_record(result)
+        return None
+
+    def list_mail_invoices(
+        self,
+        *,
+        owner_user_id: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    extraction.pdf_file_id,
+                    extraction.attachment_id,
+                    extraction.vendor_name AS vendor,
+                    extraction.invoice_number,
+                    extraction.purchase_order,
+                    extraction.amount_due::text AS amount_due,
+                    extraction.currency,
+                    extraction.parse_status,
+                    extraction.parser_method,
+                    extraction.confidence::float AS parse_confidence,
+                    decision.decision,
+                    decision.confidence AS decision_confidence,
+                    decision.next_action,
+                    message.received_at,
+                    attachment.filename,
+                    message.sender,
+                    message.subject
+                FROM mail_invoice_extractions extraction
+                LEFT JOIN mail_invoice_decisions decision
+                    ON decision.owner_user_id = extraction.owner_user_id
+                   AND decision.pdf_file_id = extraction.pdf_file_id
+                LEFT JOIN mail_attachments attachment
+                    ON attachment.id = extraction.attachment_id
+                LEFT JOIN mail_messages message
+                    ON message.id = attachment.message_id
+                WHERE extraction.owner_user_id = %s
+                ORDER BY COALESCE(message.received_at, extraction.updated_at) DESC,
+                         extraction.updated_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (owner_user_id, max(1, min(limit, 500)), max(0, offset)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_mail_invoice_detail(
+        self,
+        *,
+        owner_user_id: str,
+        pdf_file_id: int,
+    ) -> dict[str, Any] | None:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    extraction.*,
+                    pdf.sha256,
+                    pdf.byte_size,
+                    pdf.storage_path,
+                    parse.status AS raw_parse_status,
+                    parse.parser_version AS raw_parser_version,
+                    parse.result AS raw_parse_result,
+                    parse.warnings AS raw_parse_warnings,
+                    decision.decision,
+                    decision.confidence AS decision_confidence,
+                    decision.summary AS decision_summary,
+                    decision.next_action AS decision_next_action,
+                    decision.checks AS decision_checks,
+                    decision.audit AS decision_audit,
+                    attachment.filename,
+                    attachment.mime_type,
+                    attachment.candidate_reason,
+                    attachment.metadata AS attachment_metadata,
+                    message.provider,
+                    message.provider_message_id,
+                    message.thread_id,
+                    message.conversation_id,
+                    message.sender,
+                    message.subject,
+                    message.received_at,
+                    message.metadata AS message_metadata
+                FROM mail_invoice_extractions extraction
+                JOIN mail_pdf_files pdf
+                    ON pdf.id = extraction.pdf_file_id
+                LEFT JOIN mail_pdf_parse_results parse
+                    ON parse.pdf_file_id = extraction.pdf_file_id
+                LEFT JOIN mail_invoice_decisions decision
+                    ON decision.owner_user_id = extraction.owner_user_id
+                   AND decision.pdf_file_id = extraction.pdf_file_id
+                LEFT JOIN mail_attachments attachment
+                    ON attachment.id = extraction.attachment_id
+                LEFT JOIN mail_messages message
+                    ON message.id = attachment.message_id
+                WHERE extraction.owner_user_id = %s
+                  AND extraction.pdf_file_id = %s
+                """,
+                (owner_user_id, pdf_file_id),
+            ).fetchone()
+            if not row:
+                return None
+            detail = dict(row)
+            for key, fallback in {
+                "normalized_invoice": {},
+                "raw_parse_result": {},
+                "raw_parse_warnings": [],
+                "decision_checks": [],
+                "decision_audit": {},
+                "attachment_metadata": {},
+                "message_metadata": {},
+            }.items():
+                detail[key] = _json_from_db(detail.get(key), fallback)
+            return detail
+
+    def get_mail_invoice_overlay_source(
+        self,
+        *,
+        owner_user_id: str,
+        pdf_file_id: int,
+    ) -> dict[str, Any] | None:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT pdf.storage_path, parse.result AS raw_parse_result
+                FROM mail_invoice_extractions extraction
+                JOIN mail_pdf_files pdf
+                    ON pdf.id = extraction.pdf_file_id
+                JOIN mail_pdf_parse_results parse
+                    ON parse.pdf_file_id = extraction.pdf_file_id
+                WHERE extraction.owner_user_id = %s
+                  AND extraction.pdf_file_id = %s
+                """,
+                (owner_user_id, pdf_file_id),
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["raw_parse_result"] = _json_from_db(result.get("raw_parse_result"), {})
+            return result
+
+    def _hydrate_ap_context_record(self, row: dict[str, Any]) -> dict[str, Any]:
+        row["context"] = _json_from_db(row.get("context"), {})
+        row["source_metadata"] = _json_from_db(row.get("source_metadata"), {})
+        return row
+
     def upsert_attachment(
         self,
         *,
@@ -960,39 +1477,57 @@ class MailRepository:
             rows = conn.execute(
                 """
                 SELECT
-                    attachments.id AS attachment_id,
-                    attachments.filename,
-                    attachments.candidate_reason,
-                    attachments.created_at AS attachment_created_at,
-                    pdf_files.id AS pdf_file_id,
-                    pdf_files.sha256,
-                    pdf_files.byte_size,
-                    pdf_files.storage_path,
-                    messages.id AS message_id,
-                    messages.sender,
-                    messages.subject,
-                    messages.received_at,
-                    accounts.provider,
-                    accounts.email AS account_email,
-                    parse_results.status AS parse_status,
-                    parse_results.result AS parse_result,
-                    parse_results.warnings AS parse_warnings,
-                    parse_results.updated_at AS parsed_at
-                FROM mail_attachments AS attachments
-                JOIN mail_accounts AS accounts ON accounts.id = attachments.account_id
-                JOIN mail_messages AS messages ON messages.id = attachments.message_id
-                JOIN mail_pdf_files AS pdf_files ON pdf_files.id = attachments.pdf_file_id
-                LEFT JOIN mail_pdf_parse_results AS parse_results
-                    ON parse_results.pdf_file_id = pdf_files.id
-                WHERE accounts.owner_user_id = %s
-                  AND LOWER(parse_results.status) LIKE '%%review%%'
+                    extraction.attachment_id,
+                    attachment.filename,
+                    attachment.candidate_reason,
+                    attachment.created_at AS attachment_created_at,
+                    extraction.pdf_file_id,
+                    pdf.sha256,
+                    pdf.byte_size,
+                    pdf.storage_path,
+                    message.id AS message_id,
+                    message.sender,
+                    message.subject,
+                    message.received_at,
+                    message.provider,
+                    account.email AS account_email,
+                    extraction.parse_status,
+                    raw_parse.result AS parse_result,
+                    raw_parse.warnings AS parse_warnings,
+                    raw_parse.updated_at AS parsed_at,
+                    extraction.vendor_name AS vendor,
+                    extraction.invoice_number,
+                    extraction.amount_due::text AS amount_due,
+                    extraction.currency,
+                    decision.decision,
+                    decision.confidence AS decision_confidence,
+                    decision.next_action
+                FROM mail_invoice_extractions extraction
+                JOIN mail_pdf_files pdf
+                    ON pdf.id = extraction.pdf_file_id
+                LEFT JOIN mail_attachments attachment
+                    ON attachment.id = extraction.attachment_id
+                LEFT JOIN mail_messages message
+                    ON message.id = attachment.message_id
+                LEFT JOIN mail_accounts account
+                    ON account.id = attachment.account_id
+                LEFT JOIN mail_pdf_parse_results raw_parse
+                    ON raw_parse.pdf_file_id = extraction.pdf_file_id
+                LEFT JOIN mail_invoice_decisions decision
+                    ON decision.owner_user_id = extraction.owner_user_id
+                   AND decision.pdf_file_id = extraction.pdf_file_id
+                WHERE extraction.owner_user_id = %s
+                  AND (
+                      decision.decision IS NULL
+                      OR decision.decision = ANY(%s)
+                  )
                 ORDER BY
-                    messages.received_at DESC NULLS LAST,
-                    attachments.created_at DESC,
-                    attachments.id DESC
+                    COALESCE(message.received_at, extraction.updated_at) DESC,
+                    extraction.updated_at DESC,
+                    extraction.pdf_file_id DESC
                 LIMIT %s
                 """,
-                (owner_user_id, limit),
+                (owner_user_id, list(REVIEW_QUEUE_DECISIONS), limit),
             ).fetchall()
             return [dict(row) for row in rows]
 

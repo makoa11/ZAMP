@@ -13,12 +13,26 @@ from app.mail_worker import _handle_job, _storage_pdf_path
 class TestRepo:
     def __init__(self) -> None:
         self.parse_results: list[dict[str, object]] = []
+        self.extractions: list[dict[str, object]] = []
+        self.decisions: list[dict[str, object]] = []
         self.completed: list[int] = []
         self.retries: list[dict[str, object]] = []
+        self.ap_context_record: dict[str, object] | None = None
 
     def upsert_pdf_parse_result(self, **kwargs: object) -> dict[str, object]:
         self.parse_results.append(kwargs)
         return {"pdf_file_id": kwargs["pdf_file_id"], **kwargs}
+
+    def upsert_mail_invoice_extraction(self, **kwargs: object) -> dict[str, object]:
+        self.extractions.append(kwargs)
+        return {"pdf_file_id": kwargs["pdf_file_id"], **kwargs}
+
+    def upsert_mail_invoice_decision(self, **kwargs: object) -> dict[str, object]:
+        self.decisions.append(kwargs)
+        return {"pdf_file_id": kwargs["pdf_file_id"], **kwargs}
+
+    def find_ap_context_record(self, **kwargs: object) -> dict[str, object] | None:
+        return self.ap_context_record
 
     def complete_job(self, *, job_id: int) -> None:
         self.completed.append(job_id)
@@ -31,6 +45,94 @@ class TestIntegration:
     def __init__(self, root: Path) -> None:
         self.repo = TestRepo()
         self.storage = SimpleNamespace(root=root)
+
+
+def _field(value: object, *, confidence: float = 0.95) -> dict[str, object]:
+    return {
+        "raw": value,
+        "value": value,
+        "page": 1,
+        "bbox": [10.0, 20.0, 80.0, 28.0],
+        "label": "test",
+        "confidence": confidence,
+        "method": "unit_test",
+    }
+
+
+def _money(value: object, *, confidence: float = 0.95) -> dict[str, object]:
+    return {
+        "raw": f"USD {value}",
+        "value": float(value),
+        "amount": float(value),
+        "currency": "USD",
+        "page": 1,
+        "bbox": [120.0, 160.0, 180.0, 168.0],
+        "label": "balance due",
+        "confidence": confidence,
+        "method": "unit_test",
+    }
+
+
+def _parsed_invoice_result() -> dict[str, object]:
+    return {
+        "status": "parsed",
+        "parser_version": "static-pdf-v1",
+        "fields": {
+            "invoice_number": _field("INV-1045"),
+            "issue_date": _field("2026-07-01"),
+            "due_date": _field("2026-07-31"),
+            "purchase_order": _field("PO-1000"),
+            "terms": _field("Net 30"),
+            "currency": _field("USD"),
+            "seller": _field("Acme Supplies LLC\nbilling@acme.example"),
+            "buyer": _field("Beta Foods Inc"),
+            "subtotal": _money("1000.00"),
+            "discount": _money("0.00"),
+            "tax": _money("0.00"),
+            "shipping": _money("0.00"),
+            "paid": _money("0.00"),
+            "balance_due": _money("1000.00"),
+            "payment_instructions": _field("ACH transfer **** 1234\nbilling@acme.example"),
+            "line_items": [],
+        },
+        "pages": [{"page": 1, "text": "invoice"}],
+        "warnings": [],
+    }
+
+
+def _approve_ap_context_record() -> dict[str, object]:
+    return {
+        "id": 1,
+        "source_key": "unit:approve",
+        "_match_strategy": "vendor_po",
+        "source_metadata": {"source": "unit_test"},
+        "context": {
+            "schema_version": 1,
+            "available": True,
+            "source": {"type": "unit_test"},
+            "scenario": "unit_approve",
+            "vendor": {
+                "name": "Acme Supplies LLC",
+                "normalized_name": "acme supplies",
+                "approved": True,
+            },
+            "purchase_order": {
+                "po_number": "PO-1000",
+                "normalized": "PO1000",
+                "authorized_total": "1000.00",
+                "previously_consumed": "0.00",
+                "remaining_before_invoice": "1000.00",
+            },
+            "invoice_total": "1000.00",
+            "approved_bank_details": {"account": "**** 1234"},
+            "invoice_payment": {"bank_account": "**** 1234"},
+            "previous_invoices": [],
+            "duplicate_candidates": [],
+            "candidate_open_po": None,
+            "tolerance_policy": {"percent": "0.00", "amount": "0.00"},
+            "expected": {},
+        },
+    }
 
 
 class MailWorkerParsePdfTests(unittest.TestCase):
@@ -62,6 +164,66 @@ class MailWorkerParsePdfTests(unittest.TestCase):
         self.assertEqual(integration.repo.parse_results[0]["pdf_file_id"], 42)
         self.assertEqual(integration.repo.parse_results[0]["status"], "parsed")
         self.assertEqual(integration.repo.parse_results[0]["warnings"], ["missing tax"])
+
+    def test_parse_pdf_job_persists_normalized_extraction_and_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Path(root, "invoice.pdf").write_bytes(b"%PDF-1.4\nfixture")
+            integration = TestIntegration(root)
+            integration.repo.ap_context_record = _approve_ap_context_record()
+            job = {
+                "id": 101,
+                "type": "parse_pdf",
+                "attempts": 1,
+                "payload": {
+                    "attachment_id": 7,
+                    "pdf_file_id": 42,
+                    "storage_path": "invoice.pdf",
+                    "owner_user_id": "user-123",
+                },
+            }
+
+            with patch("app.mail_worker.parse_invoice_pdf", return_value=_parsed_invoice_result()):
+                _handle_job(integration, job)  # type: ignore[arg-type]
+
+        self.assertEqual(integration.repo.completed, [101])
+        self.assertEqual(integration.repo.extractions[0]["owner_user_id"], "user-123")
+        self.assertEqual(integration.repo.extractions[0]["attachment_id"], 7)
+        normalized = integration.repo.extractions[0]["normalized_invoice"]
+        self.assertIsInstance(normalized, dict)
+        self.assertEqual(normalized["vendor"]["normalized_name"], "acme supplies")
+        decision = integration.repo.decisions[0]["decision_result"]
+        self.assertIsInstance(decision, dict)
+        self.assertEqual(decision["decision"], "approve")
+        self.assertEqual(
+            decision["audit"]["ap_context_summary"]["source"]["type"],
+            "ap_context_records",
+        )
+
+    def test_parse_pdf_job_without_ap_context_routes_to_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Path(root, "invoice.pdf").write_bytes(b"%PDF-1.4\nfixture")
+            integration = TestIntegration(root)
+            job = {
+                "id": 102,
+                "type": "parse_pdf",
+                "attempts": 1,
+                "payload": {
+                    "attachment_id": 8,
+                    "pdf_file_id": 43,
+                    "storage_path": "invoice.pdf",
+                    "owner_user_id": "user-123",
+                },
+            }
+
+            with patch("app.mail_worker.parse_invoice_pdf", return_value=_parsed_invoice_result()):
+                _handle_job(integration, job)  # type: ignore[arg-type]
+
+        decision = integration.repo.decisions[0]["decision_result"]
+        self.assertIsInstance(decision, dict)
+        self.assertEqual(decision["decision"], "needs_review")
+        self.assertEqual(decision["audit"]["ap_context_summary"]["available"], False)
 
     def test_parse_pdf_job_retries_when_parser_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

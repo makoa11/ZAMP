@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
+from app.invoice_fixtures import write_invoice_manifest
+from app.invoice_generator import generate_invoice
+from app.invoice_pdf import render_invoice_pdf
 from scripts.parse_test_pdfs import _pdf_paths
+from scripts.run_test_invoice_pipeline import run_test_invoice_pipeline
 
 
 class ParseTestPdfsScriptTests(unittest.TestCase):
@@ -22,6 +28,36 @@ class ParseTestPdfsScriptTests(unittest.TestCase):
             (root / "notes.txt").write_text("not a pdf", encoding="utf-8")
 
             self.assertEqual(_pdf_paths(root), sorted(expected))
+
+    def test_full_synthetic_pipeline_writes_decision_audit_artifacts(self) -> None:
+        sample = generate_invoice(
+            template_slug="ledger-clean",
+            paper_slug="a4-half-horizontal",
+            seed=123,
+            variation_index=1,
+            today=date(2026, 7, 7),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "out"
+            pdf_path = root / "partial.pdf"
+            pdf_path.write_bytes(render_invoice_pdf([sample]))
+            write_invoice_manifest(pdf_path, [sample])
+
+            summary = run_test_invoice_pipeline(
+                input_dir=root,
+                output_dir=output_dir,
+                limit=1,
+            )
+
+            file_summary = summary["files"][0]
+            self.assertEqual(file_summary["expected_decision"], "approve_partial_consumption")
+            self.assertEqual(file_summary["decision"], "approve_partial_consumption")
+            for key in ("parsed_json", "overlay_pdf", "normalized_json", "decision_json", "audit_json"):
+                self.assertTrue(Path(file_summary[key]).exists())
+
+            decision_payload = json.loads(Path(file_summary["decision_json"]).read_text(encoding="utf-8"))
+            self.assertTrue(decision_payload["matches_expected"])
 
 
 if __name__ == "__main__":

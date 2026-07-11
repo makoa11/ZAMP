@@ -27,7 +27,7 @@ from .invoice_generator import (
 )
 from .invoice_pdf import render_invoice_pdf
 from .mail_service import MailIntegration
-from .mail_store import MailIntegrationError
+from .mail_store import MailIntegrationError, REVIEW_QUEUE_DECISIONS
 from .security import generate_csrf_token, sign_value, unsign_value, valid_signed_pair
 from .templates import dashboard_page, error_page, invoice_samples_page, login_page, signup_page
 from .workos_auth import (
@@ -44,6 +44,7 @@ from .workos_auth import (
 
 STATIC_CSS = Path(__file__).parent / "static" / "styles.css"
 SENSITIVE_QUERY_PARAMETERS = {"secret"}
+ACTIONABLE_DASHBOARD_DECISIONS = set(REVIEW_QUEUE_DECISIONS)
 
 
 def _redact_query_parameters(target: str) -> str:
@@ -77,6 +78,56 @@ def _display_value(value: Any) -> str:
         return ""
     text = str(value).strip()
     return text
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _invoice_needs_dashboard_review(item: dict[str, Any]) -> bool:
+    decision = _display_value(item.get("decision")).lower()
+    if not decision:
+        return True
+    return decision in ACTIONABLE_DASHBOARD_DECISIONS
+
+
+def _humanize_token(value: Any) -> str:
+    text = _display_value(value).replace("_", " ").replace("-", " ")
+    return text.capitalize() if text else ""
+
+
+def _badge_class(value: Any) -> str:
+    text = _display_value(value).lower().replace("_", "-").replace(" ", "-")
+    return "".join(character for character in text if character.isalnum() or character == "-")
+
+
+def _format_amount(amount_value: Any, currency_value: Any = None) -> str:
+    if amount_value in (None, ""):
+        return ""
+    try:
+        amount = float(amount_value)
+    except (TypeError, ValueError):
+        return _display_value(amount_value)
+    currency = _display_value(currency_value)
+    if currency:
+        return f"{currency} {amount:,.2f}"
+    return f"{amount:,.2f}"
+
+
+def _nested_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _field_value(field: Any, *keys: str) -> str:
+    data = _nested_dict(field)
+    for key in keys or ("value",):
+        value = _display_value(data.get(key))
+        if value:
+            return value
+    return ""
 
 
 def _app_header_html(*, csrf_token: str, active: str) -> str:
@@ -173,6 +224,12 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/mail/pdfs/"):
             self._handle_mail_pdf_get(parsed)
+            return
+        if parsed.path == "/api/mail/invoices":
+            self._handle_mail_invoices_get(parsed.query)
+            return
+        if parsed.path.startswith("/api/mail/invoices/"):
+            self._handle_mail_invoice_detail_get(parsed)
             return
         if parsed.path == "/api/mail/invoice-patterns":
             self._handle_mail_invoice_patterns_get()
@@ -336,10 +393,16 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         mail_notice = None
         mail_notice_kind = "success"
         try:
-            review_items = self.mail_integration.list_invoice_review_items(
+            invoices = self.mail_integration.list_invoices(
                 owner_user_id=owner_user_id,
                 limit=50,
+                offset=0,
             )
+            review_items = [
+                item
+                for item in invoices
+                if _invoice_needs_dashboard_review(item)
+            ]
         except (ConfigError, MailIntegrationError) as exc:
             review_items = []
             mail_notice = str(exc)
@@ -355,8 +418,20 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             review_items[0] if review_items else None,
         )
 
+        selected_invoice = None
+        selected_pdf_file_id = _safe_int(selected_item.get("pdf_file_id")) if selected_item else _safe_int(selected_pdf_id)
+        if selected_pdf_file_id is not None:
+            try:
+                selected_invoice = self.mail_integration.get_invoice(
+                    owner_user_id=owner_user_id,
+                    pdf_file_id=selected_pdf_file_id,
+                )
+            except (ConfigError, MailIntegrationError) as exc:
+                mail_notice = str(exc)
+                mail_notice_kind = "error"
+
         queue_items_html = self._review_queue_html(review_items, selected_item)
-        evidence_html = self._review_evidence_html(selected_item)
+        evidence_html = self._review_evidence_html(selected_item, selected_invoice)
         queue_count = len(review_items)
         queue_label = "invoice" if queue_count == 1 else "invoices"
         notice_html = (
@@ -418,14 +493,26 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
 
     def _review_queue_item_html(self, item: dict[str, Any], *, active: bool) -> str:
         title = _display_value(item.get("invoice_number") or item.get("filename"))
-        amount = _display_value(item.get("amount") or "")
+        amount = _display_value(item.get("amount")) or _format_amount(
+            item.get("amount_due"),
+            item.get("currency"),
+        )
         vendor = _display_value(item.get("vendor") or item.get("sender") or item.get("account_email"))
         subject = _display_value(item.get("subject"))
-        received = _display_value(item.get("received_at"))
+        received = _display_value(item.get("received_date") or item.get("received_at"))
+        decision = _display_value(item.get("decision")) or _display_value(item.get("parse_status"))
+        decision_label = _humanize_token(decision) or "Pending"
+        confidence = _display_value(item.get("confidence"))
         pdf_file_id = html_lib.escape(str(item.get("pdf_file_id") or ""))
         active_attr = ' aria-current="page"' if active else ""
         amount_label = amount or "Review"
         title_label = title or "Untitled invoice"
+        decision_class = html_lib.escape(_badge_class(decision_label))
+        confidence_html = (
+            f"<span>{html_lib.escape(confidence)} confidence</span>"
+            if confidence
+            else ""
+        )
         return f"""
         <a class="queue-item{' active' if active else ''}" href="/dashboard?pdf_id={pdf_file_id}"{active_attr}>
           <div class="queue-header">
@@ -436,11 +523,17 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
           <div class="queue-subject">{html_lib.escape(subject)}</div>
           <div class="queue-meta">
             <span>{html_lib.escape(received)}</span>
+            <span class="decision-badge status-{decision_class}">{html_lib.escape(decision_label)}</span>
+            {confidence_html}
           </div>
         </a>"""
 
-    def _review_evidence_html(self, selected_item: dict[str, Any] | None) -> str:
-        if not selected_item:
+    def _review_evidence_html(
+        self,
+        selected_item: dict[str, Any] | None,
+        invoice: dict[str, Any] | None,
+    ) -> str:
+        if not selected_item and not invoice:
             return """
       <div class="evidence-empty">
         <div>
@@ -449,24 +542,226 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         </div>
       </div>"""
 
-        filename = _display_value(selected_item.get("filename"))
-        subject = _display_value(selected_item.get("subject"))
-        pdf_url = html_lib.escape(str(selected_item.get("pdf_url") or ""))
+        detail = invoice if isinstance(invoice, dict) else {}
+        message = _nested_dict(detail.get("message"))
+        attachment = _nested_dict(detail.get("attachment"))
+        normalized_invoice = _nested_dict(detail.get("normalized_invoice"))
+        decision = _nested_dict(detail.get("decision"))
+        raw_parse = _nested_dict(detail.get("raw_parse"))
+        audit = _nested_dict(detail.get("audit"))
+        ap_context = _nested_dict(detail.get("ap_context"))
+        checks = detail.get("checks") if isinstance(detail.get("checks"), list) else []
+
+        item = selected_item or {}
+        pdf_file_id = _safe_int(detail.get("pdf_file_id")) or _safe_int(item.get("pdf_file_id"))
+        filename = _display_value(attachment.get("filename") or item.get("filename"))
+        subject = _display_value(message.get("subject") or item.get("subject"))
+        sender = _display_value(message.get("sender") or item.get("sender"))
+        received = _display_value(message.get("received_at") or item.get("received_date") or item.get("received_at"))
+        decision_value = _display_value(decision.get("decision") or item.get("decision"))
+        confidence = _display_value(decision.get("confidence") or item.get("confidence"))
+        decision_label = _humanize_token(decision_value) or "Pending"
+        decision_class = html_lib.escape(_badge_class(decision_label))
+        overlay_url = (
+            f"/api/mail/invoices/{pdf_file_id}/overlay.pdf?boxes=all"
+            if pdf_file_id is not None
+            else ""
+        )
+        meta_html = self._detail_facts_html(
+            [
+                ("From", sender),
+                ("Received", received),
+                ("Attachment", filename),
+            ]
+        )
+        normalized_html = self._normalized_invoice_html(normalized_invoice, raw_parse, item)
+        decision_html = self._decision_summary_html(decision, checks, item)
+        checks_html = self._decision_checks_html(checks)
+        audit_html = self._audit_reasoning_html(audit, ap_context)
+        pdf_html = (
+            f'<iframe class="pdf-viewer" src="{html_lib.escape(overlay_url)}" '
+            f'title="{html_lib.escape(filename or "Invoice overlay")}"></iframe>'
+            if overlay_url
+            else '<div class="evidence-empty"><strong>Overlay unavailable</strong></div>'
+        )
         return f"""
       <div class="evidence-header">
         <div class="evidence-title">
-          <strong>{html_lib.escape(filename)}</strong>
+          <strong>{html_lib.escape(filename or "Invoice detail")}</strong>
           <span>{html_lib.escape(subject)}</span>
         </div>
         <div class="actions review-actions">
-          <button type="button" class="secondary compact-button">Hold</button>
-          <button type="button" class="secondary compact-button">Ask</button>
-          <button type="button" class="compact-button">Approve</button>
+          <span class="decision-badge status-{decision_class}">{html_lib.escape(decision_label)}</span>
+          {f'<span class="confidence-badge">{html_lib.escape(confidence)} confidence</span>' if confidence else ''}
         </div>
       </div>
-      <div class="pdf-stage">
-        <iframe class="pdf-viewer" src="{pdf_url}" title="{html_lib.escape(filename)}"></iframe>
+      <div class="evidence-content">
+        <div class="review-detail-panel">
+          {decision_html}
+          {normalized_html}
+          {checks_html}
+          {audit_html}
+          <section class="detail-section">
+            <h2>Source</h2>
+            {meta_html}
+          </section>
+        </div>
+        <div class="pdf-stage">
+          {pdf_html}
+        </div>
       </div>"""
+
+    def _decision_summary_html(
+        self,
+        decision: dict[str, Any],
+        checks: list[Any],
+        item: dict[str, Any],
+    ) -> str:
+        decision_value = _display_value(decision.get("decision") or item.get("decision"))
+        summary = _display_value(decision.get("summary")) or _display_value(item.get("next_action"))
+        next_action = _display_value(decision.get("next_action") or item.get("next_action"))
+        failed_or_review = sum(
+            1
+            for check in checks
+            if isinstance(check, dict) and _display_value(check.get("status")).lower() in {"fail", "review"}
+        )
+        facts = self._detail_facts_html(
+            [
+                ("Decision", _humanize_token(decision_value) or "Pending"),
+                ("Attention checks", str(failed_or_review) if checks else ""),
+            ]
+        )
+        body = facts
+        if summary:
+            body += f'<p class="detail-summary">{html_lib.escape(summary)}</p>'
+        if next_action:
+            body += f'<p class="detail-next-action">{html_lib.escape(next_action)}</p>'
+        return f"""
+          <section class="detail-section decision-section">
+            <h2>Decision</h2>
+            {body}
+          </section>"""
+
+    def _normalized_invoice_html(
+        self,
+        normalized_invoice: dict[str, Any],
+        raw_parse: dict[str, Any],
+        item: dict[str, Any],
+    ) -> str:
+        amount = self._normalized_amount(normalized_invoice) or _format_amount(
+            item.get("amount_due"),
+            item.get("currency"),
+        )
+        parse_status = _display_value(raw_parse.get("status") or normalized_invoice.get("parser_status") or item.get("parse_status"))
+        parser_method = _display_value(raw_parse.get("parser_method"))
+        page_count = _display_value(raw_parse.get("page_count"))
+        facts = self._detail_facts_html(
+            [
+                ("Vendor", _field_value(normalized_invoice.get("vendor"), "name", "value", "raw") or item.get("vendor")),
+                ("Invoice #", _field_value(normalized_invoice.get("invoice_number"), "value") or item.get("invoice_number")),
+                ("Purchase order", _field_value(normalized_invoice.get("purchase_order"), "value") or item.get("purchase_order")),
+                ("Issue date", _field_value(normalized_invoice.get("issue_date"), "value")),
+                ("Due date", _field_value(normalized_invoice.get("due_date"), "value")),
+                ("Amount due", amount),
+                ("Parse status", _humanize_token(parse_status)),
+                ("Parser", parser_method),
+                ("Pages", page_count),
+            ]
+        )
+        return f"""
+          <section class="detail-section">
+            <h2>Normalized Invoice</h2>
+            {facts}
+          </section>"""
+
+    def _decision_checks_html(self, checks: list[Any]) -> str:
+        if not checks:
+            return """
+          <section class="detail-section">
+            <h2>Decision Checks</h2>
+            <p class="detail-muted">No checks recorded yet.</p>
+          </section>"""
+        rows = []
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            check_id = _display_value(check.get("id"))
+            status = _display_value(check.get("status"))
+            summary = _display_value(check.get("summary"))
+            status_label = _humanize_token(status) or "Unknown"
+            status_class = html_lib.escape(_badge_class(status_label))
+            rows.append(
+                f"""
+              <li class="check-row">
+                <div>
+                  <strong>{html_lib.escape(_humanize_token(check_id) or check_id)}</strong>
+                  <span>{html_lib.escape(summary)}</span>
+                </div>
+                <span class="decision-badge status-{status_class}">{html_lib.escape(status_label)}</span>
+              </li>"""
+            )
+        checks_html = "\n".join(rows) if rows else '<p class="detail-muted">No checks recorded yet.</p>'
+        return f"""
+          <section class="detail-section">
+            <h2>Decision Checks</h2>
+            <ul class="check-list">
+              {checks_html}
+            </ul>
+          </section>"""
+
+    def _audit_reasoning_html(self, audit: dict[str, Any], ap_context: dict[str, Any]) -> str:
+        context_available = ap_context.get("available")
+        context_label = (
+            "Available"
+            if context_available is True
+            else "Missing"
+            if context_available is False
+            else ""
+        )
+        source = _nested_dict(ap_context.get("source") or audit.get("context_source"))
+        facts = self._detail_facts_html(
+            [
+                ("AP context", context_label),
+                ("Reason", ap_context.get("reason")),
+                ("Scenario", ap_context.get("scenario") or audit.get("context_scenario")),
+                ("Source", source.get("type")),
+                ("Record", source.get("record_id") or source.get("source_key")),
+                ("Normalized vendor", audit.get("normalized_vendor")),
+                ("Normalized invoice #", audit.get("normalized_invoice_number")),
+                ("Purchase order", audit.get("purchase_order")),
+                ("Audit amount", audit.get("amount_due")),
+            ]
+        )
+        return f"""
+          <section class="detail-section">
+            <h2>Audit Reasoning</h2>
+            {facts}
+          </section>"""
+
+    def _detail_facts_html(self, rows: list[tuple[str, Any]]) -> str:
+        items = []
+        for label, value in rows:
+            text = _display_value(value)
+            if not text:
+                continue
+            items.append(
+                f"""
+              <div>
+                <dt>{html_lib.escape(label)}</dt>
+                <dd>{html_lib.escape(text)}</dd>
+              </div>"""
+            )
+        if not items:
+            return '<p class="detail-muted">No data recorded yet.</p>'
+        return f"""
+            <dl class="detail-facts">
+              {"".join(items)}
+            </dl>"""
+
+    def _normalized_amount(self, normalized_invoice: dict[str, Any]) -> str:
+        amount_due = _nested_dict(normalized_invoice.get("amount_due"))
+        currency = amount_due.get("currency") or _field_value(normalized_invoice.get("currency"), "value")
+        return _format_amount(amount_due.get("amount"), currency)
 
     def _handle_settings_get(self, query: str) -> None:
         session, set_session_cookie, clear_cookies = self._session()
@@ -733,6 +1028,82 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             headers={"Content-Disposition": f'inline; filename="{filename}"'},
             cookies=cookies,
         )
+
+    def _handle_mail_invoices_get(self, query: str) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        params = parse_qs(query)
+        try:
+            limit = int(params.get("limit", ["100"])[0])
+            offset = int(params.get("offset", ["0"])[0])
+            invoices = self.mail_integration.list_invoices(
+                owner_user_id=owner_user_id,
+                limit=limit,
+                offset=offset,
+            )
+        except (ConfigError, MailIntegrationError, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, {"invoices": invoices}, cookies=cookies)
+
+    def _handle_mail_invoice_detail_get(self, parsed: Any) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) not in {4, 5} or parts[:3] != ["api", "mail", "invoices"]:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Page not found."}, cookies=cookies)
+            return
+        try:
+            pdf_file_id = int(parts[3])
+        except ValueError:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid PDF file id."}, cookies=cookies)
+            return
+
+        if len(parts) == 5:
+            if parts[4] != "overlay.pdf":
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Page not found."}, cookies=cookies)
+                return
+            params = parse_qs(parsed.query)
+            box_mode = params.get("boxes", ["parsed"])[0] or "parsed"
+            try:
+                content = self.mail_integration.invoice_overlay_pdf(
+                    owner_user_id=owner_user_id,
+                    pdf_file_id=pdf_file_id,
+                    box_mode=box_mode,
+                )
+            except (ConfigError, MailIntegrationError, ValueError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+                return
+            if content is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Invoice PDF was not found."}, cookies=cookies)
+                return
+            self._send_binary(
+                HTTPStatus.OK,
+                content,
+                content_type="application/pdf",
+                cookies=cookies,
+                headers={
+                    "Content-Disposition": f'inline; filename="mail-invoice-{pdf_file_id}-overlay.pdf"',
+                },
+            )
+            return
+
+        try:
+            invoice = self.mail_integration.get_invoice(
+                owner_user_id=owner_user_id,
+                pdf_file_id=pdf_file_id,
+            )
+        except (ConfigError, MailIntegrationError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        if invoice is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Invoice was not found."}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, invoice, cookies=cookies)
 
     def _handle_mail_invoice_patterns_get(self) -> None:
         context = self._authenticated_api_user()
@@ -1619,8 +1990,8 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         content: bytes,
         *,
         content_type: str,
-        headers: dict[str, str] | None = None,
         cookies: list[str] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)

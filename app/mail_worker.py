@@ -8,7 +8,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .ap_context import load_db_procurement_context, summarize_procurement_context
 from .config import ConfigError, load_config
+from .invoice_decision import decide_invoice
+from .invoice_normalizer import normalize_invoice_parse
 from .invoice_parser import PARSER_VERSION, parse_invoice_pdf
 from .mail_ingestion import MAIL_JOB_TYPES
 from .mail_service import MailIntegration
@@ -113,6 +116,7 @@ def _handle_job(integration: MailIntegration, job: dict[str, Any]) -> None:
 def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any]) -> None:
     pdf_file_id = int(payload["pdf_file_id"])
     storage_path = str(payload["storage_path"])
+    attachment_id = _optional_int(payload.get("attachment_id"))
     pdf_path = _storage_pdf_path(integration.storage.root, storage_path)
     result = parse_invoice_pdf(
         pdf_path.read_bytes(),
@@ -126,6 +130,35 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
         result=result,
         warnings=warnings if isinstance(warnings, list) else [],
     )
+    owner_user_id = _owner_user_id_for_parse_job(integration, payload)
+    if not owner_user_id:
+        return
+
+    normalized_invoice = normalize_invoice_parse(result)
+    integration.repo.upsert_mail_invoice_extraction(
+        owner_user_id=owner_user_id,
+        pdf_file_id=pdf_file_id,
+        attachment_id=attachment_id,
+        normalized_invoice=normalized_invoice,
+        parse_status=str(normalized_invoice.get("parser_status") or result.get("status") or "failed"),
+        parser_method="static_text",
+    )
+    procurement_context = load_db_procurement_context(
+        integration.repo,
+        owner_user_id=owner_user_id,
+        invoice=normalized_invoice,
+    )
+    decision = decide_invoice(normalized_invoice, procurement_context)
+    audit = decision.get("audit") if isinstance(decision.get("audit"), dict) else {}
+    decision["audit"] = {
+        **audit,
+        "ap_context_summary": summarize_procurement_context(procurement_context),
+    }
+    integration.repo.upsert_mail_invoice_decision(
+        owner_user_id=owner_user_id,
+        pdf_file_id=pdf_file_id,
+        decision_result=decision,
+    )
 
 
 def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
@@ -133,6 +166,30 @@ def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
     if relative_path.is_absolute() or ".." in relative_path.parts:
         raise RuntimeError("PDF storage path must be relative to MAIL_PDF_STORAGE_DIR.")
     return Path(root) / relative_path
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _owner_user_id_for_parse_job(integration: MailIntegration, payload: dict[str, Any]) -> str | None:
+    owner_user_id = payload.get("owner_user_id")
+    if isinstance(owner_user_id, str) and owner_user_id:
+        return owner_user_id
+
+    account_id = _optional_int(payload.get("account_id"))
+    if account_id is None:
+        return None
+    account = integration.repo.get_account(account_id)
+    if not account:
+        return None
+    owner_user_id = account.get("owner_user_id")
+    return owner_user_id if isinstance(owner_user_id, str) and owner_user_id else None
 
 
 def _enqueue_polling_fallbacks(integration: MailIntegration) -> None:

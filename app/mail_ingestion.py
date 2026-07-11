@@ -451,6 +451,7 @@ class MailIngestionService:
                     "pdf_file_id": int(pdf_row["id"]),
                     "storage_path": stored.relative_path,
                     "account_id": account_id,
+                    "owner_user_id": account.get("owner_user_id"),
                 },
                 unique_key=f"parse-pdf:{attachment_row['id']}",
             )
@@ -551,6 +552,7 @@ class MailIngestionService:
                     "pdf_file_id": int(pdf_row["id"]),
                     "storage_path": stored.relative_path,
                     "account_id": account_id,
+                    "owner_user_id": account.get("owner_user_id"),
                 },
                 unique_key=f"parse-pdf:{attachment_row['id']}",
             )
