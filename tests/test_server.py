@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.server import ZampHTTPServer, ZampRequestHandler, _filter_invoice_items
-from app.templates import login_page, signup_page
+from app.templates import dashboard_page, login_page, signup_page
 
 
 class TestSocket:
@@ -34,6 +34,14 @@ class TestSocket:
 
 
 class ServerRouteTests(unittest.TestCase):
+    def test_settings_template_discloses_opt_in_ai_fallback(self) -> None:
+        content = dashboard_page(csrf_token="csrf", session={"user": {"email": "ap@example.com"}})
+
+        self.assertIn("data-use-ai-extraction", content)
+        self.assertIn("Use AI when local full-page OCR fails", content)
+        self.assertIn("invoice PDF will be sent", content)
+        self.assertIn("/api/mail/extraction-settings", content)
+
     def test_auth_pages_use_refreshed_split_layout(self) -> None:
         login_html = login_page(csrf_token="csrf")
         signup_html = signup_page(csrf_token="csrf")

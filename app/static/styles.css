@@ -850,6 +850,35 @@ button.secondary:hover,
   margin-bottom: 12px;
 }
 
+.ai-consent-control {
+  display: flex;
+  gap: 0.9rem;
+  align-items: flex-start;
+  padding: 1rem;
+  border: 1px solid var(--line, #d8d4c8);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface, #fff) 86%, #e7f0e9);
+  cursor: pointer;
+}
+
+.ai-consent-control input {
+  width: 1.15rem;
+  height: 1.15rem;
+  margin-top: 0.15rem;
+  accent-color: var(--ink, #1c3028);
+}
+
+.ai-consent-control span {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.ai-consent-control small {
+  max-width: 68ch;
+  color: var(--muted, #66736c);
+  line-height: 1.5;
+}
+
 .panel-heading {
   display: flex;
   align-items: flex-start;

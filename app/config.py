@@ -134,6 +134,11 @@ class AppConfig:
     mail_parse_ocr_refinement_dpi: int
     mail_parse_ocr_timeout_seconds: float
     mail_parse_document_timeout_seconds: float
+    ai_extraction_endpoint: str | None
+    ai_extraction_api_key: str | None
+    ai_extraction_model: str | None
+    ai_extraction_timeout_seconds: float
+    ai_extraction_max_pdf_bytes: int
 
     @property
     def logout_return_url(self) -> str:
@@ -293,4 +298,17 @@ def load_config(root: Path | None = None) -> AppConfig:
         mail_parse_ocr_refinement_dpi=mail_parse_ocr_refinement_dpi,
         mail_parse_ocr_timeout_seconds=mail_parse_ocr_timeout_seconds,
         mail_parse_document_timeout_seconds=mail_parse_document_timeout_seconds,
+        ai_extraction_endpoint=_env("AI_EXTRACTION_ENDPOINT", env_file_values),
+        ai_extraction_api_key=_env("AI_EXTRACTION_API_KEY", env_file_values),
+        ai_extraction_model=_env("AI_EXTRACTION_MODEL", env_file_values),
+        ai_extraction_timeout_seconds=_float_env(
+            "AI_EXTRACTION_TIMEOUT_SECONDS",
+            env_file_values,
+            60.0,
+        ),
+        ai_extraction_max_pdf_bytes=_int_env(
+            "AI_EXTRACTION_MAX_PDF_BYTES",
+            env_file_values,
+            20 * 1024 * 1024,
+        ),
     )

@@ -399,6 +399,23 @@ def dashboard_page(
     <textarea id="invoice-patterns" class="pattern-input" data-invoice-patterns rows="6" spellcheck="false" placeholder="^INV-\\d+"></textarea>
   </section>
 
+  <section class="data-panel mail-panel" aria-labelledby="ai-extraction-title">
+    <div class="panel-heading">
+      <div>
+        <p class="label">Last-resort extraction</p>
+        <h2 id="ai-extraction-title">AI fallback</h2>
+      </div>
+    </div>
+    <label class="ai-consent-control" for="use-ai-extraction">
+      <input id="use-ai-extraction" data-use-ai-extraction type="checkbox">
+      <span>
+        <strong>Use AI when local full-page OCR fails</strong>
+        <small>The invoice PDF will be sent to the AI endpoint configured by your administrator. Static extraction and local OCR always run first.</small>
+      </span>
+    </label>
+    <div class="mail-status" data-ai-extraction-status role="status"></div>
+  </section>
+
   <section class="data-panel">
     <h2>Session data</h2>
     <pre>{_e(session_json)}</pre>
@@ -416,6 +433,8 @@ def dashboard_page(
     var invoicePatternDropzoneEl = document.querySelector("[data-invoice-pattern-dropzone]");
     var generateInvoicePatternButton = document.querySelector("[data-generate-invoice-pattern]");
     var saveInvoicePatternsButton = document.querySelector("[data-save-invoice-patterns]");
+    var useAiExtractionEl = document.querySelector("[data-use-ai-extraction]");
+    var aiExtractionStatusEl = document.querySelector("[data-ai-extraction-status]");
     var buttons = Array.prototype.slice.call(document.querySelectorAll("[data-connect-provider]"));
 
     function setStatus(target, message, kind) {{
@@ -569,6 +588,53 @@ def dashboard_page(
         }});
     }}
 
+    function loadExtractionSettings() {{
+      if (!useAiExtractionEl) return;
+      setStatus(aiExtractionStatusEl, "Loading AI preference.", "");
+      fetch("/api/mail/extraction-settings")
+        .then(function (response) {{
+          return response.json().then(function (body) {{
+            if (!response.ok) throw new Error(body.error || "Could not load extraction settings.");
+            return body;
+          }});
+        }})
+        .then(function (body) {{
+          useAiExtractionEl.checked = body.use_ai === true;
+          setStatus(aiExtractionStatusEl, "", "");
+        }})
+        .catch(function (error) {{
+          setStatus(aiExtractionStatusEl, error.message, "error");
+        }});
+    }}
+
+    function saveExtractionSettings() {{
+      if (!useAiExtractionEl) return;
+      useAiExtractionEl.disabled = true;
+      setStatus(aiExtractionStatusEl, "Saving AI preference.", "");
+      fetch("/api/mail/extraction-settings", {{
+        method: "POST",
+        headers: {{"Content-Type": "application/json"}},
+        body: JSON.stringify({{use_ai: useAiExtractionEl.checked}})
+      }})
+        .then(function (response) {{
+          return response.json().then(function (body) {{
+            if (!response.ok) throw new Error(body.error || "Could not save extraction settings.");
+            return body;
+          }});
+        }})
+        .then(function (body) {{
+          useAiExtractionEl.checked = body.use_ai === true;
+          setStatus(aiExtractionStatusEl, "AI preference saved.", "success");
+        }})
+        .catch(function (error) {{
+          useAiExtractionEl.checked = !useAiExtractionEl.checked;
+          setStatus(aiExtractionStatusEl, error.message, "error");
+        }})
+        .finally(function () {{
+          useAiExtractionEl.disabled = false;
+        }});
+    }}
+
     function appendInvoicePattern(pattern) {{
       if (!invoicePatternsEl || !pattern) return;
       var patterns = invoicePatternsEl.value.split(/\\r?\\n/).map(function (line) {{
@@ -664,6 +730,10 @@ def dashboard_page(
       saveInvoicePatternsButton.addEventListener("click", saveInvoicePatterns);
     }}
 
+    if (useAiExtractionEl) {{
+      useAiExtractionEl.addEventListener("change", saveExtractionSettings);
+    }}
+
     if (generateInvoicePatternButton) {{
       generateInvoicePatternButton.addEventListener("click", function () {{
         suggestInvoicePattern(invoicePatternFilenameEl ? invoicePatternFilenameEl.value : "");
@@ -701,6 +771,7 @@ def dashboard_page(
 
     loadAccounts();
     loadInvoicePatterns();
+    loadExtractionSettings();
   }})();
 </script>{expiry_script}
 """

@@ -155,9 +155,13 @@ CREATE TABLE IF NOT EXISTS mail_accounts (
 CREATE TABLE IF NOT EXISTS mail_invoice_match_settings (
     owner_user_id TEXT PRIMARY KEY,
     patterns JSONB NOT NULL DEFAULT '[]'::jsonb,
+    use_ai_extraction BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE mail_invoice_match_settings
+ADD COLUMN IF NOT EXISTS use_ai_extraction BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS mail_messages (
     id BIGSERIAL PRIMARY KEY,
@@ -685,6 +689,28 @@ class MailRepository:
             if isinstance(stored, str):
                 stored = json.loads(stored)
             return [item for item in stored if isinstance(item, str)]
+
+    def get_ai_extraction_enabled(self, *, owner_user_id: str) -> bool:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT use_ai_extraction FROM mail_invoice_match_settings WHERE owner_user_id = %s",
+                (owner_user_id,),
+            ).fetchone()
+            return bool(row and row.get("use_ai_extraction"))
+
+    def set_ai_extraction_enabled(self, *, owner_user_id: str, enabled: bool) -> bool:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO mail_invoice_match_settings (owner_user_id, use_ai_extraction)
+                VALUES (%s, %s)
+                ON CONFLICT (owner_user_id)
+                DO UPDATE SET use_ai_extraction = EXCLUDED.use_ai_extraction, updated_at = now()
+                RETURNING use_ai_extraction
+                """,
+                (owner_user_id, enabled),
+            ).fetchone()
+            return bool(row and row.get("use_ai_extraction"))
 
     def list_active_accounts(self) -> list[dict[str, Any]]:
         with self.database.connect() as conn:

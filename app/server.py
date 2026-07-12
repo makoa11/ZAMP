@@ -315,6 +315,9 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/mail/invoice-patterns":
             self._handle_mail_invoice_patterns_get()
             return
+        if parsed.path == "/api/mail/extraction-settings":
+            self._handle_mail_extraction_settings_get()
+            return
         if parsed.path.startswith("/api/mail/oauth/") and parsed.path.endswith("/callback"):
             self._handle_mail_oauth_callback(parsed)
             return
@@ -345,6 +348,9 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/mail/invoice-patterns":
             self._handle_mail_invoice_patterns_post()
+            return
+        if parsed.path == "/api/mail/extraction-settings":
+            self._handle_mail_extraction_settings_post()
             return
         if parsed.path == "/webhooks/gmail/pubsub":
             self._handle_gmail_pubsub_webhook(parsed)
@@ -1626,6 +1632,36 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
             return
         self._send_json(HTTPStatus.OK, {"patterns": patterns}, cookies=cookies)
+
+    def _handle_mail_extraction_settings_get(self) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        try:
+            settings = self.mail_integration.get_extraction_settings(owner_user_id=owner_user_id)
+        except (ConfigError, MailIntegrationError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, settings, cookies=cookies)
+
+    def _handle_mail_extraction_settings_post(self) -> None:
+        context = self._authenticated_api_user()
+        if not context:
+            return
+        owner_user_id, cookies = context
+        try:
+            body = self._json_body(max_bytes=4 * 1024)
+            if not isinstance(body.get("use_ai"), bool):
+                raise ValueError("use_ai must be a boolean.")
+            settings = self.mail_integration.update_extraction_settings(
+                owner_user_id=owner_user_id,
+                use_ai=body["use_ai"],
+            )
+        except (ConfigError, MailIntegrationError, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
+        self._send_json(HTTPStatus.OK, settings, cookies=cookies)
 
     def _handle_mail_invoice_patterns_post(self) -> None:
         context = self._authenticated_api_user()

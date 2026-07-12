@@ -213,6 +213,19 @@ class MailIntegration:
         self._enqueue_owner_fallbacks(owner_user_id=owner_user_id, patterns=stored)
         return stored
 
+    def get_extraction_settings(self, *, owner_user_id: str) -> dict[str, bool]:
+        return {
+            "use_ai": self.repo.get_ai_extraction_enabled(owner_user_id=owner_user_id),
+        }
+
+    def update_extraction_settings(self, *, owner_user_id: str, use_ai: bool) -> dict[str, bool]:
+        return {
+            "use_ai": self.repo.set_ai_extraction_enabled(
+                owner_user_id=owner_user_id,
+                enabled=use_ai,
+            ),
+        }
+
     def suggest_invoice_match_pattern(self, *, filename: str) -> str:
         return suggest_invoice_match_pattern_from_filename(filename)
 

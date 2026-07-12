@@ -170,3 +170,27 @@ class ConfigTests(unittest.TestCase):
                     load_config(root)
 
         self.assertIn("MAIL_PARSE_OCR_REFINEMENT_DPI", str(error.exception))
+
+    def test_ai_extraction_transport_settings_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {
+                    **self._base_env(),
+                    "AI_EXTRACTION_ENDPOINT": "https://ai.example/extract",
+                    "AI_EXTRACTION_API_KEY": "secret",
+                    "AI_EXTRACTION_MODEL": "model-a",
+                    "AI_EXTRACTION_TIMEOUT_SECONDS": "45",
+                    "AI_EXTRACTION_MAX_PDF_BYTES": "123456",
+                },
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        self.assertEqual(config.ai_extraction_endpoint, "https://ai.example/extract")
+        self.assertEqual(config.ai_extraction_api_key, "secret")
+        self.assertEqual(config.ai_extraction_model, "model-a")
+        self.assertEqual(config.ai_extraction_timeout_seconds, 45.0)
+        self.assertEqual(config.ai_extraction_max_pdf_bytes, 123456)

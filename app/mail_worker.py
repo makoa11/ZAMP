@@ -11,6 +11,13 @@ from typing import Any
 from .ap_context import load_db_procurement_context, summarize_procurement_context
 from .config import ConfigError, load_config
 from .invoice_decision import decide_invoice
+from .invoice_ai import (
+    AiExtractionError,
+    HttpJsonAiExtractionClient,
+    extracted_text_for_ai,
+    promote_ai_extraction,
+    should_run_ai_fallback,
+)
 from .invoice_normalizer import normalize_invoice_parse
 from .invoice_ocr import OCR_MAX_DOCUMENT_PAGES, OCR_REGION_PADDING
 from .invoice_pipeline import configuration_fingerprint
@@ -184,7 +191,16 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
     }.items():
         if hasattr(integration.config, config_name):
             parse_kwargs[parser_name] = getattr(integration.config, config_name)
-    result = parse_invoice_pdf(pdf_path.read_bytes(), **parse_kwargs)
+    pdf_content = pdf_path.read_bytes()
+    result = parse_invoice_pdf(pdf_content, **parse_kwargs)
+    owner_user_id = _owner_user_id_for_parse_job(integration, payload)
+    result = _run_ai_fallback_if_enabled(
+        integration,
+        result=result,
+        content=pdf_content,
+        filename=pdf_path.name,
+        owner_user_id=owner_user_id,
+    )
     parser_revision = _parser_revision(integration)
     result["parser_revision"] = parser_revision
     warnings = result.get("warnings")
@@ -210,7 +226,6 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
             warnings=warnings if isinstance(warnings, list) else [],
             promoted=True,
         )
-    owner_user_id = _owner_user_id_for_parse_job(integration, payload)
     if not owner_user_id:
         return
 
@@ -269,17 +284,88 @@ def _parser_revision(integration: MailIntegration) -> str:
             "refinement_dpi": getattr(integration.config, "mail_parse_ocr_refinement_dpi", None),
             "ocr_timeout": getattr(integration.config, "mail_parse_ocr_timeout_seconds", None),
             "document_timeout": getattr(integration.config, "mail_parse_document_timeout_seconds", None),
+            "ai_contract": "zamp-invoice-extraction-v1",
+            "ai_model": getattr(integration.config, "ai_extraction_model", None),
+            "ai_endpoint_configured": bool(getattr(integration.config, "ai_extraction_endpoint", None)),
         }
     )
     return f"{readable}:config={fingerprint}"
 
 
 def _parser_method(result: dict[str, Any]) -> str:
+    if result.get("ai_used") and isinstance(result.get("ai"), dict) and result["ai"].get("promoted"):
+        return "ai"
     pipeline = result.get("pipeline")
     route = pipeline.get("route") if isinstance(pipeline, dict) else None
     if route in {"native_text", "local_ocr", "hybrid"}:
         return str(route)
     return "local_ocr" if result.get("ocr_used") else "native_text"
+
+
+def _run_ai_fallback_if_enabled(
+    integration: MailIntegration,
+    *,
+    result: dict[str, Any],
+    content: bytes,
+    filename: str,
+    owner_user_id: str | None,
+) -> dict[str, Any]:
+    if not owner_user_id or not should_run_ai_fallback(result):
+        return result
+    preference_getter = getattr(integration.repo, "get_ai_extraction_enabled", None)
+    if not callable(preference_getter) or not preference_getter(owner_user_id=owner_user_id):
+        return result
+
+    endpoint = getattr(integration.config, "ai_extraction_endpoint", None)
+    model = getattr(integration.config, "ai_extraction_model", None)
+    if not endpoint or not model:
+        return _record_ai_failure(
+            result,
+            "AI fallback is enabled, but AI_EXTRACTION_ENDPOINT or AI_EXTRACTION_MODEL is not configured.",
+            model=model,
+            status="not_configured",
+        )
+    client = HttpJsonAiExtractionClient(
+        endpoint=str(endpoint),
+        model=str(model),
+        api_key=getattr(integration.config, "ai_extraction_api_key", None),
+        timeout_seconds=float(getattr(integration.config, "ai_extraction_timeout_seconds", 60.0)),
+        max_pdf_bytes=int(
+            getattr(integration.config, "ai_extraction_max_pdf_bytes", 20 * 1024 * 1024)
+        ),
+    )
+    try:
+        extraction = client.extract(
+            content,
+            filename=filename,
+            extracted_text=extracted_text_for_ai(result),
+        )
+        return promote_ai_extraction(result, extraction, model=str(model))
+    except AiExtractionError as exc:
+        return _record_ai_failure(result, str(exc), model=str(model), status="failed")
+
+
+def _record_ai_failure(
+    result: dict[str, Any],
+    message: str,
+    *,
+    model: str | None,
+    status: str,
+) -> dict[str, Any]:
+    updated = dict(result)
+    warnings = [str(item) for item in result.get("warnings", []) if item]
+    warning = f"AI fallback unavailable: {message}"
+    if warning not in warnings:
+        warnings.append(warning)
+    updated["warnings"] = warnings
+    updated["ai_used"] = False
+    updated["ai"] = {
+        "attempted": status != "not_configured",
+        "status": status,
+        "model": model,
+        "promoted": False,
+    }
+    return updated
 
 
 def _optional_int(value: Any) -> int | None:
