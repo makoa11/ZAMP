@@ -4,12 +4,13 @@ import io
 import json
 import tempfile
 import unittest
+from datetime import date
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.server import ZampHTTPServer, ZampRequestHandler
+from app.server import ZampHTTPServer, ZampRequestHandler, _filter_invoice_items
 
 
 class TestSocket:
@@ -143,13 +144,19 @@ class ServerRouteTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.list_owner_user_id: str | None = None
                 self.list_limit: int | None = None
+                self.list_offset: int | None = None
                 self.detail_request: tuple[str, int] | None = None
 
-            def list_invoice_review_items(
-                self, *, owner_user_id: str, limit: int = 50
+            def count_invoices(self, *, owner_user_id: str) -> int:
+                self.list_owner_user_id = owner_user_id
+                return 2
+
+            def list_invoices(
+                self, *, owner_user_id: str, limit: int = 100, offset: int = 0
             ) -> list[dict[str, object]]:
                 self.list_owner_user_id = owner_user_id
                 self.list_limit = limit
+                self.list_offset = offset
                 return [
                     {
                         "pdf_file_id": 20,
@@ -163,7 +170,19 @@ class ServerRouteTests(unittest.TestCase):
                         "decision": "needs_review",
                         "confidence": "medium",
                         "next_action": "Route to AP review.",
-                    }
+                    },
+                    {
+                        "pdf_file_id": 21,
+                        "filename": "accepted-invoice.pdf",
+                        "invoice_number": "INV-OK-200",
+                        "amount_due": "84.00",
+                        "currency": "USD",
+                        "vendor": "Auto Approved LLC",
+                        "subject": "Approved invoice",
+                        "received_date": "2026-07-09T10:00:00+00:00",
+                        "decision": "approve",
+                        "confidence": "high",
+                    },
                 ]
 
             def get_invoice(
@@ -241,7 +260,8 @@ class ServerRouteTests(unittest.TestCase):
 
         self.assertIn(" 200 ", response.splitlines()[0])
         self.assertEqual(mail.list_owner_user_id, "user-123")
-        self.assertEqual(mail.list_limit, 50)
+        self.assertEqual(mail.list_limit, 500)
+        self.assertEqual(mail.list_offset, 0)
         self.assertEqual(mail.detail_request, ("user-123", 20))
         self.assertIn("INV-DB-100", response)
         self.assertIn("Database Vendor LLC", response)
@@ -255,14 +275,75 @@ class ServerRouteTests(unittest.TestCase):
             response,
         )
         self.assertIn("Accounts payable context records", response)
+        self.assertNotIn("What matters now", response)
+        self.assertNotIn("Invoice in focus", response)
+        self.assertNotIn("decision-orb", response)
+        self.assertIn("Collapse invoice sidebar", response)
+        self.assertIn("zamp-sidebar-collapsed", response)
+        self.assertIn("data-previous-invoice", response)
+        self.assertIn("data-next-invoice", response)
+        self.assertIn('d="M4 6h16M4 12h16M4 18h16"', response)
+        self.assertIn("Your next step", response)
+        self.assertIn("Review issue", response)
+        self.assertIn('href="#decision-steps"', response)
+        self.assertIn("Already done", response)
+        self.assertIn("Still to do", response)
+        self.assertNotIn("Zen mode", response)
+        self.assertIn("Supporting details", response)
+        self.assertIn("2</strong> processed", response)
+        self.assertIn("1</strong> shown", response)
+        self.assertIn('name="review" value="needs_review" checked', response)
         self.assertIn('/api/mail/invoices/20/overlay.pdf?boxes=all', response)
         self.assertNotIn('/api/mail/pdfs/20', response)
         self.assertNotIn("AP context", response)
         self.assertNotIn("AP review", response)
         self.assertNotIn("ap_context_records", response)
-        self.assertNotIn("Auto Approved LLC", response)
+        self.assertIn("Auto Approved LLC", response)
+        self.assertIn(
+            'data-needs-review="false" data-received="2026-07-09T10:00:00+00:00" hidden',
+            response,
+        )
+        self.assertIn("window.history.replaceState", response)
+        self.assertIn("event.preventDefault()", response)
         self.assertNotIn("/api/invoices/samples.pdf", response)
         self.assertNotIn("Unknown Seller", response)
+
+        all_request = b"GET /dashboard?review=all HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        all_socket = TestSocket(all_request)
+        Handler(all_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        all_response = all_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn("INV-OK-200", all_response)
+        self.assertIn("Auto Approved LLC", all_response)
+        self.assertIn('aria-label="Next invoice"', all_response)
+        self.assertIn("pdf_id=21", all_response)
+        self.assertIn(
+            'data-needs-review="false" data-received="2026-07-09T10:00:00+00:00">',
+            all_response,
+        )
+        self.assertIn("2</strong> shown", all_response)
+        self.assertNotIn('name="review" value="needs_review" checked', all_response)
+
+    def test_invoice_filters_apply_review_and_date_independently(self) -> None:
+        items = [
+            {"pdf_file_id": 1, "decision": "needs_review", "received_date": "2026-07-12T09:00:00Z"},
+            {"pdf_file_id": 2, "decision": "approve", "received_date": "2026-07-11T09:00:00Z"},
+            {"pdf_file_id": 3, "decision": "approve", "received_date": "2026-06-01T09:00:00Z"},
+        ]
+
+        review_only = _filter_invoice_items(
+            items,
+            review_filter="needs_review",
+        )
+        custom_range = _filter_invoice_items(
+            items,
+            review_filter="all",
+            date_from=date(2026, 7, 10),
+            date_to=date(2026, 7, 12),
+        )
+
+        self.assertEqual([item["pdf_file_id"] for item in review_only], [1])
+        self.assertEqual([item["pdf_file_id"] for item in custom_range], [1, 2])
 
     def test_mail_pdf_endpoint_serves_owned_stored_pdf(self) -> None:
         class MailIntegration:

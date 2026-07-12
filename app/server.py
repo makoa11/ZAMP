@@ -45,6 +45,13 @@ from .workos_auth import (
 
 STATIC_CSS = Path(__file__).parent / "static" / "styles.css"
 SENSITIVE_QUERY_PARAMETERS = {"secret"}
+REVIEW_DECISIONS = {
+    "needs_review",
+    "request_missing_info",
+    "flag_possible_duplicate",
+    "block_or_escalate",
+    "apply_credit_or_route_review",
+}
 
 
 def _redact_query_parameters(target: str) -> str:
@@ -126,6 +133,49 @@ def _badge_class(value: Any) -> str:
     return "".join(character for character in text if character.isalnum() or character == "-")
 
 
+def _invoice_needs_review(item: dict[str, Any]) -> bool:
+    decision = _display_value(item.get("decision")).lower().replace("-", "_")
+    return not decision or decision in REVIEW_DECISIONS
+
+
+def _invoice_received_date(item: dict[str, Any]) -> date | None:
+    value = _display_value(item.get("received_date") or item.get("received_at"))
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _filter_invoice_items(
+    items: list[dict[str, Any]],
+    *,
+    review_filter: str,
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> list[dict[str, Any]]:
+    filtered = items
+    if review_filter == "needs_review":
+        filtered = [item for item in filtered if _invoice_needs_review(item)]
+    if date_from is not None or date_to is not None:
+        filtered = [
+            item
+            for item in filtered
+            if (received_date := _invoice_received_date(item)) is not None
+            and (date_from is None or received_date >= date_from)
+            and (date_to is None or received_date <= date_to)
+        ]
+    return filtered
+
+
+def _query_date(value: str) -> date | None:
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def _format_amount(amount_value: Any, currency_value: Any = None) -> str:
     if amount_value in (None, ""):
         return ""
@@ -160,16 +210,25 @@ def _app_header_html(*, csrf_token: str, active: str) -> str:
     return f"""
   <header class="app-header">
     <div class="app-brand">
-      <div class="brand-mark app-brand-mark" aria-hidden="true">Z</div>
+      <a class="app-logo" href="/dashboard" aria-label="Zamp home">
+        <span class="app-brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" role="presentation"><path d="M8 9.5h16L10 22.5h14"/><circle cx="23.5" cy="8.5" r="2.5"/></svg>
+        </span>
+        <span>Zamp</span>
+      </a>
       <nav class="nav-links" aria-label="Primary">
-        <a href="/dashboard"{review_class}{review_current}>Review</a>
+        <a href="/dashboard"{review_class}{review_current}>Focus</a>
         <a href="/settings"{settings_class}{settings_current}>Settings</a>
       </nav>
     </div>
-    <form class="logout-form" method="post" action="/logout">
-      <input type="hidden" name="_csrf" value="{html_lib.escape(csrf_token)}">
-      <button class="secondary compact-button" type="submit">Log out</button>
-    </form>
+    <div class="app-header-actions">
+      <form class="logout-form" method="post" action="/logout">
+        <input type="hidden" name="_csrf" value="{html_lib.escape(csrf_token)}">
+        <button class="icon-button" type="submit" aria-label="Log out" title="Log out">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H5v14h5M14 8l4 4-4 4M8 12h10"/></svg>
+        </button>
+      </form>
+    </div>
   </header>"""
 
 
@@ -415,23 +474,49 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         mail_notice = None
         mail_notice_kind = "success"
         try:
-            review_items = self.mail_integration.list_invoice_review_items(
+            all_items = self.mail_integration.list_invoices(
                 owner_user_id=owner_user_id,
-                limit=50,
+                limit=500,
+                offset=0,
             )
+            processed_count = self.mail_integration.count_invoices(owner_user_id=owner_user_id)
         except (ConfigError, MailIntegrationError) as exc:
-            review_items = []
+            all_items = []
+            processed_count = 0
             mail_notice = str(exc)
             mail_notice_kind = "error"
 
-        selected_pdf_id = parse_qs(query).get("pdf_id", [""])[0]
-        selected_item = next(
-            (
-                item
-                for item in review_items
-                if str(item.get("pdf_file_id") or "") == selected_pdf_id
-            ),
-            review_items[0] if review_items else None,
+        query_values = parse_qs(query)
+        review_filter = query_values.get("review", ["needs_review"])[-1]
+        if review_filter not in {"needs_review", "all"}:
+            review_filter = "needs_review"
+        date_from_value = query_values.get("date_from", [""])[-1]
+        date_to_value = query_values.get("date_to", [""])[-1]
+        date_from = _query_date(date_from_value)
+        date_to = _query_date(date_to_value)
+        if date_from is None:
+            date_from_value = ""
+        if date_to is None:
+            date_to_value = ""
+        review_items = _filter_invoice_items(
+            all_items,
+            review_filter=review_filter,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
+        selected_pdf_id = query_values.get("pdf_id", [""])[0]
+        selected_item = (
+            next(
+                (
+                    item
+                    for item in all_items
+                    if str(item.get("pdf_file_id") or "") == selected_pdf_id
+                ),
+                None,
+            )
+            if selected_pdf_id
+            else review_items[0] if review_items else None
         )
 
         selected_invoice = None
@@ -446,10 +531,53 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
                 mail_notice = str(exc)
                 mail_notice_kind = "error"
 
-        queue_items_html = self._review_queue_html(review_items, selected_item)
-        evidence_html = self._review_evidence_html(selected_item, selected_invoice)
+        filter_parameters = {"review": review_filter}
+        if date_from_value:
+            filter_parameters["date_from"] = date_from_value
+        if date_to_value:
+            filter_parameters["date_to"] = date_to_value
+        filter_query = urlencode(filter_parameters)
+        visible_pdf_ids = {item.get("pdf_file_id") for item in review_items}
+        queue_items_html = self._review_queue_html(
+            all_items,
+            selected_item,
+            filter_query,
+            visible_pdf_ids,
+        )
+        navigation_items = review_items
+        try:
+            selected_index = next(
+                index
+                for index, item in enumerate(navigation_items)
+                if selected_item and item.get("pdf_file_id") == selected_item.get("pdf_file_id")
+            )
+        except StopIteration:
+            navigation_items = all_items
+            selected_index = next(
+                (
+                    index
+                    for index, item in enumerate(navigation_items)
+                    if selected_item and item.get("pdf_file_id") == selected_item.get("pdf_file_id")
+                ),
+                -1,
+            )
+
+        def navigation_url(index: int) -> str:
+            if index < 0 or index >= len(navigation_items):
+                return ""
+            pdf_id = navigation_items[index].get("pdf_file_id")
+            return f"/dashboard?{filter_query}&pdf_id={pdf_id}"
+
+        previous_url = navigation_url(selected_index - 1) if selected_index >= 0 else ""
+        next_url = navigation_url(selected_index + 1) if selected_index >= 0 else ""
+        evidence_html = self._review_evidence_html(
+            selected_item,
+            selected_invoice,
+            previous_url=previous_url,
+            next_url=next_url,
+        )
         queue_count = len(review_items)
-        queue_label = "invoice" if queue_count == 1 else "invoices"
+        processed_label = "invoice" if processed_count == 1 else "invoices"
         notice_html = (
             f'<div class="queue-notice"><div class="notice notice-{html_lib.escape(mail_notice_kind)}" role="status">'
             f"{html_lib.escape(mail_notice)}</div></div>"
@@ -463,17 +591,44 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Dashboard - ZAMP</title>
+  <meta name="theme-color" content="#f5f3ee">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Manrope:wght@500;600;700&amp;display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body class="app-body">
 {_app_header_html(csrf_token=csrf, active="review")}
 
   <main class="workbench" aria-label="Invoice review workspace">
-    <aside class="queue-pane" aria-label="Invoice review queue">
+    <aside class="queue-pane" id="invoice-queue" aria-label="Invoice review queue">
       <div class="queue-pane-header">
-        <p class="eyebrow">Review queue</p>
-        <h1>Invoices</h1>
-        <p>{queue_count} {queue_label} pending</p>
+        <div class="queue-heading-row">
+          <div>
+            <h1>Invoices</h1>
+          </div>
+          <span class="queue-count" aria-label="{processed_count} {processed_label} processed">{processed_count}</span>
+        </div>
+        <p class="queue-summary"><strong>{processed_count}</strong> processed · <strong data-shown-count>{queue_count}</strong> shown</p>
+        <form class="queue-filters" method="get" action="/dashboard">
+          <input type="hidden" name="review" value="all">
+          <label class="review-filter-toggle">
+            <input type="checkbox" name="review" value="needs_review"{' checked' if review_filter == 'needs_review' else ''} data-review-filter>
+            <span class="toggle-track" aria-hidden="true"><span></span></span>
+            <span>Needs review</span>
+          </label>
+          <div class="custom-date-filters" role="group" aria-label="Filter by received date">
+            <label>
+              <span>From</span>
+              <input type="date" name="date_from" value="{html_lib.escape(date_from_value)}" data-date-from>
+            </label>
+            <label>
+              <span>To</span>
+              <input type="date" name="date_to" value="{html_lib.escape(date_to_value)}" data-date-to>
+            </label>
+          </div>
+          <button class="filter-submit" type="submit">Apply</button>
+        </form>
       </div>
       {notice_html}
       <div class="queue-list">
@@ -485,6 +640,99 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
       {evidence_html}
     </section>
   </main>
+  <script>
+    (function () {{
+      var form = document.querySelector(".queue-filters");
+      var reviewFilter = document.querySelector("[data-review-filter]");
+      var dateFrom = document.querySelector("[data-date-from]");
+      var dateTo = document.querySelector("[data-date-to]");
+      var shownCount = document.querySelector("[data-shown-count]");
+      var items = Array.prototype.slice.call(document.querySelectorAll("[data-queue-item]"));
+      if (!form || !reviewFilter || !dateFrom || !dateTo) return;
+
+      function withinDate(received, from, to) {{
+        if (!from && !to) return true;
+        if (!received) return false;
+        var receivedDay = received.slice(0, 10);
+        return (!from || receivedDay >= from) && (!to || receivedDay <= to);
+      }}
+
+      function applyFilters() {{
+        var visible = 0;
+        items.forEach(function (item) {{
+          var matchesReview = !reviewFilter.checked || item.dataset.needsReview === "true";
+          var matchesDate = withinDate(item.dataset.received, dateFrom.value, dateTo.value);
+          var matches = matchesReview && matchesDate;
+          item.hidden = !matches;
+          var itemUrl = new URL(item.href);
+          itemUrl.searchParams.set("review", reviewFilter.checked ? "needs_review" : "all");
+          if (dateFrom.value) itemUrl.searchParams.set("date_from", dateFrom.value);
+          else itemUrl.searchParams.delete("date_from");
+          if (dateTo.value) itemUrl.searchParams.set("date_to", dateTo.value);
+          else itemUrl.searchParams.delete("date_to");
+          item.href = itemUrl.toString();
+          if (matches) visible += 1;
+        }});
+        if (shownCount) shownCount.textContent = String(visible);
+
+        var url = new URL(window.location.href);
+        url.searchParams.set("review", reviewFilter.checked ? "needs_review" : "all");
+        if (dateFrom.value) url.searchParams.set("date_from", dateFrom.value);
+        else url.searchParams.delete("date_from");
+        if (dateTo.value) url.searchParams.set("date_to", dateTo.value);
+        else url.searchParams.delete("date_to");
+        window.history.replaceState(null, "", url.toString());
+
+        var visibleItems = items.filter(function (item) {{ return !item.hidden; }});
+        var activeIndex = visibleItems.findIndex(function (item) {{ return item.classList.contains("active"); }});
+        updateNavigation(document.querySelector("[data-previous-invoice]"), activeIndex > 0 ? visibleItems[activeIndex - 1] : null);
+        updateNavigation(document.querySelector("[data-next-invoice]"), activeIndex >= 0 && activeIndex < visibleItems.length - 1 ? visibleItems[activeIndex + 1] : null);
+      }}
+
+      function updateNavigation(link, item) {{
+        if (!link) return;
+        if (item) {{
+          link.href = item.href;
+          link.classList.remove("disabled");
+          link.setAttribute("aria-disabled", "false");
+        }} else {{
+          link.removeAttribute("href");
+          link.classList.add("disabled");
+          link.setAttribute("aria-disabled", "true");
+        }}
+      }}
+
+      form.addEventListener("submit", function (event) {{
+        event.preventDefault();
+        applyFilters();
+      }});
+      reviewFilter.addEventListener("change", applyFilters);
+      dateFrom.addEventListener("change", applyFilters);
+      dateTo.addEventListener("change", applyFilters);
+    }})();
+
+    (function () {{
+      var button = document.querySelector("[data-sidebar-toggle]");
+      if (!button) return;
+
+      function setCollapsed(collapsed) {{
+        document.body.classList.toggle("sidebar-collapsed", collapsed);
+        button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+        button.setAttribute("aria-label", collapsed ? "Expand invoice sidebar" : "Collapse invoice sidebar");
+        button.setAttribute("title", collapsed ? "Expand invoice sidebar" : "Collapse invoice sidebar");
+        try {{ window.localStorage.setItem("zamp-sidebar-collapsed", collapsed ? "1" : "0"); }} catch (error) {{}}
+      }}
+
+      try {{
+        setCollapsed(window.localStorage.getItem("zamp-sidebar-collapsed") === "1");
+      }} catch (error) {{
+        setCollapsed(false);
+      }}
+      button.addEventListener("click", function () {{
+        setCollapsed(!document.body.classList.contains("sidebar-collapsed"));
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
 
@@ -498,16 +746,30 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         self,
         review_items: list[dict[str, Any]],
         selected_item: dict[str, Any] | None,
+        filter_query: str,
+        visible_pdf_ids: set[Any],
     ) -> str:
         if not review_items:
-            return '<div class="empty-state">No action needed. You are all caught up.</div>'
+            return '<div class="empty-state">No invoices match these filters.</div>'
         selected_pdf_id = selected_item.get("pdf_file_id") if selected_item else None
         return "\n".join(
-            self._review_queue_item_html(item, active=item.get("pdf_file_id") == selected_pdf_id)
+            self._review_queue_item_html(
+                item,
+                active=item.get("pdf_file_id") == selected_pdf_id,
+                filter_query=filter_query,
+                visible=item.get("pdf_file_id") in visible_pdf_ids,
+            )
             for item in review_items
         )
 
-    def _review_queue_item_html(self, item: dict[str, Any], *, active: bool) -> str:
+    def _review_queue_item_html(
+        self,
+        item: dict[str, Any],
+        *,
+        active: bool,
+        filter_query: str,
+        visible: bool,
+    ) -> str:
         title = _display_value(item.get("invoice_number") or item.get("filename"))
         amount = _display_value(item.get("amount")) or _format_amount(
             item.get("amount_due"),
@@ -529,10 +791,15 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             if confidence
             else ""
         )
+        needs_review = "true" if _invoice_needs_review(item) else "false"
+        received_value = html_lib.escape(
+            _display_value(item.get("received_date") or item.get("received_at"))
+        )
+        hidden_attr = "" if visible else " hidden"
         return f"""
-        <a class="queue-item{' active' if active else ''}" href="/dashboard?pdf_id={pdf_file_id}"{active_attr}>
+        <a class="queue-item{' active' if active else ''}" href="/dashboard?{html_lib.escape(filter_query)}&amp;pdf_id={pdf_file_id}" data-queue-item data-needs-review="{needs_review}" data-received="{received_value}"{hidden_attr}{active_attr}>
           <div class="queue-header">
-            <span class="queue-vendor">{html_lib.escape(vendor or "Unknown vendor")}</span>
+            <span class="queue-vendor"><span class="vendor-dot" aria-hidden="true"></span>{html_lib.escape(vendor or "Unknown vendor")}</span>
             <span class="queue-amount">{html_lib.escape(amount_label)}</span>
           </div>
           <div class="queue-title">{html_lib.escape(title_label)}</div>
@@ -548,9 +815,28 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         self,
         selected_item: dict[str, Any] | None,
         invoice: dict[str, Any] | None,
+        *,
+        previous_url: str = "",
+        next_url: str = "",
     ) -> str:
+        previous_link = self._invoice_navigation_link(
+            direction="previous",
+            url=previous_url,
+        )
+        next_link = self._invoice_navigation_link(
+            direction="next",
+            url=next_url,
+        )
         if not selected_item and not invoice:
-            return """
+            return f"""
+      <div class="evidence-header">
+        <div class="evidence-navigation-left">
+          {self._sidebar_toggle_html()}
+          {previous_link}
+        </div>
+        <div class="evidence-title"><strong>No invoice selected</strong></div>
+        <div class="review-actions">{next_link}</div>
+      </div>
       <div class="evidence-empty">
         <div>
           <p class="eyebrow">Invoice preview</p>
@@ -602,6 +888,10 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         )
         return f"""
       <div class="evidence-header">
+        <div class="evidence-navigation-left">
+          {self._sidebar_toggle_html()}
+          {previous_link}
+        </div>
         <div class="evidence-title">
           <strong>{html_lib.escape(filename or "Invoice detail")}</strong>
           <span>{html_lib.escape(subject)}</span>
@@ -609,23 +899,46 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         <div class="actions review-actions">
           <span class="decision-badge status-{decision_class}">{html_lib.escape(decision_label)}</span>
           {f'<span class="confidence-badge">{html_lib.escape(confidence)} confidence</span>' if confidence else ''}
+          {next_link}
         </div>
       </div>
       <div class="evidence-content">
         <div class="review-detail-panel">
           {decision_html}
-          {normalized_html}
           {checks_html}
-          {audit_html}
-          <section class="detail-section">
-            <h2>Source</h2>
-            {meta_html}
-          </section>
+          <div class="supporting-details">
+            <p class="supporting-label">Supporting details</p>
+            {normalized_html}
+            {audit_html}
+            <details class="detail-section disclosure-section">
+              <summary>Source</summary>
+              <div class="disclosure-body">{meta_html}</div>
+            </details>
+          </div>
         </div>
         <div class="pdf-stage">
           {pdf_html}
         </div>
       </div>"""
+
+    def _sidebar_toggle_html(self) -> str:
+        return """
+        <button class="sidebar-toggle" type="button" data-sidebar-toggle aria-controls="invoice-queue" aria-expanded="true" aria-label="Collapse invoice sidebar" title="Collapse invoice sidebar">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        </button>"""
+
+    def _invoice_navigation_link(self, *, direction: str, url: str) -> str:
+        is_previous = direction == "previous"
+        label = "Previous invoice" if is_previous else "Next invoice"
+        data_attribute = "data-previous-invoice" if is_previous else "data-next-invoice"
+        path = "M15 18l-6-6 6-6" if is_previous else "M9 6l6 6-6 6"
+        href = f' href="{html_lib.escape(url)}"' if url else ""
+        disabled_class = " disabled" if not url else ""
+        disabled = "true" if not url else "false"
+        return f"""
+        <a class="invoice-nav-button{disabled_class}"{href} {data_attribute} aria-label="{label}" title="{label}" aria-disabled="{disabled}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="{path}"/></svg>
+        </a>"""
 
     def _decision_summary_html(
         self,
@@ -641,21 +954,43 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             for check in checks
             if isinstance(check, dict) and _display_value(check.get("status")).lower() in {"fail", "review"}
         )
-        facts = self._detail_facts_html(
-            [
-                ("Decision", _humanize_token(decision_value) or "Pending"),
-                ("Attention checks", str(failed_or_review) if checks else ""),
-            ]
+        decision_label = _humanize_token(decision_value) or "Pending"
+        decision_class = html_lib.escape(_badge_class(decision_label))
+        normalized_decision = decision_value.lower().replace("-", "_")
+        is_clear = normalized_decision.startswith("approve") or normalized_decision == "pass"
+        headline = (
+            "Ready to move forward"
+            if is_clear
+            else "Review is getting ready"
+            if not normalized_decision
+            else "This invoice needs your attention"
         )
-        body = facts
-        if summary:
-            body += f'<p class="detail-summary">{html_lib.escape(summary)}</p>'
+        summary_html = f'<p class="decision-summary">{html_lib.escape(summary)}</p>' if summary else ""
+        action_html = ""
         if next_action:
-            body += f'<p class="detail-next-action">{html_lib.escape(next_action)}</p>'
+            cta_label = "Review issue" if failed_or_review else "View completed checks"
+            action_html = f"""
+              <div class="next-step-card">
+                <span class="next-step-number">01</span>
+                <div>
+                  <span class="next-step-label">Your next step</span>
+                  <strong>{html_lib.escape(next_action)}</strong>
+                </div>
+                <a class="primary-action" href="#decision-steps">
+                  <span>{cta_label}</span>
+                  <span aria-hidden="true">→</span>
+                </a>
+              </div>"""
         return f"""
-          <section class="detail-section decision-section">
-            <h2>Decision</h2>
-            {body}
+          <section class="decision-hero status-{decision_class}">
+            <div class="decision-hero-copy">
+              <div class="decision-overline">
+                {f'<span>{failed_or_review} attention check{"s" if failed_or_review != 1 else ""}</span>' if checks else ''}
+              </div>
+              <h2>{headline}</h2>
+              {summary_html}
+            </div>
+            {action_html}
           </section>"""
 
     def _normalized_invoice_html(
@@ -685,19 +1020,32 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             ]
         )
         return f"""
-          <section class="detail-section">
-            <h2>Normalized Invoice</h2>
-            {facts}
-          </section>"""
+          <details class="detail-section disclosure-section">
+            <summary>Normalized Invoice</summary>
+            <div class="disclosure-body">{facts}</div>
+          </details>"""
 
     def _decision_checks_html(self, checks: list[Any]) -> str:
         if not checks:
             return """
-          <section class="detail-section">
-            <h2>Decision Checks</h2>
-            <p class="detail-muted">No checks recorded yet.</p>
+          <section class="progress-section" id="decision-steps">
+            <div class="progress-column done-column">
+              <div class="progress-heading">
+                <span class="progress-marker">✓</span>
+                <div><span>Already done</span><h2>Invoice received</h2></div>
+              </div>
+              <p class="detail-muted">The invoice is safely in your workspace.</p>
+            </div>
+            <div class="progress-column attention-column">
+              <div class="progress-heading">
+                <span class="progress-marker">→</span>
+                <div><span>Still to do</span><h2>Decision checks</h2></div>
+              </div>
+              <p class="detail-muted">Checks are still being prepared.</p>
+            </div>
           </section>"""
-        rows = []
+        completed_rows = []
+        attention_rows = []
         for check in checks:
             if not isinstance(check, dict):
                 continue
@@ -706,9 +1054,10 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             summary = _frontend_copy(check.get("summary"))
             status_label = _humanize_token(status) or "Unknown"
             status_class = html_lib.escape(_badge_class(status_label))
-            rows.append(
+            row = (
                 f"""
               <li class="check-row">
+                <span class="check-icon" aria-hidden="true"></span>
                 <div>
                   <strong>{html_lib.escape(_humanize_token(check_id) or check_id)}</strong>
                   <span>{html_lib.escape(summary)}</span>
@@ -716,13 +1065,28 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
                 <span class="decision-badge status-{status_class}">{html_lib.escape(status_label)}</span>
               </li>"""
             )
-        checks_html = "\n".join(rows) if rows else '<p class="detail-muted">No checks recorded yet.</p>'
+            if status.lower() in {"fail", "review"}:
+                attention_rows.append(row)
+            else:
+                completed_rows.append(row)
+        completed_html = "\n".join(completed_rows) if completed_rows else '<p class="detail-muted">No completed checks yet.</p>'
+        attention_html = "\n".join(attention_rows) if attention_rows else '<div class="all-clear"><span aria-hidden="true">✓</span><p><strong>Nothing else is blocking this invoice.</strong><br>All recorded checks are clear.</p></div>'
         return f"""
-          <section class="detail-section">
-            <h2>Decision Checks</h2>
-            <ul class="check-list">
-              {checks_html}
-            </ul>
+          <section class="progress-section" id="decision-steps">
+            <div class="progress-column done-column">
+              <div class="progress-heading">
+                <span class="progress-marker">✓</span>
+                <div><span>Already done</span><h2>Checks completed</h2></div>
+              </div>
+              <ul class="check-list">{completed_html}</ul>
+            </div>
+            <div class="progress-column attention-column">
+              <div class="progress-heading">
+                <span class="progress-marker">→</span>
+                <div><span>Still to do</span><h2>Needs attention</h2></div>
+              </div>
+              <ul class="check-list">{attention_html}</ul>
+            </div>
           </section>"""
 
     def _audit_reasoning_html(self, audit: dict[str, Any], ap_context: dict[str, Any]) -> str:
@@ -749,10 +1113,10 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             ]
         )
         return f"""
-          <section class="detail-section">
-            <h2>Audit Reasoning</h2>
-            {facts}
-          </section>"""
+          <details class="detail-section disclosure-section">
+            <summary>Audit Reasoning</summary>
+            <div class="disclosure-body">{facts}</div>
+          </details>"""
 
     def _detail_facts_html(self, rows: list[tuple[str, Any]]) -> str:
         items = []

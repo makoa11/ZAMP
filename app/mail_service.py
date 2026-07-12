@@ -224,6 +224,9 @@ class MailIntegration:
         )
         return [_public_invoice_queue_row(row) for row in rows]
 
+    def count_invoices(self, *, owner_user_id: str) -> int:
+        return self.repo.count_mail_invoices(owner_user_id=owner_user_id)
+
     def get_invoice(self, *, owner_user_id: str, pdf_file_id: int) -> dict[str, Any] | None:
         row = self.repo.get_mail_invoice_detail(
             owner_user_id=owner_user_id,

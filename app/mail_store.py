@@ -1506,6 +1506,18 @@ class MailRepository:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def count_mail_invoices(self, *, owner_user_id: str) -> int:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS invoice_count
+                FROM mail_invoice_extractions
+                WHERE owner_user_id = %s
+                """,
+                (owner_user_id,),
+            ).fetchone()
+            return int(row["invoice_count"]) if row else 0
+
     def get_mail_invoice_detail(
         self,
         *,
