@@ -215,6 +215,7 @@ class ServerRouteTests(unittest.TestCase):
                         "status": "parsed",
                         "parser_method": "static_text",
                         "page_count": 2,
+                        "ocr_parts": ["invoice_number", "amount_due"],
                     },
                     "normalized_invoice": {
                         "vendor": {"name": "Database Vendor LLC"},
@@ -294,6 +295,8 @@ class ServerRouteTests(unittest.TestCase):
         self.assertNotIn("decision-orb", response)
         self.assertIn("Collapse invoice sidebar", response)
         self.assertIn("zamp-sidebar-collapsed", response)
+        self.assertIn("zamp-review-queue-scroll-top", response)
+        self.assertIn("zamp-review-queue-scroll-left", response)
         self.assertIn("data-previous-invoice", response)
         self.assertIn("data-next-invoice", response)
         self.assertIn('d="M4 6h16M4 12h16M4 18h16"', response)
@@ -304,10 +307,12 @@ class ServerRouteTests(unittest.TestCase):
         self.assertIn("Still to do", response)
         self.assertNotIn("Zen mode", response)
         self.assertIn("Supporting details", response)
+        self.assertIn("detail-fact-row is-ocr", response)
+        self.assertNotIn("field-source-badge", response)
         self.assertIn("2</strong> processed", response)
         self.assertIn("1</strong> shown", response)
         self.assertIn('name="review" value="needs_review" checked', response)
-        self.assertIn('/api/mail/invoices/20/overlay.pdf?boxes=all', response)
+        self.assertIn('/api/mail/invoices/20/overlay.pdf?boxes=parsed', response)
         self.assertNotIn('/api/mail/pdfs/20', response)
         self.assertNotIn("AP context", response)
         self.assertNotIn("AP review", response)

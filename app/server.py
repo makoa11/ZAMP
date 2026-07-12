@@ -648,7 +648,41 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
       var dateTo = document.querySelector("[data-date-to]");
       var shownCount = document.querySelector("[data-shown-count]");
       var items = Array.prototype.slice.call(document.querySelectorAll("[data-queue-item]"));
+      var queuePane = document.querySelector(".queue-pane");
+      var queueList = document.querySelector(".queue-list");
+      var queueScrollTopStorageKey = "zamp-review-queue-scroll-top";
+      var queueScrollLeftStorageKey = "zamp-review-queue-scroll-left";
       if (!form || !reviewFilter || !dateFrom || !dateTo) return;
+
+      function persistQueueScroll() {{
+        try {{
+          if (queuePane) {{
+            window.sessionStorage.setItem(queueScrollTopStorageKey, String(queuePane.scrollTop || 0));
+          }}
+          if (queueList) {{
+            window.sessionStorage.setItem(queueScrollLeftStorageKey, String(queueList.scrollLeft || 0));
+          }}
+        }} catch (error) {{}}
+      }}
+
+      function restoreQueueScroll() {{
+        try {{
+          var storedTop = window.sessionStorage.getItem(queueScrollTopStorageKey);
+          var storedLeft = window.sessionStorage.getItem(queueScrollLeftStorageKey);
+          if (queuePane && storedTop !== null) {{
+            var scrollTop = Number(storedTop);
+            if (!Number.isNaN(scrollTop) && scrollTop >= 0) {{
+              queuePane.scrollTop = scrollTop;
+            }}
+          }}
+          if (queueList && storedLeft !== null) {{
+            var scrollLeft = Number(storedLeft);
+            if (!Number.isNaN(scrollLeft) && scrollLeft >= 0) {{
+              queueList.scrollLeft = scrollLeft;
+            }}
+          }}
+        }} catch (error) {{}}
+      }}
 
       function withinDate(received, from, to) {{
         if (!from && !to) return true;
@@ -709,6 +743,16 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
       reviewFilter.addEventListener("change", applyFilters);
       dateFrom.addEventListener("change", applyFilters);
       dateTo.addEventListener("change", applyFilters);
+      if (queuePane) {{
+        queuePane.addEventListener("scroll", persistQueueScroll, {{ passive: true }});
+      }}
+      if (queueList) {{
+        queueList.addEventListener("scroll", persistQueueScroll, {{ passive: true }});
+      }}
+      items.forEach(function (item) {{
+        item.addEventListener("click", persistQueueScroll);
+      }});
+      window.requestAnimationFrame(restoreQueueScroll);
     }})();
 
     (function () {{
@@ -865,7 +909,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         decision_label = _humanize_token(decision_value) or "Pending"
         decision_class = html_lib.escape(_badge_class(decision_label))
         overlay_url = (
-            f"/api/mail/invoices/{pdf_file_id}/overlay.pdf?boxes=all"
+            f"/api/mail/invoices/{pdf_file_id}/overlay.pdf?boxes=parsed"
             if pdf_file_id is not None
             else ""
         )
@@ -1006,18 +1050,24 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         parse_status = _display_value(raw_parse.get("status") or normalized_invoice.get("parser_status") or item.get("parse_status"))
         parser_method = _display_value(raw_parse.get("parser_method"))
         page_count = _display_value(raw_parse.get("page_count"))
-        facts = self._detail_facts_html(
+        ocr_parts = {
+            _display_value(part)
+            for part in raw_parse.get("ocr_parts", [])
+            if _display_value(part)
+        }
+        facts = self._detail_facts_with_source_html(
             [
-                ("Vendor", _field_value(normalized_invoice.get("vendor"), "name", "value", "raw") or item.get("vendor")),
-                ("Invoice #", _field_value(normalized_invoice.get("invoice_number"), "value") or item.get("invoice_number")),
-                ("Purchase order", _field_value(normalized_invoice.get("purchase_order"), "value") or item.get("purchase_order")),
-                ("Issue date", _field_value(normalized_invoice.get("issue_date"), "value")),
-                ("Due date", _field_value(normalized_invoice.get("due_date"), "value")),
-                ("Amount due", amount),
-                ("Parse status", _humanize_token(parse_status)),
-                ("Parser", parser_method),
-                ("Pages", page_count),
-            ]
+                ("Vendor", _field_value(normalized_invoice.get("vendor"), "name", "value", "raw") or item.get("vendor"), "vendor"),
+                ("Invoice #", _field_value(normalized_invoice.get("invoice_number"), "value") or item.get("invoice_number"), "invoice_number"),
+                ("Purchase order", _field_value(normalized_invoice.get("purchase_order"), "value") or item.get("purchase_order"), "purchase_order"),
+                ("Issue date", _field_value(normalized_invoice.get("issue_date"), "value"), "issue_date"),
+                ("Due date", _field_value(normalized_invoice.get("due_date"), "value"), "due_date"),
+                ("Amount due", amount, "amount_due"),
+                ("Parse status", _humanize_token(parse_status), None),
+                ("Parser", parser_method, None),
+                ("Pages", page_count, None),
+            ],
+            ocr_parts=ocr_parts,
         )
         return f"""
           <details class="detail-section disclosure-section">
@@ -1135,6 +1185,37 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             return '<p class="detail-muted">No data recorded yet.</p>'
         return f"""
             <dl class="detail-facts">
+              {"".join(items)}
+            </dl>"""
+
+    def _detail_facts_with_source_html(
+        self,
+        rows: list[tuple[str, Any, str | None]],
+        *,
+        ocr_parts: set[str],
+    ) -> str:
+        items = []
+        for label, value, part_key in rows:
+            text = _display_value(value)
+            if not text:
+                continue
+            is_ocr = part_key in ocr_parts if part_key else False
+            row_class = "detail-fact-row is-ocr" if is_ocr else "detail-fact-row"
+            items.append(
+                f"""
+              <div class="{row_class}">
+                <dt>{html_lib.escape(label)}</dt>
+                <dd>
+                  <div class="detail-fact-value">
+                    <span>{html_lib.escape(text)}</span>
+                  </div>
+                </dd>
+              </div>"""
+            )
+        if not items:
+            return '<p class="detail-muted">No data recorded yet.</p>'
+        return f"""
+            <dl class="detail-facts detail-facts-with-source">
               {"".join(items)}
             </dl>"""
 
