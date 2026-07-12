@@ -9,6 +9,7 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -353,6 +354,12 @@ CREATE INDEX IF NOT EXISTS idx_ap_context_records_owner_vendor_invoice
     ON ap_context_records(owner_user_id, normalized_vendor, normalized_invoice_number);
 CREATE INDEX IF NOT EXISTS idx_ap_context_records_owner_vendor_amount_date
     ON ap_context_records(owner_user_id, normalized_vendor, invoice_total, issue_date);
+CREATE INDEX IF NOT EXISTS idx_ap_context_records_owner_po
+    ON ap_context_records(owner_user_id, normalized_purchase_order);
+CREATE INDEX IF NOT EXISTS idx_ap_context_records_owner_invoice
+    ON ap_context_records(owner_user_id, normalized_invoice_number);
+CREATE INDEX IF NOT EXISTS idx_ap_context_records_owner_amount_date
+    ON ap_context_records(owner_user_id, invoice_total, issue_date);
 """
 
 
@@ -365,6 +372,42 @@ def _json_from_db(value: Any, fallback: Any) -> Any:
         except json.JSONDecodeError:
             return fallback
     return value
+
+
+def _best_ap_context_candidate(rows: Iterable[Any], normalized_vendor: str | None) -> dict[str, Any] | None:
+    candidates = [dict(row) for row in rows]
+    if not candidates:
+        return None
+    vendor = str(normalized_vendor or "")
+    if not vendor:
+        candidates[0]["_vendor_similarity"] = 0.0
+        return candidates[0]
+    scored = [
+        (
+            SequenceMatcher(None, vendor, str(candidate.get("normalized_vendor") or "")).ratio(),
+            -index,
+            candidate,
+        )
+        for index, candidate in enumerate(candidates)
+    ]
+    similarity, _, result = max(scored, key=lambda item: (item[0], item[1]))
+    result["_vendor_similarity"] = round(similarity, 3)
+    return result
+
+
+def _ap_match_strategy(
+    record: dict[str, Any],
+    normalized_vendor: str | None,
+    *,
+    exact: str,
+    fuzzy: str,
+    fallback: str,
+) -> str:
+    if normalized_vendor and record.get("normalized_vendor") == normalized_vendor:
+        return exact
+    if float(record.get("_vendor_similarity") or 0.0) >= 0.85:
+        return fuzzy
+    return fallback
 
 
 def _decimal_from_value(value: Any) -> Decimal | None:
@@ -1335,75 +1378,86 @@ class MailRepository:
         amount_due: Decimal | str | float | int | None,
         issue_date: date | datetime | str | None,
     ) -> dict[str, Any] | None:
-        if not normalized_vendor:
-            return None
-
         with self.database.connect() as conn:
             if normalized_purchase_order:
-                row = conn.execute(
+                rows = conn.execute(
                     """
                     SELECT *
                     FROM ap_context_records
                     WHERE owner_user_id = %s
-                      AND normalized_vendor = %s
                       AND normalized_purchase_order = %s
                     ORDER BY updated_at DESC, id DESC
-                    LIMIT 1
+                    LIMIT 20
                     """,
-                    (owner_user_id, normalized_vendor, normalized_purchase_order),
-                ).fetchone()
-                if row:
-                    result = dict(row)
-                    result["_match_strategy"] = "vendor_po"
+                    (owner_user_id, normalized_purchase_order),
+                ).fetchall()
+                result = _best_ap_context_candidate(rows, normalized_vendor)
+                if result:
+                    result["_match_strategy"] = _ap_match_strategy(
+                        result,
+                        normalized_vendor,
+                        exact="vendor_po",
+                        fuzzy="fuzzy_vendor_po",
+                        fallback="po",
+                    )
                     return self._hydrate_ap_context_record(result)
 
             if normalized_invoice_number:
-                row = conn.execute(
+                rows = conn.execute(
                     """
                     SELECT *
                     FROM ap_context_records
                     WHERE owner_user_id = %s
-                      AND normalized_vendor = %s
                       AND normalized_invoice_number = %s
                     ORDER BY updated_at DESC, id DESC
-                    LIMIT 1
+                    LIMIT 20
                     """,
-                    (owner_user_id, normalized_vendor, normalized_invoice_number),
-                ).fetchone()
-                if row:
-                    result = dict(row)
-                    result["_match_strategy"] = "vendor_invoice_number"
+                    (owner_user_id, normalized_invoice_number),
+                ).fetchall()
+                result = _best_ap_context_candidate(rows, normalized_vendor)
+                if result:
+                    result["_match_strategy"] = _ap_match_strategy(
+                        result,
+                        normalized_vendor,
+                        exact="vendor_invoice_number",
+                        fuzzy="fuzzy_vendor_invoice_number",
+                        fallback="invoice_number",
+                    )
                     return self._hydrate_ap_context_record(result)
 
             amount = _decimal_from_value(amount_due)
             parsed_date = _date_from_value(issue_date)
             if amount is not None:
-                row = conn.execute(
+                rows = conn.execute(
                     """
                     SELECT *
                     FROM ap_context_records
                     WHERE owner_user_id = %s
-                      AND normalized_vendor = %s
                       AND invoice_total = %s
                       AND (%s::date IS NULL OR issue_date = %s::date OR issue_date IS NULL)
                     ORDER BY
                         CASE WHEN issue_date = %s::date THEN 0 ELSE 1 END,
                         updated_at DESC,
                         id DESC
-                    LIMIT 1
+                    LIMIT 20
                     """,
                     (
                         owner_user_id,
-                        normalized_vendor,
                         amount,
                         parsed_date,
                         parsed_date,
                         parsed_date,
                     ),
-                ).fetchone()
-                if row:
-                    result = dict(row)
-                    result["_match_strategy"] = "vendor_amount_date"
+                ).fetchall()
+                result = _best_ap_context_candidate(rows, normalized_vendor)
+                if result:
+                    result["_match_strategy"] = _ap_match_strategy(
+                        result,
+                        normalized_vendor,
+                        exact="vendor_amount_date",
+                        fuzzy="fuzzy_vendor_amount_date",
+                        fallback="amount_date",
+                    )
                     return self._hydrate_ap_context_record(result)
         return None
 

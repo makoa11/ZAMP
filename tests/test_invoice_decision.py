@@ -24,6 +24,7 @@ from app.invoice_normalizer import (
 )
 from app.invoice_parser import parse_invoice_pdf
 from app.invoice_pdf import render_invoice_pdf
+from app.mail_store import MailRepository
 from scripts.run_invoice_decision import run_invoice_decision
 
 
@@ -157,6 +158,56 @@ def _invoice_from_sample(sample: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _matching_context(invoice: dict[str, Any]) -> dict[str, Any]:
+    vendor = invoice["vendor"]
+    buyer = invoice["buyer"]
+    invoice_number = invoice["invoice_number"]
+    issue_date = invoice["issue_date"]
+    due_date = invoice["due_date"]
+    purchase_order = invoice["purchase_order"]
+    amount_due = invoice["amount_due"]
+    amounts = invoice["amounts"]
+    return {
+        "schema_version": 1,
+        "available": True,
+        "source": {"type": "unit_test"},
+        "scenario": "unit_approve",
+        "vendor": {
+            "name": vendor["name"],
+            "normalized_name": vendor["normalized_name"],
+            "aliases": [],
+            "approved": True,
+        },
+        "buyer": {
+            "name": buyer["name"],
+            "normalized_name": buyer["normalized_name"],
+        },
+        "invoice": {
+            "invoice_number": invoice_number["value"],
+            "normalized_invoice_number": invoice_number["normalized"],
+            "issue_date": issue_date["value"],
+            "due_date": due_date["value"],
+        },
+        "currency": invoice["currency"]["value"],
+        "purchase_order": {
+            "po_number": purchase_order["value"],
+            "normalized": purchase_order["normalized"],
+            "authorized_total": amount_due["amount"],
+            "previously_consumed": "0.00",
+            "remaining_before_invoice": amount_due["amount"],
+        },
+        "invoice_total": amount_due["amount"],
+        "approved_bank_details": {"account": "**** 1234"},
+        "invoice_payment": {"bank_account": "**** 1234"},
+        "previous_invoices": [],
+        "duplicate_candidates": [],
+        "candidate_open_po": None,
+        "tolerance_policy": {"percent": "0.00", "amount": "0.00"},
+        "amounts": {key: value["amount"] for key, value in amounts.items()},
+        "expected": {},
+    }
+
+
 def _decision_for_variation(variation_index: int) -> dict[str, Any]:
     sample = generate_invoice(
         template_slug="ledger-clean",
@@ -195,6 +246,13 @@ class InvoiceNormalizerTests(unittest.TestCase):
 
         self.assertIn("purchase_order", invoice["missing_fields"])
         self.assertNotIn("purchase_order", invoice["missing_critical_fields"])
+
+    def test_parser_required_identity_fields_are_critical_for_decisioning(self) -> None:
+        invoice = normalize_invoice_parse(
+            _parsed_result(due_date=None, currency=None, buyer=None)
+        )
+
+        self.assertTrue({"due_date", "currency", "buyer"}.issubset(invoice["missing_critical_fields"]))
 
     def test_tracks_low_confidence_fields(self) -> None:
         invoice = normalize_invoice_parse(
@@ -281,6 +339,135 @@ class InvoiceDecisionTests(unittest.TestCase):
         credit = next(check for check in decision["checks"] if check["id"] == "credit_memo")
         self.assertEqual(credit["status"], "review")
 
+    def test_vendor_mismatch_blocks_partial_consumption_approval(self) -> None:
+        invoice = normalize_invoice_parse(_parsed_result())
+        context = _matching_context(invoice)
+        context["vendor"] = {
+            "name": "Wrong Vendor LLC",
+            "normalized_name": "wrong vendor",
+            "approved": True,
+        }
+        context["purchase_order"]["previously_consumed"] = "100.00"
+        context["previous_invoices"] = [{"invoice_number": "INV-1000"}]
+
+        decision = decide_invoice(invoice, context)
+
+        self.assertEqual(decision["decision"], "needs_review")
+        self.assertEqual(decision["checks"][-1]["id"], "vendor_match")
+        self.assertEqual(decision["checks"][-1]["status"], "fail")
+
+    def test_fuzzy_vendor_match_requires_review_but_approved_alias_passes(self) -> None:
+        typo_invoice = normalize_invoice_parse(_parsed_result(seller=_field("Acme Supples LLC")))
+        context = _matching_context(normalize_invoice_parse(_parsed_result()))
+
+        typo_decision = decide_invoice(typo_invoice, context)
+
+        self.assertEqual(typo_decision["decision"], "needs_review")
+        fuzzy = typo_decision["checks"][-1]
+        self.assertEqual(fuzzy["context"]["match_method"], "fuzzy_name")
+
+        alias_context = _matching_context(typo_invoice)
+        alias_context["vendor"] = {
+            "name": "Acme Holdings LLC",
+            "normalized_name": "acme holdings",
+            "aliases": ["Acme Supples LLC"],
+            "approved": True,
+        }
+        alias_decision = decide_invoice(typo_invoice, alias_context)
+        self.assertEqual(alias_decision["decision"], "approve")
+
+    def test_currency_mismatch_cannot_approve_equal_numeric_amount(self) -> None:
+        invoice = normalize_invoice_parse(
+            _parsed_result(
+                currency=_field("EUR"),
+                subtotal=_money("1000.00", currency="EUR"),
+                discount=_money("0.00", currency="EUR"),
+                tax=_money("0.00", currency="EUR"),
+                shipping=_money("0.00", currency="EUR"),
+                paid=_money("0.00", currency="EUR"),
+                balance_due=_money("1000.00", currency="EUR"),
+                line_items=[],
+            )
+        )
+        context = _matching_context(invoice)
+        context["currency"] = "USD"
+
+        decision = decide_invoice(invoice, context)
+
+        self.assertEqual(decision["decision"], "needs_review")
+        currency = next(check for check in decision["checks"] if check["id"] == "currency_match")
+        self.assertEqual(currency["status"], "fail")
+
+    def test_bad_amount_composition_cannot_approve_matching_final_total(self) -> None:
+        invoice = normalize_invoice_parse(
+            _parsed_result(
+                subtotal=_money("800.00"),
+                tax=_money("100.00"),
+                balance_due=_money("1000.00"),
+                line_items=[],
+            )
+        )
+        context = _matching_context(invoice)
+        context["amounts"] = {}
+
+        decision = decide_invoice(invoice, context)
+
+        self.assertEqual(decision["decision"], "needs_review")
+        composition = next(check for check in decision["checks"] if check["id"] == "amount_composition")
+        self.assertEqual(composition["status"], "fail")
+        self.assertEqual(composition["evidence"]["composition_variance"], "100.00")
+
+    def test_parser_needs_review_and_low_confidence_amount_both_block_approval(self) -> None:
+        parser_review = _parsed_result()
+        parser_review["status"] = "needs_review"
+        parser_review["warnings"] = ["Review required."]
+        invoice = normalize_invoice_parse(parser_review)
+
+        parser_decision = decide_invoice(invoice, _matching_context(invoice))
+
+        self.assertEqual(parser_decision["decision"], "needs_review")
+        self.assertEqual(parser_decision["checks"][-1]["id"], "parser_status")
+
+        low_invoice = normalize_invoice_parse(_parsed_result(balance_due=_money("1000.00", confidence=0.40)))
+        confidence_decision = decide_invoice(low_invoice, _matching_context(low_invoice))
+        self.assertEqual(confidence_decision["decision"], "needs_review")
+        self.assertEqual(confidence_decision["checks"][-2]["id"], "parse_confidence")
+
+    def test_expected_invoice_number_dates_and_buyer_are_decisioned(self) -> None:
+        invoice = normalize_invoice_parse(_parsed_result())
+
+        cases = (
+            ("buyer", {"name": "Other Buyer", "normalized_name": "other buyer"}, "buyer_match"),
+            (
+                "invoice",
+                {
+                    "invoice_number": "INV-9999",
+                    "normalized_invoice_number": "9999",
+                    "issue_date": "2026-07-01",
+                    "due_date": "2026-07-31",
+                },
+                "invoice_number_match",
+            ),
+            (
+                "invoice",
+                {
+                    "invoice_number": "INV-1045",
+                    "normalized_invoice_number": "1045",
+                    "issue_date": "2026-07-02",
+                    "due_date": "2026-07-31",
+                },
+                "date_match",
+            ),
+        )
+        for key, value, check_id in cases:
+            with self.subTest(check_id=check_id):
+                context = _matching_context(invoice)
+                context[key] = value
+                decision = decide_invoice(invoice, context)
+                self.assertEqual(decision["decision"], "needs_review")
+                check = next(item for item in decision["checks"] if item["id"] == check_id)
+                self.assertEqual(check["status"], "fail")
+
 
 class DbProcurementContextTests(unittest.TestCase):
     def test_manifest_context_can_seed_db_backed_ap_context_record(self) -> None:
@@ -338,6 +525,59 @@ class DbProcurementContextTests(unittest.TestCase):
         self.assertEqual(context["source"]["type"], "ap_context_records")
         self.assertEqual(context["source"]["record_id"], 99)
         self.assertEqual(context["source"]["match_strategy"], "vendor_po")
+
+    def test_repository_ranks_strong_po_candidates_when_vendor_has_typo(self) -> None:
+        rows = [
+            {
+                "id": 1,
+                "normalized_vendor": "unrelated vendor",
+                "context": {},
+                "source_metadata": {},
+            },
+            {
+                "id": 2,
+                "normalized_vendor": "acme supplies",
+                "context": {},
+                "source_metadata": {},
+            },
+        ]
+
+        class Cursor:
+            def fetchall(self) -> list[dict[str, Any]]:
+                return rows
+
+        class Connection:
+            def __enter__(self) -> "Connection":
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                return None
+
+            def execute(self, query: str, params: tuple[Any, ...]) -> Cursor:
+                self.query = query
+                self.params = params
+                return Cursor()
+
+        connection = Connection()
+
+        class Database:
+            def connect(self) -> Connection:
+                return connection
+
+        record = MailRepository(Database()).find_ap_context_record(  # type: ignore[arg-type]
+            owner_user_id="user-123",
+            normalized_vendor="acme supples",
+            normalized_purchase_order="PO1000",
+            normalized_invoice_number=None,
+            amount_due=None,
+            issue_date=None,
+        )
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["id"], 2)
+        self.assertEqual(record["_match_strategy"], "fuzzy_vendor_po")
+        self.assertEqual(connection.params, ("user-123", "PO1000"))
 
     def test_db_backed_ap_context_exercises_decision_scenarios(self) -> None:
         cases = {

@@ -7,7 +7,15 @@ from typing import Any
 
 MONEY_QUANT = Decimal("0.01")
 LOW_CONFIDENCE_THRESHOLD = 0.70
-CRITICAL_FIELDS = ("vendor", "invoice_number", "issue_date", "amount_due")
+CRITICAL_FIELDS = (
+    "vendor",
+    "buyer",
+    "invoice_number",
+    "issue_date",
+    "due_date",
+    "currency",
+    "amount_due",
+)
 MONEY_FIELD_KEYS = (
     "subtotal",
     "discount",
@@ -66,6 +74,7 @@ def normalize_invoice_parse(parse_result: dict[str, Any]) -> dict[str, Any]:
             "issue_date": issue_date,
             "due_date": due_date,
             "purchase_order": purchase_order,
+            "currency": currency,
             "amount_due": amount_due,
         }
     )
@@ -169,8 +178,36 @@ def _party(kind: str, field: Any) -> dict[str, Any] | None:
         "name": name,
         "raw": raw,
         "normalized_name": normalize_vendor_name(name),
+        "tax_ids": _extract_tax_ids(raw),
+        "vendor_ids": _extract_vendor_ids(raw) if kind == "vendor" else [],
         "evidence": _evidence(kind, field),
     }
+
+
+def _extract_tax_ids(raw: str) -> list[str]:
+    values: list[str] = []
+    pattern = re.compile(
+        r"\b(?:tax\s*id|vat|gstin|gst|ein)\s*[:#-]?\s*([A-Z0-9][A-Z0-9 -]{4,24})",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(raw):
+        value = re.sub(r"[^A-Z0-9]+", "", match.group(1).upper())
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _extract_vendor_ids(raw: str) -> list[str]:
+    values: list[str] = []
+    pattern = re.compile(
+        r"\b(?:vendor|supplier)\s*(?:id|number|no\.?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{2,24})",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(raw):
+        value = re.sub(r"[^A-Z0-9]+", "", match.group(1).upper())
+        if value and value not in values:
+            values.append(value)
+    return values
 
 
 def _text_field(key: str, field: Any) -> dict[str, Any] | None:

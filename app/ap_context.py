@@ -61,6 +61,14 @@ def procurement_context_from_db_record(record: Mapping[str, Any]) -> dict[str, A
     result["available"] = True
     result.setdefault("schema_version", 1)
     result["scenario"] = result.get("scenario") or record.get("scenario") or "ap_context_record"
+    invoice = result.get("invoice") if isinstance(result.get("invoice"), Mapping) else {}
+    result["invoice"] = {
+        **dict(invoice),
+        "invoice_number": invoice.get("invoice_number") or record.get("invoice_number"),
+        "normalized_invoice_number": invoice.get("normalized_invoice_number")
+        or record.get("normalized_invoice_number"),
+        "issue_date": invoice.get("issue_date") or _date_text(record.get("issue_date")),
+    }
 
     source = result.get("source") if isinstance(result.get("source"), Mapping) else {}
     result["source"] = {
@@ -295,6 +303,8 @@ def _context_from_document(
     expected = ap_context.get("expected") if isinstance(ap_context.get("expected"), Mapping) else {}
     seller = document.get("seller") if isinstance(document.get("seller"), Mapping) else {}
     buyer = document.get("buyer") if isinstance(document.get("buyer"), Mapping) else {}
+    issue_date = document.get("issue_date") if isinstance(document.get("issue_date"), Mapping) else {}
+    due_date = document.get("due_date") if isinstance(document.get("due_date"), Mapping) else {}
     amounts = document.get("amounts") if isinstance(document.get("amounts"), Mapping) else {}
 
     invoice_total = _first_decimal(
@@ -335,6 +345,9 @@ def _context_from_document(
 
     vendor_master = raw_context.get("vendor_master") if isinstance(raw_context.get("vendor_master"), Mapping) else {}
     invoice_payment = raw_context.get("invoice_payment") if isinstance(raw_context.get("invoice_payment"), Mapping) else {}
+    vendor_aliases = vendor_master.get("aliases")
+    if not isinstance(vendor_aliases, list):
+        vendor_aliases = []
 
     previous_invoices = _previous_invoices(raw_context)
     duplicate_candidates = _duplicate_candidates(raw_context)
@@ -357,12 +370,22 @@ def _context_from_document(
         "vendor": {
             "name": vendor_master.get("vendor_name") or seller.get("name"),
             "normalized_name": normalize_vendor_name(vendor_master.get("vendor_name") or seller.get("name")),
+            "aliases": [str(value) for value in vendor_aliases if value],
+            "vendor_id": vendor_master.get("vendor_id"),
+            "tax_id": vendor_master.get("tax_id") or seller.get("tax_id"),
             "approved": True,
         },
         "buyer": {
             "name": buyer.get("name"),
             "normalized_name": normalize_vendor_name(buyer.get("name")),
         },
+        "invoice": {
+            "invoice_number": document.get("invoice_number"),
+            "normalized_invoice_number": normalize_invoice_number(document.get("invoice_number")),
+            "issue_date": issue_date.get("value"),
+            "due_date": due_date.get("value"),
+        },
+        "currency": document.get("currency"),
         "purchase_order": {
             "po_number": str(po_number or ""),
             "normalized": normalize_purchase_order(po_number),
@@ -499,6 +522,11 @@ def _date_value(value: Any) -> date | None:
         return date.fromisoformat(value.strip()[:10])
     except ValueError:
         return None
+
+
+def _date_text(value: Any) -> str | None:
+    parsed = _date_value(value)
+    return parsed.isoformat() if parsed else None
 
 
 def _candidate_po(value: Mapping[str, Any] | None) -> dict[str, Any] | None:

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
+from datetime import date
 from decimal import Decimal
+from difflib import SequenceMatcher
 from typing import Any
 
 from .ap_context import missing_procurement_context
@@ -60,6 +63,29 @@ def decide_invoice(
     confidence_check = _parse_confidence_check(invoice)
     checks.append(confidence_check)
 
+    parser_check = _parser_status_check(invoice)
+    checks.append(parser_check)
+    if parser_check["status"] != "pass":
+        return _decision(
+            "needs_review" if parser_check["status"] == "review" else "request_missing_info",
+            "low",
+            str(parser_check["summary"]),
+            "Resolve the parser review findings and re-parse the invoice before approval.",
+            checks,
+            invoice,
+            context,
+        )
+    if confidence_check["status"] == "review":
+        return _decision(
+            "needs_review",
+            _confidence_for_review(invoice),
+            str(confidence_check["summary"]),
+            "Validate the low-confidence fields against the source invoice before approval.",
+            checks,
+            invoice,
+            context,
+        )
+
     context_check = _context_check(context)
     checks.append(context_check)
     if context_check["status"] == "fail":
@@ -75,6 +101,42 @@ def decide_invoice(
 
     vendor_check = _vendor_check(invoice, context)
     checks.append(vendor_check)
+    if vendor_check["status"] != "pass":
+        return _decision(
+            "needs_review",
+            _confidence_for_review(invoice),
+            str(vendor_check["summary"]),
+            "Review vendor identity, aliases, and tax identifiers before approving payment.",
+            checks,
+            invoice,
+            context,
+        )
+
+    buyer_check = _buyer_check(invoice, context)
+    checks.append(buyer_check)
+    if buyer_check["status"] in {"fail", "review"}:
+        return _decision(
+            "needs_review",
+            _confidence_for_review(invoice),
+            str(buyer_check["summary"]),
+            "Confirm that the invoice is billed to the approved legal entity before approval.",
+            checks,
+            invoice,
+            context,
+        )
+
+    currency_check = _currency_check(invoice, context)
+    checks.append(currency_check)
+    if currency_check["status"] in {"fail", "review"}:
+        return _decision(
+            "needs_review",
+            _confidence_for_review(invoice),
+            str(currency_check["summary"]),
+            "Confirm invoice and purchase-order currency before comparing monetary amounts.",
+            checks,
+            invoice,
+            context,
+        )
 
     duplicate_check = _duplicate_check(invoice, context)
     checks.append(duplicate_check)
@@ -84,6 +146,32 @@ def decide_invoice(
             _confidence_for_review(invoice),
             "Invoice may duplicate a prior vendor invoice.",
             "Hold payment and compare the candidate prior invoice before posting.",
+            checks,
+            invoice,
+            context,
+        )
+
+    invoice_number_check = _expected_invoice_number_check(invoice, context)
+    checks.append(invoice_number_check)
+    if invoice_number_check["status"] == "fail":
+        return _decision(
+            "needs_review",
+            _confidence_for_review(invoice),
+            str(invoice_number_check["summary"]),
+            "Resolve the invoice-number mismatch against the matched accounts payable record.",
+            checks,
+            invoice,
+            context,
+        )
+
+    date_check = _date_check(invoice, context)
+    checks.append(date_check)
+    if date_check["status"] == "fail":
+        return _decision(
+            "needs_review",
+            _confidence_for_review(invoice),
+            str(date_check["summary"]),
+            "Resolve invoice or due-date differences against accounts payable context.",
             checks,
             invoice,
             context,
@@ -128,6 +216,19 @@ def decide_invoice(
             context,
         )
 
+    tax_check = _amount_composition_check(invoice, context)
+    checks.append(tax_check)
+    if tax_check["status"] in {"fail", "review"}:
+        return _decision(
+            "needs_review",
+            _confidence_for_review(invoice),
+            str(tax_check["summary"]),
+            "Reconcile subtotal, discounts, aggregate tax, shipping, payments, and balance due before approval.",
+            checks,
+            invoice,
+            context,
+        )
+
     partial_check = _partial_consumption_check(invoice, context)
     checks.append(partial_check)
     if partial_check["status"] == "pass":
@@ -136,6 +237,16 @@ def decide_invoice(
             _confidence_for_approval(invoice),
             "Invoice fits within the remaining PO balance after prior consumption.",
             "Approve the invoice and consume the remaining PO balance by the invoice amount.",
+            checks,
+            invoice,
+            context,
+        )
+    if partial_check["status"] in {"fail", "review"}:
+        return _decision(
+            "needs_review",
+            _confidence_for_review(invoice),
+            str(partial_check["summary"]),
+            "Resolve the remaining purchase-order balance before approval.",
             checks,
             invoice,
             context,
@@ -163,13 +274,12 @@ def decide_invoice(
             invoice,
             context,
         )
-
-    if vendor_check["status"] == "fail":
+    if amount_check["status"] == "review":
         return _decision(
             "needs_review",
             _confidence_for_review(invoice),
-            "Invoice vendor does not match the approved vendor context.",
-            "Review vendor master and PO ownership before approving payment.",
+            str(amount_check["summary"]),
+            "Load the missing expected amount and route the invoice for accounts payable review.",
             checks,
             invoice,
             context,
@@ -233,7 +343,31 @@ def _parse_confidence_check(invoice: dict[str, Any]) -> dict[str, Any]:
         summary,
         evidence={
             "confidence": invoice.get("confidence"),
+            "low_confidence_fields": low_fields if isinstance(low_fields, list) else [],
             "parse_warnings": invoice.get("parse_warnings"),
+        },
+    )
+
+
+def _parser_status_check(invoice: dict[str, Any]) -> dict[str, Any]:
+    parser_status = str(invoice.get("parser_status") or "unknown")
+    if parser_status == "parsed":
+        status = "pass"
+        summary = "Parser completed without review status."
+    elif parser_status == "needs_review":
+        status = "review"
+        summary = "Parser marked the invoice as needing review."
+    else:
+        status = "fail"
+        summary = f"Parser did not produce an approvable result ({parser_status})."
+    return _check(
+        "parser_status",
+        status,
+        summary,
+        evidence={
+            "parser_status": parser_status,
+            "parse_warnings": invoice.get("parse_warnings"),
+            "missing_fields": invoice.get("missing_fields"),
         },
     )
 
@@ -260,23 +394,144 @@ def _context_check(context: dict[str, Any]) -> dict[str, Any]:
 def _vendor_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     invoice_vendor = _invoice_vendor(invoice)
     context_vendor = context.get("vendor") if isinstance(context.get("vendor"), dict) else {}
-    if not context_vendor.get("normalized_name"):
+    approved_vendor = str(
+        context_vendor.get("normalized_name")
+        or normalize_vendor_name(context_vendor.get("name"))
+    )
+    aliases = context_vendor.get("aliases") if isinstance(context_vendor.get("aliases"), list) else []
+    normalized_aliases = {
+        normalize_vendor_name(value)
+        for value in aliases
+        if normalize_vendor_name(value)
+    }
+    invoice_tax_ids = _invoice_tax_ids(invoice)
+    context_tax_id = _normalize_tax_identifier(context_vendor.get("tax_id"))
+    tax_id_match = bool(context_tax_id and context_tax_id in invoice_tax_ids)
+    invoice_vendor_ids = _invoice_vendor_ids(invoice)
+    context_vendor_id = _normalize_identifier(context_vendor.get("vendor_id"))
+    vendor_id_match = bool(context_vendor_id and context_vendor_id in invoice_vendor_ids)
+    if not approved_vendor and not normalized_aliases and not context_tax_id and not context_vendor_id:
         return _check(
             "vendor_match",
             "review",
-            "No approved vendor name is available in accounts payable context.",
-            evidence={"invoice_vendor": invoice_vendor},
+            "No approved vendor identity is available in accounts payable context.",
+            evidence={
+                "invoice_vendor": invoice_vendor,
+                "invoice_tax_ids": sorted(invoice_tax_ids),
+                "invoice_vendor_ids": sorted(invoice_vendor_ids),
+            },
             context={"vendor": context_vendor},
         )
-    status = "pass" if invoice_vendor == context_vendor.get("normalized_name") else "fail"
+    exact_name_match = bool(invoice_vendor and invoice_vendor == approved_vendor)
+    alias_match = bool(invoice_vendor and invoice_vendor in normalized_aliases)
+    candidates = [approved_vendor, *sorted(normalized_aliases)]
+    similarity = max(
+        (SequenceMatcher(None, invoice_vendor, candidate).ratio() for candidate in candidates if candidate),
+        default=0.0,
+    )
+    if exact_name_match:
+        status = "pass"
+        summary = "Invoice vendor matches approved vendor."
+        match_method = "normalized_name"
+    elif alias_match:
+        status = "pass"
+        summary = "Invoice vendor matches an approved vendor alias."
+        match_method = "approved_alias"
+    elif tax_id_match:
+        status = "pass"
+        summary = "Invoice vendor tax identifier matches approved vendor."
+        match_method = "tax_id"
+    elif vendor_id_match:
+        status = "pass"
+        summary = "Invoice vendor identifier matches approved vendor."
+        match_method = "vendor_id"
+    elif similarity >= 0.85:
+        status = "review"
+        summary = "Invoice vendor is a close fuzzy match and requires identity review."
+        match_method = "fuzzy_name"
+    else:
+        status = "fail"
+        summary = "Invoice vendor does not match approved vendor."
+        match_method = "none"
     return _check(
         "vendor_match",
         status,
-        "Invoice vendor matches approved vendor."
+        summary,
+        evidence={
+            **_invoice_evidence(invoice, "vendor"),
+            "normalized_vendor": invoice_vendor,
+            "tax_ids": sorted(invoice_tax_ids),
+            "vendor_ids": sorted(invoice_vendor_ids),
+        },
+        context={
+            "vendor": context_vendor,
+            "match_method": match_method,
+            "similarity": round(similarity, 3),
+        },
+    )
+
+
+def _buyer_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    invoice_buyer = _invoice_buyer(invoice)
+    context_buyer = context.get("buyer") if isinstance(context.get("buyer"), dict) else {}
+    expected_buyer = str(
+        context_buyer.get("normalized_name")
+        or normalize_vendor_name(context_buyer.get("name"))
+    )
+    if not expected_buyer:
+        return _check(
+            "buyer_match",
+            "not_applicable",
+            "Accounts payable context does not specify an expected buyer.",
+            evidence=_invoice_evidence(invoice, "buyer"),
+        )
+    status = "pass" if invoice_buyer == expected_buyer else "fail"
+    return _check(
+        "buyer_match",
+        status,
+        "Invoice buyer matches the approved bill-to entity."
         if status == "pass"
-        else "Invoice vendor does not match approved vendor.",
-        evidence=_invoice_evidence(invoice, "vendor"),
-        context={"vendor": context_vendor},
+        else "Invoice buyer does not match the approved bill-to entity.",
+        evidence={**_invoice_evidence(invoice, "buyer"), "normalized_buyer": invoice_buyer},
+        context={"buyer": context_buyer},
+    )
+
+
+def _currency_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    invoice_currency = _invoice_currency(invoice)
+    expected_currency = _context_currency(context)
+    money_currencies = _invoice_money_currencies(invoice)
+    inconsistent = sorted(value for value in money_currencies if value != invoice_currency)
+    if inconsistent:
+        return _check(
+            "currency_match",
+            "fail",
+            "Invoice monetary fields contain inconsistent currencies.",
+            evidence={
+                **_invoice_evidence(invoice, "currency", "amount_due"),
+                "invoice_currency": invoice_currency,
+                "money_currencies": sorted(money_currencies),
+            },
+        )
+    if not expected_currency:
+        return _check(
+            "currency_match",
+            "not_applicable",
+            "Accounts payable context does not specify an expected currency.",
+            evidence={**_invoice_evidence(invoice, "currency"), "invoice_currency": invoice_currency},
+        )
+    status = "pass" if invoice_currency == expected_currency else "fail"
+    return _check(
+        "currency_match",
+        status,
+        "Invoice currency matches accounts payable context."
+        if status == "pass"
+        else "Invoice currency does not match accounts payable context.",
+        evidence={
+            **_invoice_evidence(invoice, "currency", "amount_due"),
+            "invoice_currency": invoice_currency,
+        },
+        context={"expected_currency": expected_currency},
     )
 
 
@@ -310,6 +565,65 @@ def _duplicate_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[s
         "No duplicate invoice candidate matched.",
         evidence=_invoice_evidence(invoice, "invoice_number"),
         context={"candidate_count": len(candidates)},
+    )
+
+
+def _expected_invoice_number_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    actual = _invoice_number(invoice)
+    expected = _context_invoice_number(context)
+    if not expected:
+        return _check(
+            "invoice_number_match",
+            "not_applicable",
+            "Accounts payable context does not specify an expected invoice number.",
+            evidence=_invoice_evidence(invoice, "invoice_number"),
+        )
+    status = "pass" if actual == expected else "fail"
+    return _check(
+        "invoice_number_match",
+        status,
+        "Invoice number matches the accounts payable record."
+        if status == "pass"
+        else "Invoice number does not match the accounts payable record.",
+        evidence={**_invoice_evidence(invoice, "invoice_number"), "normalized_invoice_number": actual},
+        context={"expected_normalized_invoice_number": expected},
+    )
+
+
+def _date_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    expected_invoice = context.get("invoice") if isinstance(context.get("invoice"), dict) else {}
+    expected_issue = _normalize_date(
+        expected_invoice.get("issue_date") or context.get("issue_date")
+    )
+    expected_due = _normalize_date(
+        expected_invoice.get("due_date") or context.get("due_date")
+    )
+    actual_issue = _invoice_date(invoice, "issue_date")
+    actual_due = _invoice_date(invoice, "due_date")
+    mismatches: list[str] = []
+    if expected_issue and expected_issue not in _invoice_date_candidates(invoice, "issue_date"):
+        mismatches.append("issue_date")
+    if expected_due and expected_due not in _invoice_date_candidates(invoice, "due_date"):
+        mismatches.append("due_date")
+    if not expected_issue and not expected_due:
+        status = "not_applicable"
+        summary = "Accounts payable context does not specify expected invoice dates."
+    elif mismatches:
+        status = "fail"
+        summary = f"Invoice date fields do not match accounts payable context: {', '.join(mismatches)}."
+    else:
+        status = "pass"
+        summary = "Invoice dates match accounts payable context."
+    return _check(
+        "date_match",
+        status,
+        summary,
+        evidence={
+            **_invoice_evidence(invoice, "issue_date", "due_date"),
+            "issue_date": actual_issue,
+            "due_date": actual_due,
+        },
+        context={"issue_date": expected_issue, "due_date": expected_due},
     )
 
 
@@ -425,6 +739,102 @@ def _purchase_order_check(invoice: dict[str, Any], context: dict[str, Any]) -> d
         "Invoice purchase order matches accounts payable context.",
         evidence=_invoice_evidence(invoice, "purchase_order"),
         context={"purchase_order": context.get("purchase_order")},
+    )
+
+
+def _amount_composition_check(invoice: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    amounts = invoice.get("amounts") if isinstance(invoice.get("amounts"), dict) else {}
+    subtotal = money_decimal(amounts.get("subtotal"))
+    balance_due = _invoice_amount(invoice)
+    if subtotal is None:
+        return _check(
+            "amount_composition",
+            "not_applicable",
+            "Invoice does not expose a subtotal for amount composition reconciliation.",
+            evidence=_invoice_evidence(invoice, "amount_due"),
+        )
+    if balance_due is None:
+        return _check(
+            "amount_composition",
+            "review",
+            "Invoice balance due is unavailable for amount composition reconciliation.",
+            evidence=_invoice_evidence(invoice, "amount_due"),
+        )
+
+    components = {
+        key: money_decimal(amounts.get(key)) or Decimal("0.00")
+        for key in ("discount", "tax", "shipping", "paid")
+    }
+    calculated_balance = (
+        subtotal
+        - components["discount"]
+        + components["tax"]
+        + components["shipping"]
+        - components["paid"]
+    ).quantize(Decimal("0.01"))
+    composition_variance = (balance_due - calculated_balance).quantize(Decimal("0.01"))
+
+    context_amounts = context.get("amounts") if isinstance(context.get("amounts"), dict) else {}
+    component_mismatches: dict[str, dict[str, str | None]] = {}
+    for key in ("subtotal", "discount", "tax", "shipping", "paid", "balance_due"):
+        actual = balance_due if key == "balance_due" else money_decimal(amounts.get(key))
+        expected = money_decimal(context_amounts.get(key))
+        if expected is None:
+            continue
+        if actual is None:
+            if expected != Decimal("0.00"):
+                component_mismatches[key] = {"actual": None, "expected": str(expected)}
+            continue
+        if abs(actual - expected) <= Decimal("0.01"):
+            continue
+        component_mismatches[key] = {"actual": str(actual), "expected": str(expected)}
+
+    line_items = invoice.get("line_items") if isinstance(invoice.get("line_items"), list) else []
+    line_total = sum(
+        (
+            money_decimal(item.get("amount")) or Decimal("0.00")
+            for item in line_items
+            if isinstance(item, dict)
+        ),
+        Decimal("0.00"),
+    ).quantize(Decimal("0.01"))
+    has_line_amounts = any(
+        isinstance(item, dict) and money_decimal(item.get("amount")) is not None
+        for item in line_items
+    )
+    line_variance = (line_total - subtotal).quantize(Decimal("0.01")) if has_line_amounts else None
+
+    failures: list[str] = []
+    if abs(composition_variance) > Decimal("0.01"):
+        failures.append("summary arithmetic")
+    if component_mismatches:
+        failures.append("accounts payable amount components")
+    if line_variance is not None and abs(line_variance) > Decimal("0.01"):
+        failures.append("line-item subtotal")
+    status = "fail" if failures else "pass"
+    summary = (
+        f"Invoice amount composition does not reconcile: {', '.join(failures)}."
+        if failures
+        else "Subtotal, discounts, aggregate tax, shipping, payments, and balance due reconcile."
+    )
+    return _check(
+        "amount_composition",
+        status,
+        summary,
+        evidence={
+            "subtotal": str(subtotal),
+            "discount": str(components["discount"]),
+            "tax": str(components["tax"]),
+            "shipping": str(components["shipping"]),
+            "paid": str(components["paid"]),
+            "balance_due": str(balance_due),
+            "calculated_balance": str(calculated_balance),
+            "composition_variance": str(composition_variance),
+            "line_item_total": str(line_total) if has_line_amounts else None,
+            "line_item_variance": str(line_variance) if line_variance is not None else None,
+            **_invoice_evidence(invoice, "amount_due"),
+        },
+        context={"component_mismatches": component_mismatches},
     )
 
 
@@ -574,6 +984,143 @@ def _invoice_number(invoice: dict[str, Any]) -> str:
 def _invoice_vendor(invoice: dict[str, Any]) -> str:
     field = invoice.get("vendor") if isinstance(invoice.get("vendor"), dict) else {}
     return str(field.get("normalized_name") or normalize_vendor_name(field.get("name")))
+
+
+def _invoice_buyer(invoice: dict[str, Any]) -> str:
+    field = invoice.get("buyer") if isinstance(invoice.get("buyer"), dict) else {}
+    return str(field.get("normalized_name") or normalize_vendor_name(field.get("name")))
+
+
+def _invoice_tax_ids(invoice: dict[str, Any]) -> set[str]:
+    field = invoice.get("vendor") if isinstance(invoice.get("vendor"), dict) else {}
+    raw_ids = field.get("tax_ids") if isinstance(field.get("tax_ids"), list) else []
+    return {
+        normalized
+        for value in raw_ids
+        if (normalized := _normalize_tax_identifier(value))
+    }
+
+
+def _invoice_vendor_ids(invoice: dict[str, Any]) -> set[str]:
+    field = invoice.get("vendor") if isinstance(invoice.get("vendor"), dict) else {}
+    raw_ids = field.get("vendor_ids") if isinstance(field.get("vendor_ids"), list) else []
+    return {
+        normalized
+        for value in raw_ids
+        if (normalized := _normalize_identifier(value))
+    }
+
+
+def _normalize_identifier(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def _normalize_tax_identifier(value: Any) -> str:
+    text = re.sub(
+        r"\b(?:TAX\s*ID|VAT|GSTIN|GST|EIN)\b",
+        "",
+        str(value or "").upper(),
+    )
+    normalized = _normalize_identifier(text)
+    if re.fullmatch(r"[A-Z]{2}\d{5,}", normalized):
+        return normalized[2:]
+    return normalized
+
+
+def _invoice_currency(invoice: dict[str, Any]) -> str:
+    currency = invoice.get("currency") if isinstance(invoice.get("currency"), dict) else {}
+    amount_due = invoice.get("amount_due") if isinstance(invoice.get("amount_due"), dict) else {}
+    return str(currency.get("value") or amount_due.get("currency") or "").strip().upper()
+
+
+def _context_currency(context: dict[str, Any]) -> str:
+    purchase_order = context.get("purchase_order") if isinstance(context.get("purchase_order"), dict) else {}
+    raw_ap = context.get("raw_ap_context") if isinstance(context.get("raw_ap_context"), dict) else {}
+    raw_values = raw_ap.get("context") if isinstance(raw_ap.get("context"), dict) else {}
+    context_currency = context.get("currency")
+    if isinstance(context_currency, dict):
+        context_currency = context_currency.get("value") or context_currency.get("code")
+    po_currency = purchase_order.get("currency")
+    if isinstance(po_currency, dict):
+        po_currency = po_currency.get("value") or po_currency.get("code")
+    return str(
+        context_currency
+        or po_currency
+        or raw_values.get("currency")
+        or raw_values.get("invoice_currency")
+        or raw_values.get("po_currency")
+        or raw_values.get("expected_currency")
+        or ""
+    ).strip().upper()
+
+
+def _invoice_money_currencies(invoice: dict[str, Any]) -> set[str]:
+    currencies: set[str] = set()
+    amounts = invoice.get("amounts") if isinstance(invoice.get("amounts"), dict) else {}
+    for value in amounts.values():
+        if isinstance(value, dict) and value.get("currency"):
+            currencies.add(str(value["currency"]).strip().upper())
+    line_items = invoice.get("line_items") if isinstance(invoice.get("line_items"), list) else []
+    for item in line_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("currency"):
+            currencies.add(str(item["currency"]).strip().upper())
+        for key in ("unit_price", "amount"):
+            value = item.get(key)
+            if isinstance(value, dict) and value.get("currency"):
+                currencies.add(str(value["currency"]).strip().upper())
+    return currencies
+
+
+def _context_invoice_number(context: dict[str, Any]) -> str:
+    invoice_context = context.get("invoice") if isinstance(context.get("invoice"), dict) else {}
+    expected = (
+        invoice_context.get("normalized_invoice_number")
+        or invoice_context.get("invoice_number")
+        or context.get("normalized_invoice_number")
+        or context.get("invoice_number")
+    )
+    return normalize_invoice_number(expected)
+
+
+def _invoice_date(invoice: dict[str, Any], key: str) -> str | None:
+    field = invoice.get(key) if isinstance(invoice.get(key), dict) else {}
+    return _normalize_date(field.get("value"))
+
+
+def _invoice_date_candidates(invoice: dict[str, Any], key: str) -> set[str]:
+    candidates = {value for value in [_invoice_date(invoice, key)] if value}
+    field = invoice.get(key) if isinstance(invoice.get(key), dict) else {}
+    evidence = field.get("evidence") if isinstance(field.get("evidence"), dict) else {}
+    raw = str(field.get("raw") or evidence.get("raw") or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 8:
+        day, month, year = digits[:2], digits[2:4], digits[4:]
+        for candidate in (f"{year}-{month}-{day}", f"{year}-{day}-{month}"):
+            normalized = _normalize_date(candidate)
+            if normalized:
+                candidates.add(normalized)
+    elif len(digits) == 6:
+        day, month, short_year = digits[:2], digits[2:4], digits[4:]
+        year = f"20{short_year}"
+        for candidate in (f"{year}-{month}-{day}", f"{year}-{day}-{month}"):
+            normalized = _normalize_date(candidate)
+            if normalized:
+                candidates.add(normalized)
+    return candidates
+
+
+def _normalize_date(value: Any) -> str | None:
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        return text
 
 
 def _invoice_po(invoice: dict[str, Any]) -> str:
