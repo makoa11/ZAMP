@@ -57,58 +57,108 @@ def login_page(
         notice = f'<div class="notice notice-{_e(message_kind)}" role="status">{_e(message)}</div>'
 
     body = f"""
-<main class="auth-shell">
-  <section class="login-panel" aria-labelledby="login-title">
-    <div class="brand-row">
-      <div class="brand-mark" aria-hidden="true">Z</div>
-      <div>
-        <p class="eyebrow">ZAMP</p>
-        <h1 id="login-title">Sign in</h1>
+<main class="auth-shell auth-shell-split">
+  <section class="auth-layout">
+    <aside class="auth-aside" aria-label="ZAMP overview">
+      <div class="auth-brand">
+        <div class="brand-mark" aria-hidden="true">Z</div>
+        <div>
+          <p class="eyebrow">ZAMP</p>
+          <p class="auth-brand-line">Invoice operations</p>
+        </div>
       </div>
-    </div>
 
-    <div class="tabs" role="tablist" aria-label="Sign in method">
-      <a class="tab{' active' if password_active else ''}" href="/login?mode=password" role="tab" aria-selected="{str(password_active).lower()}">Password</a>
-      <a class="tab{' active' if otp_active else ''}" href="/login?mode=otp" role="tab" aria-selected="{str(otp_active).lower()}">Email OTP</a>
-    </div>
-
-    {notice}
-
-    <form class="form{' hidden' if not (password_active and not email_verification_active) else ''}" method="post" action="/login">
-      <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
-      <input type="hidden" name="action" value="password">
-      <label for="password-email">Email</label>
-      <input id="password-email" name="email" type="email" autocomplete="email" required>
-
-      <label for="password">Password</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required>
-
-      <button type="submit">Sign in</button>
-    </form>
-
-    <form class="form{' hidden' if not (otp_active and not email_verification_active) else ''}" method="post" action="/login">
-      <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
-      <label for="otp-email">Email</label>
-      <input id="otp-email" name="email" type="email" autocomplete="email" value="{_e(otp_email)}" required>
-      <label for="otp-code">Code</label>
-      <input id="otp-code" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="10" required>
-      <div class="button-row">
-        <button type="submit" name="action" value="otp_send" formnovalidate>Send code</button>
-        <button type="submit" name="action" value="otp_verify">Verify code</button>
+      <div class="auth-copy">
+        <p class="auth-kicker">Calm workflow</p>
+        <h1 class="auth-hero-title">Review invoices with structure, context, and clear next steps.</h1>
+        <p class="auth-hero-text">
+          Keep the queue, decision reasoning, and source document aligned so approvers can move quickly
+          without losing confidence.
+        </p>
       </div>
-    </form>
 
-    <form class="form{' hidden' if not email_verification_active else ''}" method="post" action="/login">
-      <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
-      <input type="hidden" name="action" value="email_verification_verify">
-      <label for="login-email-verification-email">Email</label>
-      <input id="login-email-verification-email" name="email" type="email" autocomplete="email" value="{_e(email_verification_email)}" required>
-      <label for="login-email-verification-code">Verification code</label>
-      <input id="login-email-verification-code" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="10" required>
-      <button type="submit">Verify account</button>
-    </form>
+      <div class="auth-feature-list" aria-label="Product highlights">
+        <div class="auth-feature-card">
+          <span class="auth-feature-index">01</span>
+          <div>
+            <h2>Focused triage</h2>
+            <p>Needs review, accepted items, and date filtering stay in one view.</p>
+          </div>
+        </div>
+        <div class="auth-feature-card">
+          <span class="auth-feature-index">02</span>
+          <div>
+            <h2>Decision support</h2>
+            <p>Checks already completed and missing context are separated clearly.</p>
+          </div>
+        </div>
+        <div class="auth-feature-card">
+          <span class="auth-feature-index">03</span>
+          <div>
+            <h2>Document traceability</h2>
+            <p>The PDF, normalized data, and audit reasoning remain connected.</p>
+          </div>
+        </div>
+      </div>
+    </aside>
 
-    <p class="switch-line">Need an account? <a href="/signup">Create one</a></p>
+    <section class="login-panel auth-card" aria-labelledby="login-title">
+      <div class="auth-card-header">
+        <div class="brand-row">
+          <div class="brand-mark brand-mark-soft" aria-hidden="true">Z</div>
+          <div>
+            <p class="eyebrow">Welcome back</p>
+            <h1 id="login-title">Sign in</h1>
+          </div>
+        </div>
+        <a class="auth-switch-chip" href="/signup">Create account</a>
+      </div>
+
+      <p class="auth-panel-copy">Choose your sign-in method and continue to the invoice queue.</p>
+
+      <div class="tabs" role="tablist" aria-label="Sign in method">
+        <a class="tab{' active' if password_active else ''}" href="/login?mode=password" role="tab" aria-selected="{str(password_active).lower()}">Password</a>
+        <a class="tab{' active' if otp_active else ''}" href="/login?mode=otp" role="tab" aria-selected="{str(otp_active).lower()}">Email OTP</a>
+      </div>
+
+      {notice}
+
+      <form class="form{' hidden' if not (password_active and not email_verification_active) else ''}" method="post" action="/login">
+        <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
+        <input type="hidden" name="action" value="password">
+        <label for="password-email">Email</label>
+        <input id="password-email" name="email" type="email" autocomplete="email" required>
+
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+
+        <button type="submit">Sign in</button>
+      </form>
+
+      <form class="form{' hidden' if not (otp_active and not email_verification_active) else ''}" method="post" action="/login">
+        <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
+        <label for="otp-email">Email</label>
+        <input id="otp-email" name="email" type="email" autocomplete="email" value="{_e(otp_email)}" required>
+        <label for="otp-code">Code</label>
+        <input id="otp-code" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="10" required>
+        <div class="button-row">
+          <button type="submit" name="action" value="otp_send" formnovalidate>Send code</button>
+          <button type="submit" name="action" value="otp_verify">Verify code</button>
+        </div>
+      </form>
+
+      <form class="form{' hidden' if not email_verification_active else ''}" method="post" action="/login">
+        <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
+        <input type="hidden" name="action" value="email_verification_verify">
+        <label for="login-email-verification-email">Email</label>
+        <input id="login-email-verification-email" name="email" type="email" autocomplete="email" value="{_e(email_verification_email)}" required>
+        <label for="login-email-verification-code">Verification code</label>
+        <input id="login-email-verification-code" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="10" required>
+        <button type="submit">Verify account</button>
+      </form>
+
+      <p class="switch-line">Need an account? <a href="/signup">Create one</a></p>
+    </section>
   </section>
 </main>
 """
@@ -132,72 +182,122 @@ def signup_page(
         notice = f'<div class="notice notice-{_e(message_kind)}" role="status">{_e(message)}</div>'
 
     body = f"""
-<main class="auth-shell">
-  <section class="login-panel" aria-labelledby="signup-title">
-    <div class="brand-row">
-      <div class="brand-mark" aria-hidden="true">Z</div>
-      <div>
-        <p class="eyebrow">ZAMP</p>
-        <h1 id="signup-title">Create account</h1>
-      </div>
-    </div>
-
-    <div class="tabs" role="tablist" aria-label="Signup method">
-      <a class="tab{' active' if password_active else ''}" href="/signup?mode=password" role="tab" aria-selected="{str(password_active).lower()}">Password</a>
-      <a class="tab{' active' if otp_active else ''}" href="/signup?mode=otp" role="tab" aria-selected="{str(otp_active).lower()}">Email OTP</a>
-    </div>
-
-    {notice}
-
-    <form class="form{' hidden' if not (password_active and not email_verification_active) else ''}" method="post" action="/signup">
-      <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
-      <input type="hidden" name="action" value="password">
-      <div class="name-grid">
+<main class="auth-shell auth-shell-split">
+  <section class="auth-layout">
+    <aside class="auth-aside" aria-label="ZAMP overview">
+      <div class="auth-brand">
+        <div class="brand-mark" aria-hidden="true">Z</div>
         <div>
-          <label for="signup-first-name">First name</label>
-          <input id="signup-first-name" name="first_name" type="text" autocomplete="given-name">
-        </div>
-        <div>
-          <label for="signup-last-name">Last name</label>
-          <input id="signup-last-name" name="last_name" type="text" autocomplete="family-name">
+          <p class="eyebrow">ZAMP</p>
+          <p class="auth-brand-line">Invoice operations</p>
         </div>
       </div>
 
-      <label for="signup-email">Email</label>
-      <input id="signup-email" name="email" type="email" autocomplete="email" required>
-
-      <label for="signup-password">Password</label>
-      <input id="signup-password" name="password" type="password" autocomplete="new-password" minlength="10" required>
-
-      <label for="signup-password-confirm">Confirm password</label>
-      <input id="signup-password-confirm" name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
-
-      <button type="submit">Create account</button>
-    </form>
-
-    <form class="form{' hidden' if not (otp_active and not email_verification_active) else ''}" method="post" action="/signup">
-      <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
-      <label for="signup-otp-email">Email</label>
-      <input id="signup-otp-email" name="email" type="email" autocomplete="email" value="{_e(otp_email)}" required>
-      <label for="signup-otp-code">Code</label>
-      <input id="signup-otp-code" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="10" required>
-      <div class="button-row">
-        <button type="submit" name="action" value="otp_send" formnovalidate>Send code</button>
-        <button type="submit" name="action" value="otp_verify">Verify code</button>
+      <div class="auth-copy">
+        <p class="auth-kicker">Structured onboarding</p>
+        <h1 class="auth-hero-title">Set up an account that fits the review workflow from day one.</h1>
+        <p class="auth-hero-text">
+          Start with password or email OTP and keep the same calm review experience across the queue,
+          evidence, and approval steps.
+        </p>
       </div>
-    </form>
 
-    <form class="form{' hidden' if not email_verification_active else ''}" method="post" action="/signup">
-      <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
-      <input type="hidden" name="action" value="email_verification_verify">
-      <label for="signup-email-verification-email">Email</label>
-      <input id="signup-email-verification-email" name="email" type="email" autocomplete="email" value="{_e(email_verification_email)}" required>
-      <label for="signup-email-verification-code">Verification code</label>
-      <input id="signup-email-verification-code" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="10" required>
-      <button type="submit">Verify account</button>
-    </form>
+      <div class="auth-feature-list" aria-label="Product highlights">
+        <div class="auth-feature-card">
+          <span class="auth-feature-index">01</span>
+          <div>
+            <h2>Shared queue</h2>
+            <p>Managers and reviewers can work through the same invoice state model.</p>
+          </div>
+        </div>
+        <div class="auth-feature-card">
+          <span class="auth-feature-index">02</span>
+          <div>
+            <h2>Action clarity</h2>
+            <p>Each invoice highlights what is done, what is missing, and what to do next.</p>
+          </div>
+        </div>
+        <div class="auth-feature-card">
+          <span class="auth-feature-index">03</span>
+          <div>
+            <h2>Audit trail</h2>
+            <p>Supporting details remain attached to every decision and document.</p>
+          </div>
+        </div>
+      </div>
+    </aside>
 
-    <p class="switch-line">Already have an account? <a href="/login">Sign in</a></p>
+    <section class="login-panel auth-card" aria-labelledby="signup-title">
+      <div class="auth-card-header">
+        <div class="brand-row">
+          <div class="brand-mark brand-mark-soft" aria-hidden="true">Z</div>
+          <div>
+            <p class="eyebrow">Account setup</p>
+            <h1 id="signup-title">Create account</h1>
+          </div>
+        </div>
+        <a class="auth-switch-chip" href="/login">Sign in</a>
+      </div>
+
+      <p class="auth-panel-copy">Choose a signup method and create access to the invoice workspace.</p>
+
+      <div class="tabs" role="tablist" aria-label="Signup method">
+        <a class="tab{' active' if password_active else ''}" href="/signup?mode=password" role="tab" aria-selected="{str(password_active).lower()}">Password</a>
+        <a class="tab{' active' if otp_active else ''}" href="/signup?mode=otp" role="tab" aria-selected="{str(otp_active).lower()}">Email OTP</a>
+      </div>
+
+      {notice}
+
+      <form class="form{' hidden' if not (password_active and not email_verification_active) else ''}" method="post" action="/signup">
+        <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
+        <input type="hidden" name="action" value="password">
+        <div class="name-grid">
+          <div>
+            <label for="signup-first-name">First name</label>
+            <input id="signup-first-name" name="first_name" type="text" autocomplete="given-name">
+          </div>
+          <div>
+            <label for="signup-last-name">Last name</label>
+            <input id="signup-last-name" name="last_name" type="text" autocomplete="family-name">
+          </div>
+        </div>
+
+        <label for="signup-email">Email</label>
+        <input id="signup-email" name="email" type="email" autocomplete="email" required>
+
+        <label for="signup-password">Password</label>
+        <input id="signup-password" name="password" type="password" autocomplete="new-password" minlength="10" required>
+
+        <label for="signup-password-confirm">Confirm password</label>
+        <input id="signup-password-confirm" name="password_confirm" type="password" autocomplete="new-password" minlength="10" required>
+
+        <button type="submit">Create account</button>
+      </form>
+
+      <form class="form{' hidden' if not (otp_active and not email_verification_active) else ''}" method="post" action="/signup">
+        <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
+        <label for="signup-otp-email">Email</label>
+        <input id="signup-otp-email" name="email" type="email" autocomplete="email" value="{_e(otp_email)}" required>
+        <label for="signup-otp-code">Code</label>
+        <input id="signup-otp-code" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="10" required>
+        <div class="button-row">
+          <button type="submit" name="action" value="otp_send" formnovalidate>Send code</button>
+          <button type="submit" name="action" value="otp_verify">Verify code</button>
+        </div>
+      </form>
+
+      <form class="form{' hidden' if not email_verification_active else ''}" method="post" action="/signup">
+        <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
+        <input type="hidden" name="action" value="email_verification_verify">
+        <label for="signup-email-verification-email">Email</label>
+        <input id="signup-email-verification-email" name="email" type="email" autocomplete="email" value="{_e(email_verification_email)}" required>
+        <label for="signup-email-verification-code">Verification code</label>
+        <input id="signup-email-verification-code" name="code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" maxlength="10" required>
+        <button type="submit">Verify account</button>
+      </form>
+
+      <p class="switch-line">Already have an account? <a href="/login">Sign in</a></p>
+    </section>
   </section>
 </main>
 """
@@ -238,7 +338,7 @@ def dashboard_page(
     </div>
     <div class="topbar-actions">
       <a class="button-link secondary-link" href="/invoice-samples">Invoice samples</a>
-      <form method="post" action="/logout">
+      <form class="logout-form" method="post" action="/logout">
         <input type="hidden" name="_csrf" value="{_e(csrf_token)}">
         <button class="secondary" type="submit">Log out</button>
       </form>

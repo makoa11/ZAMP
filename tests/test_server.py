@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.server import ZampHTTPServer, ZampRequestHandler, _filter_invoice_items
+from app.templates import login_page, signup_page
 
 
 class TestSocket:
@@ -33,6 +34,19 @@ class TestSocket:
 
 
 class ServerRouteTests(unittest.TestCase):
+    def test_auth_pages_use_refreshed_split_layout(self) -> None:
+        login_html = login_page(csrf_token="csrf")
+        signup_html = signup_page(csrf_token="csrf")
+
+        self.assertIn('class="auth-shell auth-shell-split"', login_html)
+        self.assertIn('class="auth-layout"', login_html)
+        self.assertIn("Review invoices with structure, context, and clear next steps.", login_html)
+        self.assertIn('class="auth-switch-chip" href="/signup"', login_html)
+
+        self.assertIn('class="auth-shell auth-shell-split"', signup_html)
+        self.assertIn("Set up an account that fits the review workflow from day one.", signup_html)
+        self.assertIn('class="auth-switch-chip" href="/login"', signup_html)
+
     def test_client_disconnect_during_response_is_ignored(self) -> None:
         class Handler(ZampRequestHandler):
             def log_message(self, format: str, *args: object) -> None:
