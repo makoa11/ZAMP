@@ -1566,7 +1566,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_gmail_pubsub_webhook(self, parsed: Any) -> None:
-        if not self._valid_gmail_pubsub_auth():
+        if not self._valid_gmail_pubsub_auth(parsed):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid Gmail webhook authentication."})
             return
         try:
@@ -2149,7 +2149,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         separator = "&" if "?" in self.config.mail_frontend_redirect_url else "?"
         return self.config.mail_frontend_redirect_url + separator + urlencode(params)
 
-    def _valid_gmail_pubsub_auth(self) -> bool:
+    def _valid_gmail_pubsub_auth(self, parsed: Any | None = None) -> bool:
         authorization = self.headers.get("Authorization")
         if authorization and authorization.lower().startswith("bearer "):
             token = authorization[7:].strip()
@@ -2177,6 +2177,10 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             self.headers.get("X-Zamp-Gmail-Webhook-Secret"),
             self.headers.get("X-Zamp-Webhook-Secret"),
         ]
+        if parsed is not None:
+            query_secret = parse_qs(parsed.query).get("secret", [None])[-1]
+            if isinstance(query_secret, str):
+                candidates.append(query_secret)
         return any(
             hmac.compare_digest(candidate, expected_secret)
             for candidate in candidates

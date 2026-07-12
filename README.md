@@ -166,7 +166,7 @@ Frontend-facing APIs:
 
 Provider webhooks:
 
-- Gmail Pub/Sub push target: `POST /webhooks/gmail/pubsub` with a Google-signed OIDC bearer token. Configure its audience and service-account email with `GMAIL_PUBSUB_OIDC_AUDIENCE` and `GMAIL_PUBSUB_OIDC_SERVICE_ACCOUNT_EMAIL`. `X-Zamp-Webhook-Secret` is available as a header-only fallback.
+- Gmail Pub/Sub push target: `POST /webhooks/gmail/pubsub` with a Google-signed OIDC bearer token. Configure its audience and service-account email with `GMAIL_PUBSUB_OIDC_AUDIENCE` and `GMAIL_PUBSUB_OIDC_SERVICE_ACCOUNT_EMAIL`. `X-Zamp-Webhook-Secret` is available as a header fallback. A `?secret=...` query parameter is also accepted for backward compatibility, but it is less safe because it can leak into request logs.
 - Outlook Graph notification target: `POST /webhooks/outlook`; notifications are validated with Graph `clientState`.
 
 Run the ingestion worker:

@@ -191,7 +191,8 @@ class MailRepositoryJobQueueTests(unittest.TestCase):
             ),
         )
         self.assertIn("parse_results.parser_version IS DISTINCT FROM %s", database.last_sql)
-        self.assertIn("'parse-pdf:' || stale.attachment_id || ':' || %s", database.last_sql)
+        self.assertIn("'parser_version', %s::text", database.last_sql)
+        self.assertIn("'parse-pdf:' || stale.attachment_id || ':' || %s::text", database.last_sql)
 
     def test_completed_durable_job_leaves_queue_and_blocks_reenqueue(self) -> None:
         database = FakeMailDatabase()

@@ -560,7 +560,7 @@ class ServerRouteTests(unittest.TestCase):
             mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}}
         )
 
-    def test_gmail_webhook_rejects_query_secret(self) -> None:
+    def test_gmail_webhook_accepts_query_secret_for_compatibility(self) -> None:
         class MailIntegration:
             def __init__(self) -> None:
                 self.payload: dict[str, object] | None = None
@@ -594,8 +594,10 @@ class ServerRouteTests(unittest.TestCase):
         Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
         response = test_socket.writer.getvalue().decode("iso-8859-1")
 
-        self.assertIn(" 403 ", response.splitlines()[0])
-        self.assertIsNone(mail.payload)
+        self.assertIn(" 200 ", response.splitlines()[0])
+        self.assertEqual(
+            mail.payload, {"subscription": "projects/p/subscriptions/s", "message": {}}
+        )
 
     def test_gmail_webhook_accepts_verified_google_oidc_token(self) -> None:
         class MailIntegration:

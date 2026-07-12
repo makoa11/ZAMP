@@ -1008,9 +1008,9 @@ class MailRepository:
                         'storage_path', stale.storage_path,
                         'account_id', stale.account_id,
                         'owner_user_id', stale.owner_user_id,
-                        'parser_version', %s
+                        'parser_version', %s::text
                     ),
-                    'parse-pdf:' || stale.attachment_id || ':' || %s,
+                    'parse-pdf:' || stale.attachment_id || ':' || %s::text,
                     now()
                 FROM stale
                 ON CONFLICT (unique_key) DO NOTHING
