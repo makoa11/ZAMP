@@ -224,3 +224,15 @@ To seed local simulated AP context from generated manifests:
 ```bash
 .venv/bin/python scripts/seed_ap_context_records.py --owner-user-id demo-user --manifest-dir storage/test_pdfs
 ```
+
+To create 10 one-invoice stress PDFs for manual email ingestion, seed their
+matching AP context for the connected mailbox owner, and verify every PDF can
+resolve that context:
+
+```bash
+.venv/bin/python scripts/create_mail_invoice_stress_test.py
+```
+
+The PDFs, manifests, and validation summary are written to
+`storage/test_invoice_pipeline`. When more than one mailbox owner is connected,
+pass `--owner-user-id USER_ID` explicitly.
