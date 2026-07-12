@@ -13,9 +13,13 @@ from .config import ConfigError, load_config
 from .invoice_decision import decide_invoice
 from .invoice_normalizer import normalize_invoice_parse
 from .invoice_ocr import OCR_MAX_DOCUMENT_PAGES, OCR_REGION_PADDING
+from .invoice_pipeline import configuration_fingerprint
 from .invoice_parser import PARSER_VERSION, parse_invoice_pdf
 from .mail_ingestion import MAIL_JOB_TYPES
 from .mail_service import MailIntegration
+
+PDF_PARSE_JOB_TYPES = {"parse_pdf"}
+MAIL_FETCH_JOB_TYPES = MAIL_JOB_TYPES - PDF_PARSE_JOB_TYPES
 
 
 def run_once(*, limit: int = 10, worker_id: str | None = None) -> int:
@@ -26,11 +30,7 @@ def run_once(*, limit: int = 10, worker_id: str | None = None) -> int:
             parser_revision=_parser_revision(integration),
         )
         worker_name = worker_id or f"{socket.gethostname()}:{time.time_ns()}"
-        jobs = integration.repo.claim_jobs(
-            worker_id=worker_name,
-            job_types=MAIL_JOB_TYPES,
-            limit=limit,
-        )
+        jobs = _claim_prioritized_jobs(integration, worker_id=worker_name, limit=limit)
         for job in jobs:
             _handle_job(integration, job)
         return len(jobs)
@@ -65,17 +65,42 @@ def run_forever(
             if now - last_renewal_at >= 3600:
                 last_renewal_at = now
                 _renew_subscriptions_safely(integration)
-            jobs = integration.repo.claim_jobs(
-                worker_id=worker_name,
-                job_types=MAIL_JOB_TYPES,
-                limit=limit,
-            )
+            jobs = _claim_prioritized_jobs(integration, worker_id=worker_name, limit=limit)
             for job in jobs:
                 _handle_job(integration, job)
             if not jobs:
                 time.sleep(poll_seconds)
     finally:
         integration.close()
+
+
+def _claim_prioritized_jobs(
+    integration: MailIntegration,
+    *,
+    worker_id: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep attachment downloads ahead of expensive PDF/OCR parsing."""
+    if limit <= 0:
+        return []
+
+    jobs = integration.repo.claim_jobs(
+        worker_id=worker_id,
+        job_types=MAIL_FETCH_JOB_TYPES,
+        limit=limit,
+    )
+    remaining = limit - len(jobs)
+    if remaining <= 0:
+        return jobs
+
+    return [
+        *jobs,
+        *integration.repo.claim_jobs(
+            worker_id=worker_id,
+            job_types=PDF_PARSE_JOB_TYPES,
+            limit=remaining,
+        ),
+    ]
 
 
 def _handle_job(integration: MailIntegration, job: dict[str, Any]) -> None:
@@ -142,19 +167,28 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
     storage_path = str(payload["storage_path"])
     attachment_id = _optional_int(payload.get("attachment_id"))
     pdf_path = _storage_pdf_path(integration.storage.root, storage_path)
-    result = parse_invoice_pdf(
-        pdf_path.read_bytes(),
-        source_id=f"mail_pdf_file:{pdf_file_id}",
-        ocr_max_regions=integration.config.mail_parse_ocr_max_regions,
-        ocr_max_document_pages=getattr(
+    parse_kwargs: dict[str, Any] = {
+        "source_id": f"mail_pdf_file:{pdf_file_id}",
+        "ocr_max_regions": integration.config.mail_parse_ocr_max_regions,
+        "ocr_max_document_pages": getattr(
             integration.config,
             "mail_parse_ocr_max_document_pages",
             OCR_MAX_DOCUMENT_PAGES,
         ),
-    )
+    }
+    for config_name, parser_name in {
+        "mail_parse_ocr_render_dpi": "ocr_render_dpi",
+        "mail_parse_ocr_refinement_dpi": "ocr_refinement_dpi",
+        "mail_parse_ocr_timeout_seconds": "ocr_timeout_seconds",
+        "mail_parse_document_timeout_seconds": "document_timeout_seconds",
+    }.items():
+        if hasattr(integration.config, config_name):
+            parse_kwargs[parser_name] = getattr(integration.config, config_name)
+    result = parse_invoice_pdf(pdf_path.read_bytes(), **parse_kwargs)
     parser_revision = _parser_revision(integration)
     result["parser_revision"] = parser_revision
     warnings = result.get("warnings")
+    parser_method = _parser_method(result)
     integration.repo.upsert_pdf_parse_result(
         pdf_file_id=pdf_file_id,
         status=str(result.get("status") or "failed"),
@@ -162,6 +196,20 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
         result=result,
         warnings=warnings if isinstance(warnings, list) else [],
     )
+    if hasattr(integration.repo, "insert_pdf_parse_run"):
+        pipeline = result.get("pipeline") if isinstance(result.get("pipeline"), dict) else {}
+        timings = pipeline.get("timings_ms") if isinstance(pipeline.get("timings_ms"), dict) else {}
+        integration.repo.insert_pdf_parse_run(
+            pdf_file_id=pdf_file_id,
+            status=str(result.get("status") or "failed"),
+            parser_version=parser_revision,
+            parser_method=parser_method,
+            configuration_fingerprint=_optional_string(pipeline.get("configuration_fingerprint")),
+            duration_ms=_optional_float(timings.get("total")),
+            result=result,
+            warnings=warnings if isinstance(warnings, list) else [],
+            promoted=True,
+        )
     owner_user_id = _owner_user_id_for_parse_job(integration, payload)
     if not owner_user_id:
         return
@@ -173,7 +221,7 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
         attachment_id=attachment_id,
         normalized_invoice=normalized_invoice,
         parse_status=str(normalized_invoice.get("parser_status") or result.get("status") or "failed"),
-        parser_method="static_text",
+        parser_method=parser_method,
     )
     procurement_context = load_db_procurement_context(
         integration.repo,
@@ -208,10 +256,30 @@ def _parser_revision(integration: MailIntegration) -> str:
         OCR_MAX_DOCUMENT_PAGES,
     )
     max_pages = "all" if configured_max_pages is None else str(int(configured_max_pages))
-    return (
+    readable = (
         f"{PARSER_VERSION}:ocr-regions={max_regions}:ocr-pages={max_pages}:"
         f"padding={OCR_REGION_PADDING:.2f}"
     )
+    fingerprint = configuration_fingerprint(
+        {
+            "max_regions": max_regions,
+            "max_pages": configured_max_pages,
+            "padding": OCR_REGION_PADDING,
+            "render_dpi": getattr(integration.config, "mail_parse_ocr_render_dpi", None),
+            "refinement_dpi": getattr(integration.config, "mail_parse_ocr_refinement_dpi", None),
+            "ocr_timeout": getattr(integration.config, "mail_parse_ocr_timeout_seconds", None),
+            "document_timeout": getattr(integration.config, "mail_parse_document_timeout_seconds", None),
+        }
+    )
+    return f"{readable}:config={fingerprint}"
+
+
+def _parser_method(result: dict[str, Any]) -> str:
+    pipeline = result.get("pipeline")
+    route = pipeline.get("route") if isinstance(pipeline, dict) else None
+    if route in {"native_text", "local_ocr", "hybrid"}:
+        return str(route)
+    return "local_ocr" if result.get("ocr_used") else "native_text"
 
 
 def _optional_int(value: Any) -> int | None:
@@ -225,6 +293,13 @@ def _optional_int(value: Any) -> int | None:
 
 def _optional_string(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _owner_user_id_for_parse_job(integration: MailIntegration, payload: dict[str, Any]) -> str | None:

@@ -7,7 +7,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.mail_worker import _handle_job, _parser_revision, _renew_subscriptions_safely, _storage_pdf_path
+from app.mail_worker import (
+    _claim_prioritized_jobs,
+    _handle_job,
+    _parser_revision,
+    _renew_subscriptions_safely,
+    _storage_pdf_path,
+)
 
 
 class TestRepo:
@@ -70,6 +76,27 @@ class MailWorkerRenewalTests(unittest.TestCase):
         )
 
         self.assertIn("ocr-pages=all", _parser_revision(integration))
+
+
+class ClaimPrioritizedJobsTests(unittest.TestCase):
+    def test_mail_fetch_jobs_are_claimed_before_parse_jobs(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        class Repo:
+            def claim_jobs(self, **kwargs: object) -> list[dict[str, object]]:
+                calls.append(kwargs)
+                job_types = set(kwargs["job_types"])  # type: ignore[arg-type]
+                if "parse_pdf" in job_types:
+                    return [{"id": 2, "type": "parse_pdf"}]
+                return [{"id": 1, "type": "gmail_message_fetch"}]
+
+        integration = SimpleNamespace(repo=Repo())
+
+        jobs = _claim_prioritized_jobs(integration, worker_id="worker-1", limit=2)  # type: ignore[arg-type]
+
+        self.assertEqual([job["type"] for job in jobs], ["gmail_message_fetch", "parse_pdf"])
+        self.assertNotIn("parse_pdf", set(calls[0]["job_types"]))  # type: ignore[arg-type]
+        self.assertEqual(set(calls[1]["job_types"]), {"parse_pdf"})  # type: ignore[arg-type]
 
 
 def _field(value: object, *, confidence: float = 0.95) -> dict[str, object]:
