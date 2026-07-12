@@ -202,13 +202,12 @@ def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
 
 def _parser_revision(integration: MailIntegration) -> str:
     max_regions = int(integration.config.mail_parse_ocr_max_regions)
-    max_pages = int(
-        getattr(
-            integration.config,
-            "mail_parse_ocr_max_document_pages",
-            OCR_MAX_DOCUMENT_PAGES,
-        )
+    configured_max_pages = getattr(
+        integration.config,
+        "mail_parse_ocr_max_document_pages",
+        OCR_MAX_DOCUMENT_PAGES,
     )
+    max_pages = "all" if configured_max_pages is None else str(int(configured_max_pages))
     return (
         f"{PARSER_VERSION}:ocr-regions={max_regions}:ocr-pages={max_pages}:"
         f"padding={OCR_REGION_PADDING:.2f}"

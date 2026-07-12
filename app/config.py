@@ -52,6 +52,23 @@ def _int_env(name: str, env_file_values: Dict[str, str], default: int) -> int:
     return parsed
 
 
+def _optional_int_env(
+    name: str,
+    env_file_values: Dict[str, str],
+    default: int | None = None,
+) -> int | None:
+    value = _env(name, env_file_values)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer.") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{name} must be greater than 0.")
+    return parsed
+
+
 def _derive_signing_secret(secret: str, purpose: str) -> str:
     return hmac.new(
         secret.encode("utf-8"),
@@ -96,7 +113,7 @@ class AppConfig:
     microsoft_client_secret: str | None
     microsoft_tenant_id: str
     mail_parse_ocr_max_regions: int
-    mail_parse_ocr_max_document_pages: int
+    mail_parse_ocr_max_document_pages: int | None
 
     @property
     def logout_return_url(self) -> str:
@@ -153,7 +170,7 @@ def load_config(root: Path | None = None) -> AppConfig:
     if mail_db_pool_max_size < mail_db_pool_min_size:
         raise ConfigError("MAIL_DB_POOL_MAX_SIZE must be greater than or equal to MAIL_DB_POOL_MIN_SIZE.")
     mail_parse_ocr_max_regions = _int_env("MAIL_PARSE_OCR_MAX_REGIONS", env_file_values, OCR_MAX_REGIONS)
-    mail_parse_ocr_max_document_pages = _int_env(
+    mail_parse_ocr_max_document_pages = _optional_int_env(
         "MAIL_PARSE_OCR_MAX_DOCUMENT_PAGES",
         env_file_values,
         OCR_MAX_DOCUMENT_PAGES,

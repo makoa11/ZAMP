@@ -56,6 +56,8 @@ OCR_FALLBACK_FIELDS = (*FIELD_KEYS, "line_items")
 
 LABELS: dict[str, tuple[str, ...]] = {
     "invoice_number": (
+        "credit memo number",
+        "credit memo no",
         "invoice number",
         "invoice no",
         "invoice #",
@@ -116,6 +118,7 @@ LABELS: dict[str, tuple[str, ...]] = {
     ),
     "purchase_order": (
         "purchase order",
+        "related po",
         "po number",
         "po ref",
         "po",
@@ -1327,50 +1330,152 @@ def _extract_fields(
 
 
 def _best_scalar_field(lines: list[Line], key: str) -> dict[str, Any] | None:
+    identifier_key = key in {"invoice_number", "purchase_order"}
     candidates: list[dict[str, Any]] = []
     for line in lines:
-        match = _match_any_label(line, LABELS[key])
-        if not match:
-            continue
-        raw, bbox, method = _value_after_label(lines, line, match, allow_below=True)
-        raw = _clean_field_raw(raw)
-        if key in {"issue_date", "due_date"}:
-            date_match = _parse_date(raw)
-            if not date_match:
-                date_match = _parse_date(line.text)
-            if not date_match:
+        matches = _label_matches(line, LABELS[key])
+        for match in matches:
+            if _is_shadowed_by_longer_known_label(line, match):
                 continue
-            raw_value, normalized = date_match
-            raw = raw_value
-            value = normalized
-        else:
-            raw = _trim_at_known_label(raw)
-            value = _normalize_scalar_value(key, raw)
-            if not value:
-                continue
+            if identifier_key:
+                identifier = _identifier_after_label(lines, line, match)
+                if identifier is None:
+                    continue
+                raw, value, bbox, method = identifier
+            else:
+                raw, bbox, method = _value_after_label(lines, line, match, allow_below=True)
+            raw = _clean_field_raw(raw)
+            if key in {"issue_date", "due_date"}:
+                date_match = _parse_date(raw)
+                if not date_match:
+                    date_match = _parse_date(line.text)
+                if not date_match:
+                    continue
+                raw_value, normalized = date_match
+                raw = raw_value
+                value = normalized
+            elif not identifier_key:
+                raw = _trim_at_known_label(raw)
+                value = _normalize_scalar_value(key, raw)
+                if not value:
+                    continue
 
-        confidence = 0.92 if method == "same_line" else 0.78
-        if len(_label_tokens(match.label)) >= 2:
-            confidence += 0.03
-        if key == "invoice_number" and _looks_like_invoice_number(str(value)):
-            confidence += 0.03
-        candidates.append(
-            _field_value(
-                raw=raw,
-                value=value,
-                page=line.page,
-                bbox=bbox,
-                label=match.label,
-                confidence=min(confidence, 0.98),
-                method=f"label_{method}",
+            confidence = 0.92
+            if len(_label_tokens(match.label)) >= 2:
+                confidence += 0.03
+            if key == "invoice_number" and _looks_like_invoice_number(str(value)):
+                confidence += 0.03
+            if identifier_key:
+                confidence += 0.02
+            candidates.append(
+                _field_value(
+                    raw=raw,
+                    value=value,
+                    page=line.page,
+                    bbox=bbox,
+                    label=match.label,
+                    confidence=min(confidence, 0.98),
+                    method=f"label_{method}",
+                )
             )
-        )
 
+    if identifier_key and len({_field_comparison_value(item) for item in candidates}) > 1:
+        return None
     return _best_candidate(
         candidates,
         ambiguity_reason="multiple_scalar_values",
         ambiguity_confidence_ceiling=0.95,
     )
+
+
+def _identifier_after_label(
+    lines: list[Line],
+    line: Line,
+    match: LabelMatch,
+) -> tuple[str, str, list[float] | None, str] | None:
+    same_line_words = _words_after_label_before_next_field(line, match)
+    identifier = _leading_identifier_word_span(same_line_words)
+    if identifier is not None:
+        raw, value, selected_words = identifier
+        return raw, value, _bbox_for_words(selected_words), "same_line"
+
+    if same_line_words:
+        return None
+
+    candidate = _next_visual_line(lines, line)
+    if candidate is None or _matches_any_known_label(candidate):
+        return None
+    identifier = _nearest_identifier_word_span(candidate.words, anchor_x=line.words[match.start].x0)
+    if identifier is None:
+        return None
+    raw, value, selected_words = identifier
+    return raw, value, _bbox_for_words(selected_words), "below"
+
+
+def _words_after_label_before_next_field(line: Line, match: LabelMatch) -> tuple[Word, ...]:
+    boundary = len(line.words)
+    for labels in LABELS.values():
+        for other in _label_matches(line, labels):
+            if other.start >= match.end:
+                boundary = min(boundary, other.start)
+    return tuple(word for word in line.words[match.end:boundary] if _canonical_token(word.text))
+
+
+def _leading_identifier_word_span(
+    words: tuple[Word, ...],
+) -> tuple[str, str, tuple[Word, ...]] | None:
+    if not words:
+        return None
+    value = _identifier_value(words[0].text)
+    if value is not None:
+        return words[0].text, value, words[:1]
+    if len(words) >= 2 and _is_identifier_prefix(words[0].text):
+        raw = _words_text(words[:2])
+        value = _identifier_value(raw)
+        if value is not None:
+            return raw, value, words[:2]
+    return None
+
+
+def _nearest_identifier_word_span(
+    words: tuple[Word, ...],
+    *,
+    anchor_x: float,
+) -> tuple[str, str, tuple[Word, ...]] | None:
+    candidates: list[tuple[float, str, str, tuple[Word, ...]]] = []
+    for index, word in enumerate(words):
+        span = _leading_identifier_word_span(words[index:])
+        if span is None:
+            continue
+        raw, value, selected_words = span
+        candidates.append((abs(selected_words[0].x0 - anchor_x), raw, value, selected_words))
+    if not candidates:
+        return None
+    _, raw, value, selected_words = min(candidates, key=lambda item: item[0])
+    return raw, value, selected_words
+
+
+def _next_visual_line(lines: list[Line], line: Line) -> Line | None:
+    return next(
+        (
+            candidate
+            for candidate in lines
+            if candidate.page == line.page and candidate.top > line.bottom
+        ),
+        None,
+    )
+
+
+def _is_identifier_prefix(raw: str) -> bool:
+    return _canonical_token(raw) in {"bill", "cm", "doc", "fy", "inv", "invoice", "job", "po"}
+
+
+def _is_shadowed_by_longer_known_label(line: Line, match: LabelMatch) -> bool:
+    for labels in LABELS.values():
+        for other in _label_matches(line, labels):
+            if other.start == match.start and other.end > match.end:
+                return True
+    return False
 
 
 def _best_money_field(lines: list[Line], key: str, inferred_currency: str | None) -> dict[str, Any] | None:
@@ -1559,8 +1664,17 @@ def _label_matches(line: Line, labels: Iterable[str]) -> list[LabelMatch]:
             continue
         for index in range(0, len(tokens) - len(label_tokens) + 1):
             if tokens[index : index + len(label_tokens)] == label_tokens:
+                if "#" in label and not _hash_label_matches_words(line.words, index, len(label_tokens)):
+                    continue
                 matches.append(LabelMatch(label, index, index + len(label_tokens)))
     return matches
+
+
+def _hash_label_matches_words(words: tuple[Word, ...], start: int, token_count: int) -> bool:
+    end = min(len(words), start + token_count)
+    if any("#" in word.text for word in words[start:end]):
+        return True
+    return end < len(words) and words[end].text.strip() == "#"
 
 
 def _is_shadowed_by_longer_non_party_label(line: Line, match: LabelMatch) -> bool:
@@ -2641,18 +2755,11 @@ def _words_text(words: Iterable[Word]) -> str:
 
 
 def _match_any_label(line: Line, labels: Iterable[str]) -> LabelMatch | None:
-    tokens = [_canonical_token(word.text) for word in line.words]
-    best: LabelMatch | None = None
-    for label in sorted(labels, key=lambda item: len(_label_tokens(item)), reverse=True):
-        label_tokens = _label_tokens(label)
-        if not label_tokens:
-            continue
-        for index in range(0, len(tokens) - len(label_tokens) + 1):
-            if tokens[index : index + len(label_tokens)] == label_tokens:
-                match = LabelMatch(label, index, index + len(label_tokens))
-                if not best or len(_label_tokens(match.label)) > len(_label_tokens(best.label)):
-                    best = match
-    return best
+    matches = _label_matches(
+        line,
+        sorted(labels, key=lambda item: len(_label_tokens(item)), reverse=True),
+    )
+    return matches[0] if matches else None
 
 
 def _value_after_label(
@@ -2947,11 +3054,16 @@ def _replace_field_with_ocr_result(
     if not text:
         return "empty_ocr_text"
 
+    field_key = _ocr_field_key(candidate.path)
+    if field_key in {"invoice_number", "purchase_order"} and candidate.reason == "missing_field":
+        # A broad fallback region has no word-to-label association. Let the
+        # full-document OCR path rebuild layout instead of guessing an ID.
+        return "ocr_identifier_requires_document_layout"
+
     rejection_reason = _ocr_replacement_rejection_reason(field, ocr_text)
     if rejection_reason:
         return rejection_reason
 
-    field_key = _ocr_field_key(candidate.path)
     if field_key == "currency":
         parsed_currency = _currency_from_ocr_text(text)
         if parsed_currency is None:
@@ -3217,14 +3329,35 @@ def _best_candidate(
 
 
 def _normalize_scalar_value(key: str, raw: str) -> str | None:
-    value = raw.strip(" :#\t\r\n")
+    strip_chars = " :\t\r\n" if key in {"invoice_number", "purchase_order"} else " :#\t\r\n"
+    value = raw.strip(strip_chars)
     if not value:
         return None
-    if key == "invoice_number":
-        value = value.split()[0] if len(value) > 80 else value
-    if key == "purchase_order":
-        value = value.split()[0] if len(value) > 80 else value
+    if key in {"invoice_number", "purchase_order"}:
+        return _identifier_value(value)
     return value[:300]
+
+
+def _identifier_value(raw: str) -> str | None:
+    value = re.sub(r"\s*([#./:_-])\s*", r"\1", raw.strip())
+    value = re.sub(
+        r"\b(BILL|DOC|FY|INV|INVOICE|JOB|PO)\s+(?=\d)",
+        r"\1-",
+        value,
+        flags=re.IGNORECASE,
+    )
+    parts = value.split()
+    if len(parts) == 2 and _is_identifier_prefix(parts[0]):
+        value = f"{parts[0]}-{parts[1]}"
+        parts = [value]
+    if len(parts) != 1:
+        return None
+    token = parts[0].strip(".:/_-")
+    if not re.fullmatch(r"[#A-Za-z0-9][#A-Za-z0-9./:_-]*", token):
+        return None
+    if not any(character.isdigit() for character in token):
+        return None
+    return token[:300]
 
 
 def _clean_field_raw(raw: str) -> str:
