@@ -194,6 +194,20 @@ CREATE TABLE IF NOT EXISTS mail_pdf_parse_results (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS mail_pdf_parse_runs (
+    id BIGSERIAL PRIMARY KEY,
+    pdf_file_id BIGINT NOT NULL REFERENCES mail_pdf_files(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    parser_method TEXT NOT NULL,
+    configuration_fingerprint TEXT,
+    duration_ms NUMERIC(12,2),
+    result JSONB NOT NULL DEFAULT '{}'::jsonb,
+    warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
+    promoted BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 ALTER TABLE mail_pdf_parse_results DROP CONSTRAINT IF EXISTS mail_pdf_parse_results_status_check;
 ALTER TABLE mail_pdf_parse_results
 ADD CONSTRAINT mail_pdf_parse_results_status_check
@@ -344,6 +358,8 @@ CREATE INDEX IF NOT EXISTS idx_mail_messages_account ON mail_messages(account_id
 CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_claim ON ingestion_jobs(status, available_at, id);
 CREATE INDEX IF NOT EXISTS idx_mail_invoice_extractions_owner_updated
     ON mail_invoice_extractions(owner_user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mail_pdf_parse_runs_file_created
+    ON mail_pdf_parse_runs(pdf_file_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mail_invoice_extractions_owner_decision
     ON mail_invoice_extractions(owner_user_id, parse_status, normalized_vendor);
 CREATE INDEX IF NOT EXISTS idx_mail_invoice_decisions_owner_decision
@@ -1188,6 +1204,43 @@ class MailRepository:
                     parser_version,
                     json.dumps(result, separators=(",", ":")),
                     json.dumps(warnings, separators=(",", ":")),
+                ),
+            ).fetchone()
+            return dict(row)
+
+    def insert_pdf_parse_run(
+        self,
+        *,
+        pdf_file_id: int,
+        status: str,
+        parser_version: str,
+        parser_method: str,
+        configuration_fingerprint: str | None,
+        duration_ms: float | None,
+        result: dict[str, Any],
+        warnings: list[str],
+        promoted: bool,
+    ) -> dict[str, Any]:
+        with self.database.connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO mail_pdf_parse_runs (
+                    pdf_file_id, status, parser_version, parser_method,
+                    configuration_fingerprint, duration_ms, result, warnings, promoted
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                RETURNING *
+                """,
+                (
+                    pdf_file_id,
+                    status,
+                    parser_version,
+                    parser_method,
+                    configuration_fingerprint,
+                    duration_ms,
+                    json.dumps(result, separators=(",", ":")),
+                    json.dumps(warnings, separators=(",", ":")),
+                    promoted,
                 ),
             ).fetchone()
             return dict(row)

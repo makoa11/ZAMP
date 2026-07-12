@@ -776,6 +776,29 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         setCollapsed(!document.body.classList.contains("sidebar-collapsed"));
       }});
     }})();
+
+    (function () {{
+      var buttons = Array.prototype.slice.call(document.querySelectorAll("[data-document-mode]"));
+      var views = Array.prototype.slice.call(document.querySelectorAll("[data-document-view]"));
+      if (!buttons.length || !views.length) return;
+
+      function setDocumentMode(mode) {{
+        buttons.forEach(function (button) {{
+          var selected = button.dataset.documentMode === mode;
+          button.classList.toggle("active", selected);
+          button.setAttribute("aria-pressed", selected ? "true" : "false");
+        }});
+        views.forEach(function (view) {{
+          view.hidden = view.dataset.documentView !== mode;
+        }});
+      }}
+
+      buttons.forEach(function (button) {{
+        button.addEventListener("click", function () {{
+          setDocumentMode(button.dataset.documentMode);
+        }});
+      }});
+    }})();
   </script>
 </body>
 </html>"""
@@ -924,11 +947,25 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         decision_html = self._decision_summary_html(decision, checks, item)
         checks_html = self._decision_checks_html(checks)
         audit_html = self._audit_reasoning_html(audit, ap_context)
+        decision_data_json = html_lib.escape(
+            json.dumps(
+                {
+                    "decision": decision,
+                    "checks": checks,
+                    "audit": audit,
+                    "ap_context": ap_context,
+                },
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+        )
         pdf_html = (
             f'<iframe class="pdf-viewer" src="{html_lib.escape(overlay_url)}" '
-            f'title="{html_lib.escape(filename or "Invoice overlay")}"></iframe>'
+            f'title="{html_lib.escape(filename or "Invoice overlay")}" '
+            f'data-document-view="pdf"></iframe>'
             if overlay_url
-            else '<div class="evidence-empty"><strong>Overlay unavailable</strong></div>'
+            else '<div class="evidence-empty" data-document-view="pdf"><strong>Overlay unavailable</strong></div>'
         )
         return f"""
       <div class="evidence-header">
@@ -960,8 +997,16 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             </details>
           </div>
         </div>
-        <div class="pdf-stage">
+        <div class="pdf-stage" data-document-stage>
+          <div class="document-mode-switch" role="group" aria-label="Document view">
+            <button class="active" type="button" data-document-mode="pdf" aria-pressed="true">PDF</button>
+            <button type="button" data-document-mode="json" aria-pressed="false">JSON</button>
+          </div>
           {pdf_html}
+          <div class="raw-json-view" data-document-view="json" hidden>
+            <div class="raw-json-heading">Decision data</div>
+            <pre><code>{decision_data_json}</code></pre>
+          </div>
         </div>
       </div>"""
 

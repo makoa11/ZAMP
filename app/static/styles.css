@@ -4238,3 +4238,113 @@ button:hover,
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* PDF / raw parser view -------------------------------------------------- */
+.document-mode-switch {
+  position: absolute;
+  top: 31px;
+  left: 50%;
+  z-index: 2;
+  display: flex;
+  gap: 2px;
+  border: 1px solid rgba(53, 55, 50, 0.18);
+  border-radius: 7px;
+  padding: 2px;
+  background: #f1f0eb;
+  box-shadow: 0 2px 8px rgba(38, 39, 35, 0.08);
+  transform: translateX(-50%);
+  transition: box-shadow 160ms ease;
+}
+
+.document-mode-switch:hover,
+.document-mode-switch:focus-within {
+  box-shadow: 0 4px 12px rgba(38, 39, 35, 0.12);
+}
+
+.document-mode-switch button {
+  min-height: 24px;
+  border: 0;
+  border-radius: 5px;
+  padding: 3px 7px;
+  background: transparent;
+  color: #555750;
+  font: 700 9px/1 "DM Sans", sans-serif;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.document-mode-switch button:hover {
+  background: #efede7;
+  color: #3f413b;
+}
+
+.document-mode-switch button.active {
+  background: #ffffff;
+  color: #2f312d;
+  box-shadow: 0 1px 3px rgba(38, 39, 35, 0.12);
+}
+
+.document-mode-switch button:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.pdf-stage > [data-document-view="pdf"] {
+  min-width: 0;
+  min-height: 0;
+}
+
+.pdf-stage > .evidence-empty[data-document-view="pdf"] {
+  width: 100%;
+}
+
+.raw-json-view {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #c6c3ba;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #20231f;
+  box-shadow: 0 12px 32px rgba(38, 39, 35, 0.13);
+}
+
+.raw-json-view[hidden] {
+  display: none;
+}
+
+.raw-json-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  border-bottom: 1px solid #dedbd3;
+  padding: 15px 18px 11px;
+  background: rgba(247, 246, 242, 0.97);
+  color: #4e514a;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.raw-json-view pre {
+  min-width: 0;
+  margin: 0;
+  padding: 18px;
+  color: inherit;
+  font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 820px) {
+  .document-mode-switch {
+    top: 31px;
+  }
+
+  .raw-json-view {
+    min-height: 520px;
+  }
+}

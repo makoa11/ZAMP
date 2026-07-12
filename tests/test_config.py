@@ -130,3 +130,43 @@ class ConfigTests(unittest.TestCase):
                 config = load_config(root)
 
         self.assertIsNone(config.mail_parse_ocr_max_document_pages)
+
+    def test_adaptive_ocr_runtime_settings_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {
+                    **self._base_env(),
+                    "MAIL_PARSE_OCR_RENDER_DPI": "240",
+                    "MAIL_PARSE_OCR_REFINEMENT_DPI": "360",
+                    "MAIL_PARSE_OCR_TIMEOUT_SECONDS": "12.5",
+                    "MAIL_PARSE_DOCUMENT_TIMEOUT_SECONDS": "75",
+                },
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        self.assertEqual(config.mail_parse_ocr_render_dpi, 240)
+        self.assertEqual(config.mail_parse_ocr_refinement_dpi, 360)
+        self.assertEqual(config.mail_parse_ocr_timeout_seconds, 12.5)
+        self.assertEqual(config.mail_parse_document_timeout_seconds, 75.0)
+
+    def test_refinement_dpi_cannot_be_lower_than_render_dpi(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {
+                    **self._base_env(),
+                    "MAIL_PARSE_OCR_RENDER_DPI": "300",
+                    "MAIL_PARSE_OCR_REFINEMENT_DPI": "200",
+                },
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ConfigError) as error:
+                    load_config(root)
+
+        self.assertIn("MAIL_PARSE_OCR_REFINEMENT_DPI", str(error.exception))

@@ -36,7 +36,16 @@ Then run:
 .venv/bin/python main.py
 ```
 
-The invoice parser performs OCR by default when OCR dependencies are available. It first re-reads parsed evidence boxes whose confidence is below `0.85`; if required normalized fields are still missing, or if the PDF has no usable text layer, it runs full-document OCR and parses those OCR words through the same schema. Results that still miss required normalized fields are marked `needs_review`. Install the system `tesseract` binary as well as the Python requirements to enable OCR.
+The invoice parser uses a local adaptive extraction pipeline. It profiles each page as native text, hybrid, or scanned; keeps competing static candidates; validates dates, currencies, totals, and line-item sums; and runs local OCR only when required evidence is missing, contradictory, or degraded. Production OCR renders selected pages once, applies OpenCV orientation/deskew/contrast/threshold preprocessing, parses the full page, and reserves high-resolution region OCR for unresolved fields. Results that remain incomplete, ambiguous, inconsistent, or over budget are marked `needs_review`. Install the system `tesseract` binary as well as the Python requirements to enable OCR.
+
+Adaptive OCR settings are optional:
+
+```env
+MAIL_PARSE_OCR_RENDER_DPI=300
+MAIL_PARSE_OCR_REFINEMENT_DPI=450
+MAIL_PARSE_OCR_TIMEOUT_SECONDS=15
+MAIL_PARSE_DOCUMENT_TIMEOUT_SECONDS=90
+```
 
 Open `http://127.0.0.1:8000/login`.
 
@@ -50,6 +59,15 @@ To generate the local parser test corpus, run:
 ```bash
 .venv/bin/python -m app.generate_test_pdfs
 ```
+
+Generate deterministic image-only scan degradations and benchmark exact fields, challenge tags, routes, and latency with:
+
+```bash
+.venv/bin/python scripts/generate_degraded_test_pdfs.py --input-dir storage/test_pdfs --output-dir storage/test_pdfs_degraded --limit 25
+.venv/bin/python scripts/benchmark_invoice_extraction.py --input-dir storage/test_pdfs_degraded --output storage/degraded-benchmark.json
+```
+
+Use `--disable-ocr` on the benchmark command to isolate native static extraction.
 
 By default this writes 250 PDFs and 250 expected-output manifests to `storage/test_pdfs`: 150 diverse one-invoice PDFs plus 100 stress PDFs. The standard PDFs cover every A4/A4-half/A4-third paper and base-template pairing at least three times, while repeat rounds shift capture profiles, fonts, currencies, date formats, table schemas, invoice number styles, labels, totals placement, amounts, and invoice dates.
 The stress PDFs cycle through multi-page invoices, line-item tables continued across pages, notes/footers close to table bounds, side-panel totals, table-row totals, ambiguous entity labels such as `Account`, `To`, `Source`, and `Entity`, and glyph-sensitive currency rendering. Stress filenames are sequenced by fixture family, for example `invoice-stress-0001-multipage-continuation.pdf`.

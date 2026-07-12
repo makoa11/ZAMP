@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import re
+import time
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Protocol
 
 
@@ -10,6 +13,7 @@ OCR_RENDER_DPI = 300
 OCR_MAX_REGIONS = 8
 OCR_MAX_DOCUMENT_PAGES: int | None = None
 OCR_TIMEOUT_SECONDS = 5.0
+OCR_REFINEMENT_DPI = 450
 
 
 class RegionOcrUnavailable(RuntimeError):
@@ -63,6 +67,7 @@ class DocumentOcrResult:
     words: list[DocumentOcrWord]
     confidence: float | None
     method: str
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class RegionOcrEngine(Protocol):
@@ -101,11 +106,20 @@ class TesseractRegionOcrEngine:
         language: str = "eng",
         config: str = "--psm 6",
         timeout_seconds: float | None = OCR_TIMEOUT_SECONDS,
+        refinement_dpi: int = OCR_REFINEMENT_DPI,
+        adaptive: bool = True,
+        document_timeout_seconds: float | None = 90.0,
     ) -> None:
         self.dpi = dpi
         self.language = language
         self.config = config
         self.timeout_seconds = timeout_seconds
+        self.refinement_dpi = refinement_dpi
+        self.adaptive = adaptive
+        self.document_timeout_seconds = document_timeout_seconds
+        self.prefers_document_first = adaptive
+        self._content_digest: str | None = None
+        self._page_cache: dict[tuple[int, int], tuple[Any, float, float]] = {}
 
     def ocr_region(
         self,
@@ -115,58 +129,43 @@ class TesseractRegionOcrEngine:
         bbox: tuple[float, float, float, float],
     ) -> RegionOcrText:
         try:
-            import fitz  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise RegionOcrUnavailable("Install PyMuPDF to render PDF regions for OCR.") from exc
-
-        try:
             import pytesseract  # type: ignore[import-not-found]
-            from PIL import Image  # type: ignore[import-not-found]
         except ImportError as exc:
             raise RegionOcrUnavailable("Install Pillow and pytesseract to run region OCR.") from exc
 
-        try:
-            document = fitz.open(stream=content, filetype="pdf")
-        except Exception as exc:  # pragma: no cover - exercised only with real PDF renderer failures.
-            raise RegionOcrError(f"Could not open PDF for OCR: {exc}") from exc
-
-        try:
-            if page < 1 or page > document.page_count:
-                raise RegionOcrError(f"OCR page {page} is outside the PDF page range.")
-            pdf_page = document.load_page(page - 1)
-            page_rect = pdf_page.rect
-            clip = fitz.Rect(
-                max(bbox[0], page_rect.x0),
-                max(bbox[1], page_rect.y0),
-                min(bbox[2], page_rect.x1),
-                min(bbox[3], page_rect.y1),
+        image, page_width, page_height = self._render_page(
+            content,
+            page=page,
+            dpi=self.refinement_dpi,
+        )
+        clipped = (
+            max(0.0, bbox[0]),
+            max(0.0, bbox[1]),
+            min(page_width, bbox[2]),
+            min(page_height, bbox[3]),
+        )
+        if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+            raise RegionOcrError(f"OCR region on page {page} is empty after clipping.")
+        scale_x = image.width / page_width
+        scale_y = image.height / page_height
+        image = image.crop(
+            (
+                round(clipped[0] * scale_x),
+                round(clipped[1] * scale_y),
+                round(clipped[2] * scale_x),
+                round(clipped[3] * scale_y),
             )
-            if clip.is_empty or clip.is_infinite:
-                raise RegionOcrError(f"OCR region on page {page} is empty after clipping.")
-            zoom = self.dpi / 72.0
-            pixmap = pdf_page.get_pixmap(
-                matrix=fitz.Matrix(zoom, zoom),
-                clip=clip,
-                alpha=False,
-                colorspace=fitz.csRGB,
-            )
-        except RegionOcrError:
-            raise
-        except Exception as exc:  # pragma: no cover - exercised only with real PDF renderer failures.
-            raise RegionOcrError(f"Could not render OCR region on page {page}: {exc}") from exc
-        finally:
-            document.close()
-
-        image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        )
+        prepared, _diagnostics, _adaptive_config = _prepare_ocr_image(image, adaptive=self.adaptive)
         try:
             data_kwargs = {
                 "lang": self.language,
-                "config": self.config,
+                "config": _merge_tesseract_config(self.config, "--psm 7" if self.adaptive else ""),
                 "output_type": pytesseract.Output.DICT,
             }
             if self.timeout_seconds is not None:
                 data_kwargs["timeout"] = self.timeout_seconds
-            data = pytesseract.image_to_data(image, **data_kwargs)
+            data = pytesseract.image_to_data(prepared, **data_kwargs)
         except Exception as exc:
             if exc.__class__.__name__ == "TesseractNotFoundError":
                 raise RegionOcrUnavailable("Install the tesseract OCR binary to run region OCR.") from exc
@@ -183,7 +182,7 @@ class TesseractRegionOcrEngine:
                     string_kwargs["timeout"] = self.timeout_seconds
                 text = (
                     pytesseract.image_to_string(
-                        image,
+                        prepared,
                         **string_kwargs,
                     )
                     or ""
@@ -213,7 +212,6 @@ class TesseractRegionOcrEngine:
 
         try:
             import pytesseract  # type: ignore[import-not-found]
-            from PIL import Image  # type: ignore[import-not-found]
         except ImportError as exc:
             raise RegionOcrUnavailable("Install Pillow and pytesseract to run full-document OCR.") from exc
 
@@ -225,43 +223,60 @@ class TesseractRegionOcrEngine:
         result_pages: list[DocumentOcrPage] = []
         words: list[DocumentOcrWord] = []
         confidences: list[float] = []
+        page_diagnostics: list[dict[str, Any]] = []
+        started_at = time.perf_counter()
+        budget_exhausted = False
         try:
             zoom = self.dpi / 72.0
-            matrix = fitz.Matrix(zoom, zoom)
             page_numbers = _document_page_numbers(
                 document.page_count,
                 pages=pages,
                 max_pages=max_pages,
             )
             for page_number in page_numbers:
-                page_index = page_number - 1
-                pdf_page = document.load_page(page_index)
-                page_rect = pdf_page.rect
-                try:
-                    pixmap = pdf_page.get_pixmap(
-                        matrix=matrix,
-                        alpha=False,
-                        colorspace=fitz.csRGB,
-                    )
-                except Exception as exc:  # pragma: no cover - exercised only with real PDF renderer failures.
-                    raise RegionOcrError(f"Could not render OCR page {page_number}: {exc}") from exc
-
-                image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+                if (
+                    self.document_timeout_seconds is not None
+                    and time.perf_counter() - started_at >= self.document_timeout_seconds
+                ):
+                    budget_exhausted = True
+                    break
+                image, _page_width, _page_height = self._render_page(
+                    content,
+                    page=page_number,
+                    dpi=self.dpi,
+                )
+                image, orientation_diagnostics = _correct_page_orientation(
+                    image,
+                    pytesseract=pytesseract,
+                    timeout_seconds=self.timeout_seconds,
+                    enabled=self.adaptive,
+                )
+                prepared, diagnostics, adaptive_config = _prepare_ocr_image(
+                    image,
+                    adaptive=self.adaptive,
+                )
+                page_diagnostics.append(
+                    {"page": page_number, **orientation_diagnostics, **diagnostics}
+                )
                 try:
                     data_kwargs = {
                         "lang": self.language,
-                        "config": self.config,
+                        "config": _merge_tesseract_config(self.config, adaptive_config),
                         "output_type": pytesseract.Output.DICT,
                     }
                     if self.timeout_seconds is not None:
                         data_kwargs["timeout"] = self.timeout_seconds
-                    data = pytesseract.image_to_data(image, **data_kwargs)
+                    data = pytesseract.image_to_data(prepared, **data_kwargs)
                 except Exception as exc:
                     if exc.__class__.__name__ == "TesseractNotFoundError":
                         raise RegionOcrUnavailable("Install the tesseract OCR binary to run full-document OCR.") from exc
                     raise RegionOcrError(f"Tesseract failed on page {page_number}: {exc}") from exc
 
-                page_words = _document_words_from_tesseract_data(data, page=page_number, zoom=zoom)
+                page_words = _document_words_from_tesseract_data(
+                    data,
+                    page=page_number,
+                    zoom=zoom,
+                )
                 page_confidences = [
                     word.confidence
                     for word in page_words
@@ -276,8 +291,8 @@ class TesseractRegionOcrEngine:
                 result_pages.append(
                     DocumentOcrPage(
                         page=page_number,
-                        width=float(page_rect.width),
-                        height=float(page_rect.height),
+                        width=prepared.width / zoom,
+                        height=prepared.height / zoom,
                         text=_page_text_from_tesseract_data(data),
                         confidence=page_confidence,
                     )
@@ -291,8 +306,63 @@ class TesseractRegionOcrEngine:
             pages=result_pages,
             words=words,
             confidence=confidence,
-            method="tesseract_document",
+            method="tesseract_adaptive_document" if self.adaptive else "tesseract_document",
+            diagnostics={
+                "render_cache_entries": len(self._page_cache),
+                "page_preprocessing": page_diagnostics,
+                "requested_pages": page_numbers,
+                "processed_pages": [page.page for page in result_pages],
+                "document_budget_exhausted": budget_exhausted,
+            },
         )
+
+    def _render_page(
+        self,
+        content: bytes,
+        *,
+        page: int,
+        dpi: int,
+    ) -> tuple[Any, float, float]:
+        try:
+            import fitz  # type: ignore[import-not-found]
+            from PIL import Image  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise RegionOcrUnavailable("Install PyMuPDF and Pillow to render PDF pages for OCR.") from exc
+
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != self._content_digest:
+            self._content_digest = digest
+            self._page_cache.clear()
+        cache_key = (page, dpi)
+        cached = self._page_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            document = fitz.open(stream=content, filetype="pdf")
+            if page < 1 or page > document.page_count:
+                raise RegionOcrError(f"OCR page {page} is outside the PDF page range.")
+            pdf_page = document.load_page(page - 1)
+            page_rect = pdf_page.rect
+            pixmap = pdf_page.get_pixmap(
+                matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0),
+                alpha=False,
+                colorspace=fitz.csRGB,
+            )
+            rendered = (
+                Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples),
+                float(page_rect.width),
+                float(page_rect.height),
+            )
+        except RegionOcrError:
+            raise
+        except Exception as exc:  # pragma: no cover - renderer-specific failure.
+            raise RegionOcrError(f"Could not render OCR page {page}: {exc}") from exc
+        finally:
+            if "document" in locals():
+                document.close()
+        self._page_cache[cache_key] = rendered
+        return rendered
 
 
 def apply_low_confidence_region_ocr(
@@ -305,6 +375,7 @@ def apply_low_confidence_region_ocr(
     padding: float = OCR_REGION_PADDING,
     max_regions: int | None = OCR_MAX_REGIONS,
     target_fields: Iterable[str] = (),
+    only_target_fields: bool = False,
     engine: RegionOcrEngine | None = None,
     field_updater: RegionOcrFieldUpdater | None = None,
 ) -> dict[str, Any]:
@@ -314,6 +385,7 @@ def apply_low_confidence_region_ocr(
         threshold=threshold,
         padding=padding,
         target_fields=target_fields,
+        only_target_fields=only_target_fields,
     )
     if max_regions is None:
         attempted_candidates = candidates
@@ -411,19 +483,21 @@ def low_confidence_ocr_regions(
     threshold: float = OCR_CONFIDENCE_THRESHOLD,
     padding: float = OCR_REGION_PADDING,
     target_fields: Iterable[str] = (),
+    only_target_fields: bool = False,
 ) -> list[OcrRegionCandidate]:
     page_dimensions = _page_dimensions(pages)
     found: list[OcrRegionCandidate] = []
     seen: set[tuple[str, int, tuple[int, int, int, int]]] = set()
-    _collect_low_confidence_regions(
-        fields,
-        path=(),
-        page_dimensions=page_dimensions,
-        threshold=threshold,
-        padding=padding,
-        found=found,
-        seen=seen,
-    )
+    if not only_target_fields:
+        _collect_low_confidence_regions(
+            fields,
+            path=(),
+            page_dimensions=page_dimensions,
+            threshold=threshold,
+            padding=padding,
+            found=found,
+            seen=seen,
+        )
     _collect_target_field_regions(
         fields=fields,
         pages=pages,
@@ -545,6 +619,7 @@ def _candidate_from_field(
     page_dimensions: dict[int, tuple[float, float]],
     threshold: float,
     padding: float,
+    minimum_padding: bool = False,
 ) -> OcrRegionCandidate | None:
     confidence = _confidence_value(value.get("confidence"))
     ambiguity_reasons = _ambiguity_reasons(value)
@@ -558,6 +633,12 @@ def _candidate_from_field(
     if bbox is None:
         return None
     padded_bbox = _padded_bbox(bbox, padding=padding, dimensions=page_dimensions.get(page))
+    if minimum_padding:
+        padded_bbox = _minimum_padded_bbox(
+            bbox,
+            padded_bbox,
+            dimensions=page_dimensions.get(page),
+        )
     if padded_bbox[2] <= padded_bbox[0] or padded_bbox[3] <= padded_bbox[1]:
         return None
     return OcrRegionCandidate(
@@ -594,6 +675,24 @@ def _collect_target_field_regions(
             continue
         field = fields.get(field_key)
         if isinstance(field, dict):
+            candidate = _candidate_from_field(
+                field,
+                path=path,
+                page_dimensions=page_dimensions,
+                threshold=threshold,
+                padding=padding,
+                minimum_padding=True,
+            )
+            if candidate is not None:
+                key = (
+                    _format_path(path),
+                    candidate.page,
+                    tuple(round(item * 100) for item in candidate.padded_bbox),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    found.append(candidate)
+                continue
             confidence = _confidence_value(field.get("confidence"))
             reasons = _ambiguity_reasons(field)
             if confidence is not None and confidence >= threshold and not reasons:
@@ -751,6 +850,25 @@ def _padded_bbox(
     )
 
 
+def _minimum_padded_bbox(
+    bbox: tuple[float, float, float, float],
+    padded_bbox: tuple[float, float, float, float],
+    *,
+    dimensions: tuple[float, float] | None,
+) -> tuple[float, float, float, float]:
+    x0, top, x1, bottom = bbox
+    padded = (
+        min(padded_bbox[0], max(0.0, x0 - 8.0)),
+        min(padded_bbox[1], max(0.0, top - 4.0)),
+        max(padded_bbox[2], x1 + 8.0),
+        max(padded_bbox[3], bottom + 4.0),
+    )
+    if dimensions is None:
+        return padded
+    width, height = dimensions
+    return padded[0], padded[1], min(width, padded[2]), min(height, padded[3])
+
+
 def _field_at_path(fields: dict[str, Any], path: tuple[str | int, ...]) -> dict[str, Any] | None:
     target: Any = fields
     for part in path:
@@ -842,6 +960,128 @@ def _replace_field_with_ocr_text(
     return True
 
 
+def _correct_page_orientation(
+    image: Any,
+    *,
+    pytesseract: Any,
+    timeout_seconds: float | None,
+    enabled: bool,
+) -> tuple[Any, dict[str, Any]]:
+    if not enabled:
+        return image, {"rotation": 0, "orientation_method": "disabled"}
+    probe = image.copy()
+    probe.thumbnail((1600, 1600))
+    kwargs: dict[str, Any] = {"lang": "osd", "config": "--psm 0"}
+    if timeout_seconds is not None:
+        kwargs["timeout"] = timeout_seconds
+    try:
+        osd = pytesseract.image_to_osd(probe, **kwargs)
+    except Exception:
+        return image, {"rotation": 0, "orientation_method": "osd_unavailable"}
+    match = re.search(r"Rotate:\s*(0|90|180|270)", str(osd))
+    rotation = int(match.group(1)) if match else 0
+    if rotation:
+        image = image.rotate(-rotation, expand=True, fillcolor="white")
+    return image, {"rotation": rotation, "orientation_method": "tesseract_osd"}
+
+
+def _prepare_ocr_image(image: Any, *, adaptive: bool) -> tuple[Any, dict[str, Any], str]:
+    if not adaptive:
+        return image, {"variant": "original", "opencv": False}, ""
+    try:
+        import cv2  # type: ignore[import-not-found]
+        import numpy as np  # type: ignore[import-not-found]
+        from PIL import Image  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            from PIL import ImageOps  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise RegionOcrUnavailable("Install Pillow to prepare images for OCR.") from exc
+        return (
+            ImageOps.autocontrast(image.convert("L")),
+            {"variant": "autocontrast", "opencv": False},
+            "--psm 6",
+        )
+
+    rgb = np.asarray(image.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    contrast = float(gray.std())
+    enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    _threshold, foreground = cv2.threshold(
+        enhanced,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    angle = _estimate_skew_angle(foreground, cv2=cv2, np=np)
+    if 0.35 <= abs(angle) <= 5.0:
+        height, width = enhanced.shape
+        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
+        enhanced = cv2.warpAffine(
+            enhanced,
+            matrix,
+            (width, height),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+        _threshold, foreground = cv2.threshold(
+            enhanced,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )
+    else:
+        angle = 0.0
+
+    ink_ratio = float(np.count_nonzero(foreground)) / float(foreground.size or 1)
+    if contrast < 15.0:
+        prepared = cv2.adaptiveThreshold(
+            enhanced,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            35,
+            15,
+        )
+        variant = "deskewed_adaptive_threshold" if angle else "adaptive_threshold"
+    else:
+        prepared = enhanced
+        variant = "deskewed_clahe" if angle else "clahe"
+    psm = 11 if ink_ratio < 0.025 else 4
+    return (
+        Image.fromarray(prepared),
+        {
+            "variant": variant,
+            "opencv": True,
+            "contrast_stddev": round(contrast, 2),
+            "deskew_degrees": round(angle, 3),
+            "ink_ratio": round(ink_ratio, 4),
+            "psm": psm,
+        },
+        f"--psm {psm}",
+    )
+
+
+def _estimate_skew_angle(foreground: Any, *, cv2: Any, np: Any) -> float:
+    coordinates = np.column_stack(np.where(foreground > 0))
+    if len(coordinates) < 20:
+        return 0.0
+    angle = float(cv2.minAreaRect(coordinates[:, ::-1].astype("float32"))[-1])
+    if angle < -45:
+        angle = 90 + angle
+    elif angle > 45:
+        angle -= 90
+    return angle
+
+
+def _merge_tesseract_config(base: str, adaptive: str) -> str:
+    if not adaptive:
+        return base
+    without_psm = re.sub(r"(?:^|\s)--psm\s+\d+", "", base).strip()
+    return " ".join(part for part in (without_psm, adaptive) if part)
+
+
 def _text_from_tesseract_data(data: dict[str, Any]) -> tuple[str, float | None]:
     words: list[str] = []
     confidences: list[float] = []
@@ -865,7 +1105,14 @@ def _text_from_tesseract_data(data: dict[str, Any]) -> tuple[str, float | None]:
     return " ".join(words).strip(), average_confidence
 
 
-def _document_words_from_tesseract_data(data: dict[str, Any], *, page: int, zoom: float) -> list[DocumentOcrWord]:
+def _document_words_from_tesseract_data(
+    data: dict[str, Any],
+    *,
+    page: int,
+    zoom: float,
+    rotation: int = 0,
+    original_pixel_size: tuple[int, int] | None = None,
+) -> list[DocumentOcrWord]:
     words: list[DocumentOcrWord] = []
     texts = data.get("text") or []
     raw_confidences = data.get("conf") or []
@@ -885,10 +1132,19 @@ def _document_words_from_tesseract_data(data: dict[str, Any], *, page: int, zoom
         if not clean_text:
             continue
         try:
-            x0 = float(left) / zoom
-            y0 = float(top) / zoom
-            x1 = (float(left) + float(width)) / zoom
-            y1 = (float(top) + float(height)) / zoom
+            pixel_bbox = (
+                float(left),
+                float(top),
+                float(left) + float(width),
+                float(top) + float(height),
+            )
+            if rotation and original_pixel_size is not None:
+                pixel_bbox = _inverse_rotated_bbox(
+                    pixel_bbox,
+                    rotation=rotation,
+                    original_pixel_size=original_pixel_size,
+                )
+            x0, y0, x1, y1 = (coordinate / zoom for coordinate in pixel_bbox)
         except (TypeError, ValueError):
             continue
         if x1 <= x0 or y1 <= y0:
@@ -905,6 +1161,30 @@ def _document_words_from_tesseract_data(data: dict[str, Any], *, page: int, zoom
             )
         )
     return words
+
+
+def _inverse_rotated_bbox(
+    bbox: tuple[float, float, float, float],
+    *,
+    rotation: int,
+    original_pixel_size: tuple[int, int],
+) -> tuple[float, float, float, float]:
+    original_width, original_height = original_pixel_size
+    x0, y0, x1, y1 = bbox
+    corners = ((x0, y0), (x1, y0), (x0, y1), (x1, y1))
+    mapped: list[tuple[float, float]] = []
+    for x, y in corners:
+        if rotation == 90:
+            mapped.append((y, original_height - x))
+        elif rotation == 180:
+            mapped.append((original_width - x, original_height - y))
+        elif rotation == 270:
+            mapped.append((original_width - y, x))
+        else:
+            mapped.append((x, y))
+    x_values = [point[0] for point in mapped]
+    y_values = [point[1] for point in mapped]
+    return min(x_values), min(y_values), max(x_values), max(y_values)
 
 
 def _page_text_from_tesseract_data(data: dict[str, Any]) -> str:

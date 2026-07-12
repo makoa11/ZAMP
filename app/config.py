@@ -9,7 +9,12 @@ from typing import Dict
 
 from cryptography.fernet import Fernet
 
-from .invoice_ocr import OCR_MAX_DOCUMENT_PAGES, OCR_MAX_REGIONS
+from .invoice_ocr import (
+    OCR_MAX_DOCUMENT_PAGES,
+    OCR_MAX_REGIONS,
+    OCR_REFINEMENT_DPI,
+    OCR_RENDER_DPI,
+)
 
 
 class ConfigError(RuntimeError):
@@ -69,6 +74,17 @@ def _optional_int_env(
     return parsed
 
 
+def _float_env(name: str, env_file_values: Dict[str, str], default: float) -> float:
+    value = _env(name, env_file_values, str(default))
+    try:
+        parsed = float(str(value))
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number.") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{name} must be greater than 0.")
+    return parsed
+
+
 def _derive_signing_secret(secret: str, purpose: str) -> str:
     return hmac.new(
         secret.encode("utf-8"),
@@ -114,6 +130,10 @@ class AppConfig:
     microsoft_tenant_id: str
     mail_parse_ocr_max_regions: int
     mail_parse_ocr_max_document_pages: int | None
+    mail_parse_ocr_render_dpi: int
+    mail_parse_ocr_refinement_dpi: int
+    mail_parse_ocr_timeout_seconds: float
+    mail_parse_document_timeout_seconds: float
 
     @property
     def logout_return_url(self) -> str:
@@ -174,6 +194,28 @@ def load_config(root: Path | None = None) -> AppConfig:
         "MAIL_PARSE_OCR_MAX_DOCUMENT_PAGES",
         env_file_values,
         OCR_MAX_DOCUMENT_PAGES,
+    )
+    mail_parse_ocr_render_dpi = _int_env(
+        "MAIL_PARSE_OCR_RENDER_DPI",
+        env_file_values,
+        OCR_RENDER_DPI,
+    )
+    mail_parse_ocr_refinement_dpi = _int_env(
+        "MAIL_PARSE_OCR_REFINEMENT_DPI",
+        env_file_values,
+        OCR_REFINEMENT_DPI,
+    )
+    if mail_parse_ocr_refinement_dpi < mail_parse_ocr_render_dpi:
+        raise ConfigError("MAIL_PARSE_OCR_REFINEMENT_DPI must be at least MAIL_PARSE_OCR_RENDER_DPI.")
+    mail_parse_ocr_timeout_seconds = _float_env(
+        "MAIL_PARSE_OCR_TIMEOUT_SECONDS",
+        env_file_values,
+        15.0,
+    )
+    mail_parse_document_timeout_seconds = _float_env(
+        "MAIL_PARSE_DOCUMENT_TIMEOUT_SECONDS",
+        env_file_values,
+        90.0,
     )
     mail_token_encryption_key = _env("MAIL_TOKEN_ENCRYPTION_KEY", env_file_values)
     if mail_token_encryption_key:
@@ -247,4 +289,8 @@ def load_config(root: Path | None = None) -> AppConfig:
         microsoft_tenant_id=_env("MICROSOFT_TENANT_ID", env_file_values, "common") or "common",
         mail_parse_ocr_max_regions=mail_parse_ocr_max_regions,
         mail_parse_ocr_max_document_pages=mail_parse_ocr_max_document_pages,
+        mail_parse_ocr_render_dpi=mail_parse_ocr_render_dpi,
+        mail_parse_ocr_refinement_dpi=mail_parse_ocr_refinement_dpi,
+        mail_parse_ocr_timeout_seconds=mail_parse_ocr_timeout_seconds,
+        mail_parse_document_timeout_seconds=mail_parse_document_timeout_seconds,
     )

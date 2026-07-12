@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -13,7 +14,10 @@ from .invoice_ocr import (
     OCR_CONFIDENCE_THRESHOLD,
     OCR_MAX_DOCUMENT_PAGES,
     OCR_MAX_REGIONS,
+    OCR_REFINEMENT_DPI,
+    OCR_RENDER_DPI,
     OCR_REGION_PADDING,
+    OCR_TIMEOUT_SECONDS,
     OcrRegionCandidate,
     RegionOcrEngine,
     RegionOcrUnavailable,
@@ -21,10 +25,17 @@ from .invoice_ocr import (
     TesseractRegionOcrEngine,
     apply_low_confidence_region_ocr,
 )
+from .invoice_pipeline import (
+    PageProfile,
+    blocking_validation_failures,
+    pipeline_metadata,
+    profile_document_pages,
+    validate_invoice_fields,
+)
 
-PARSER_VERSION = "static-pdf-v3"
+PARSER_VERSION = "static-pdf-v4"
 OCR_AMBIGUOUS_MIN_CONFIDENCE = 0.70
-PARSER_REVIEW_CONFIDENCE_THRESHOLD = OCR_CONFIDENCE_THRESHOLD
+PARSER_REVIEW_CONFIDENCE_THRESHOLD = 0.80
 REQUIRED_NORMALIZED_FIELDS = (
     "invoice_number",
     "issue_date",
@@ -191,6 +202,7 @@ LABELS: dict[str, tuple[str, ...]] = {
     ),
     "subtotal": (
         "subtotal",
+        "credit subtotal",
         "goods value",
         "billed amount",
         "net services",
@@ -269,6 +281,7 @@ LABELS: dict[str, tuple[str, ...]] = {
     ),
     "balance_due": (
         "balance due",
+        "credit balance",
         "amount due",
         "total due",
         "left balance",
@@ -552,10 +565,25 @@ def parse_invoice_pdf(
     ocr_padding: float = OCR_REGION_PADDING,
     ocr_max_regions: int | None = OCR_MAX_REGIONS,
     ocr_max_document_pages: int | None = OCR_MAX_DOCUMENT_PAGES,
+    ocr_render_dpi: int = OCR_RENDER_DPI,
+    ocr_refinement_dpi: int = OCR_REFINEMENT_DPI,
+    ocr_timeout_seconds: float | None = OCR_TIMEOUT_SECONDS,
+    document_timeout_seconds: float | None = 90.0,
     ocr_engine: RegionOcrEngine | None = None,
     document_ocr_engine: DocumentOcrEngine | None = None,
 ) -> dict[str, Any]:
+    pipeline_started_at = time.perf_counter()
     warnings: list[str] = []
+    default_ocr_engine: TesseractRegionOcrEngine | None = None
+    if enable_ocr and ocr_engine is None and document_ocr_engine is None:
+        default_ocr_engine = TesseractRegionOcrEngine(
+            dpi=ocr_render_dpi,
+            refinement_dpi=ocr_refinement_dpi,
+            timeout_seconds=ocr_timeout_seconds,
+            document_timeout_seconds=document_timeout_seconds,
+        )
+        ocr_engine = default_ocr_engine
+        document_ocr_engine = default_ocr_engine
     try:
         import pdfplumber  # type: ignore[import-not-found]
     except ImportError:
@@ -568,6 +596,7 @@ def parse_invoice_pdf(
     pages: list[dict[str, Any]] = []
     words: list[Word] = []
     char_count = 0
+    page_char_counts: dict[int, int] = {}
 
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -583,6 +612,7 @@ def parse_invoice_pdf(
                 )
                 page_chars = getattr(page, "chars", []) or []
                 char_count += len(page_chars)
+                page_char_counts[page_index] = len(page_chars)
                 for raw_word in page.extract_words(
                     x_tolerance=1.5,
                     y_tolerance=3,
@@ -610,6 +640,13 @@ def parse_invoice_pdf(
             source_id=source_id,
         )
 
+    profiles = profile_document_pages(
+        pages,
+        words,
+        page_char_counts=page_char_counts,
+    )
+    native_extraction_ms = (time.perf_counter() - pipeline_started_at) * 1000
+
     if _has_no_text_layer(char_count, words):
         if enable_ocr and enable_full_ocr_fallback:
             full_ocr = _run_full_document_ocr(
@@ -630,13 +667,61 @@ def parse_invoice_pdf(
                 words = _ocr_words_to_parser_words(ocr_result)
                 full_ocr_summary["trigger"] = "no_text_layer"
                 full_ocr_summary["missing_fields_before"] = list(REQUIRED_NORMALIZED_FIELDS)
-                return _parse_words_result(
-                    words=words,
+                fields = _extract_fields_from_words(words, warnings)
+                _calibrate_ocr_field_confidences(fields, words)
+                _tag_full_document_ocr_fields(fields)
+                targeted_fields = _adaptive_ocr_escalation_fields(fields, pages, profiles)
+                if ocr_engine is None:
+                    region_summary = _skipped_region_ocr_summary(
+                        targeted_fields=targeted_fields,
+                        max_regions=ocr_max_regions,
+                        reason="region_ocr_engine_unavailable",
+                    )
+                elif _pipeline_budget_exhausted(pipeline_started_at, document_timeout_seconds):
+                    region_summary = _skipped_region_ocr_summary(
+                        targeted_fields=targeted_fields,
+                        max_regions=ocr_max_regions,
+                        reason="document_time_budget_exhausted",
+                    )
+                else:
+                    region_summary = apply_low_confidence_region_ocr(
+                        content,
+                        fields=fields,
+                        pages=pages,
+                        warnings=warnings,
+                        threshold=ocr_confidence_threshold,
+                        padding=ocr_padding,
+                        max_regions=ocr_max_regions,
+                        target_fields=targeted_fields,
+                        only_target_fields=True,
+                        engine=ocr_engine,
+                        field_updater=lambda field, candidate, ocr_text: _replace_field_with_ocr_result(
+                            fields,
+                            field,
+                            candidate,
+                            ocr_text,
+                        ),
+                    )
+                region_summary["full_document"] = full_ocr_summary
+                return _finalize_parse_result(
+                    fields=fields,
                     pages=pages,
                     warnings=warnings,
                     source_id=source_id,
-                    ocr_summary={"full_document": full_ocr_summary},
-                    tag_fields_as_full_ocr=True,
+                    ocr_summary=region_summary,
+                    page_profiles=profiles,
+                    pipeline_started_at=pipeline_started_at,
+                    native_extraction_ms=native_extraction_ms,
+                    pipeline_configuration=_pipeline_configuration(
+                        ocr_confidence_threshold=ocr_confidence_threshold,
+                        ocr_padding=ocr_padding,
+                        ocr_max_regions=ocr_max_regions,
+                        ocr_max_document_pages=ocr_max_document_pages,
+                        ocr_render_dpi=ocr_render_dpi,
+                        ocr_refinement_dpi=ocr_refinement_dpi,
+                        ocr_timeout_seconds=ocr_timeout_seconds,
+                        document_timeout_seconds=document_timeout_seconds,
+                    ),
                 )
         return _empty_result(
             "needs_review" if enable_ocr and enable_full_ocr_fallback else "no_text_layer",
@@ -655,8 +740,43 @@ def parse_invoice_pdf(
     fields = _extract_fields_from_words(words, warnings)
     ocr_summary = None
     if enable_ocr:
-        targeted_fields = _ocr_escalation_fields(fields, pages)
-        region_ocr_summary = apply_low_confidence_region_ocr(
+        escalation_fields = (
+            _adaptive_ocr_escalation_fields(fields, pages, profiles)
+            if default_ocr_engine is not None
+            else _ocr_escalation_fields(fields, pages)
+        )
+        full_ocr_summary = None
+        if (
+            default_ocr_engine is not None
+            and escalation_fields
+            and enable_full_ocr_fallback
+            and not _pipeline_budget_exhausted(pipeline_started_at, document_timeout_seconds)
+        ):
+            full_ocr_summary = _merge_full_document_ocr(
+                content,
+                fields=fields,
+                pages=pages,
+                warnings=warnings,
+                ocr_engine=ocr_engine,
+                document_ocr_engine=document_ocr_engine,
+                escalation_fields=escalation_fields,
+                ocr_max_document_pages=ocr_max_document_pages,
+            )
+
+        targeted_fields = (
+            _adaptive_ocr_escalation_fields(fields, pages, profiles)
+            if default_ocr_engine is not None
+            else _ocr_escalation_fields(fields, pages)
+        )
+        if _pipeline_budget_exhausted(pipeline_started_at, document_timeout_seconds):
+            _append_warning_once(warnings, "Local OCR document time budget was exhausted.")
+            ocr_summary = _skipped_region_ocr_summary(
+                targeted_fields=targeted_fields,
+                max_regions=ocr_max_regions,
+                reason="document_time_budget_exhausted",
+            )
+        else:
+            ocr_summary = apply_low_confidence_region_ocr(
             content,
             fields=fields,
             pages=pages,
@@ -665,6 +785,7 @@ def parse_invoice_pdf(
             padding=ocr_padding,
             max_regions=ocr_max_regions,
             target_fields=targeted_fields,
+            only_target_fields=default_ocr_engine is not None,
             engine=ocr_engine,
             field_updater=lambda field, candidate, ocr_text: _replace_field_with_ocr_result(
                 fields,
@@ -672,48 +793,23 @@ def parse_invoice_pdf(
                 candidate,
                 ocr_text,
             ),
-        )
-        ocr_summary = region_ocr_summary
+            )
 
-        escalation_fields = _ocr_escalation_fields(fields, pages)
-        missing_after_region_ocr = _missing_required_normalized_fields(fields)
-        if escalation_fields and enable_full_ocr_fallback:
-            selected_pages = _important_ocr_pages(
-                pages,
-                target_fields=escalation_fields,
-                max_pages=ocr_max_document_pages,
-            )
-            full_ocr = _run_full_document_ocr(
-                content,
-                warnings=warnings,
-                ocr_engine=ocr_engine,
-                document_ocr_engine=document_ocr_engine,
-                page_numbers=selected_pages,
-                max_pages=ocr_max_document_pages,
-            )
-            if full_ocr is not None:
-                ocr_result, full_ocr_summary = full_ocr
-                full_ocr_summary["trigger"] = (
-                    "missing_required_fields" if missing_after_region_ocr else "unresolved_fields"
+        if default_ocr_engine is None:
+            escalation_fields = _ocr_escalation_fields(fields, pages)
+            if escalation_fields and enable_full_ocr_fallback:
+                full_ocr_summary = _merge_full_document_ocr(
+                    content,
+                    fields=fields,
+                    pages=pages,
+                    warnings=warnings,
+                    ocr_engine=ocr_engine,
+                    document_ocr_engine=document_ocr_engine,
+                    escalation_fields=escalation_fields,
+                    ocr_max_document_pages=ocr_max_document_pages,
                 )
-                full_ocr_summary["missing_fields_before"] = missing_after_region_ocr
-                full_ocr_summary["target_fields"] = escalation_fields
-                full_ocr_warnings: list[str] = []
-                full_ocr_fields = _extract_fields_from_words(
-                    _ocr_words_to_parser_words(ocr_result),
-                    full_ocr_warnings,
-                )
-                _tag_full_document_ocr_fields(full_ocr_fields)
-                applied_fields = _merge_ocr_fields(
-                    fields,
-                    full_ocr_fields,
-                    target_fields=escalation_fields,
-                )
-                full_ocr_summary["applied_fields"] = applied_fields
-                full_ocr_summary["missing_fields_after"] = _missing_required_normalized_fields(fields)
-                for warning in full_ocr_warnings:
-                    _append_warning_once(warnings, f"Full-document OCR parse: {warning}")
-                ocr_summary["full_document"] = full_ocr_summary
+        if full_ocr_summary is not None:
+            ocr_summary["full_document"] = full_ocr_summary
 
     return _finalize_parse_result(
         fields=fields,
@@ -721,6 +817,19 @@ def parse_invoice_pdf(
         warnings=warnings,
         source_id=source_id,
         ocr_summary=ocr_summary,
+        page_profiles=profiles,
+        pipeline_started_at=pipeline_started_at,
+        native_extraction_ms=native_extraction_ms,
+        pipeline_configuration=_pipeline_configuration(
+            ocr_confidence_threshold=ocr_confidence_threshold,
+            ocr_padding=ocr_padding,
+            ocr_max_regions=ocr_max_regions,
+            ocr_max_document_pages=ocr_max_document_pages,
+            ocr_render_dpi=ocr_render_dpi,
+            ocr_refinement_dpi=ocr_refinement_dpi,
+            ocr_timeout_seconds=ocr_timeout_seconds,
+            document_timeout_seconds=document_timeout_seconds,
+        ),
     )
 
 
@@ -732,9 +841,14 @@ def _parse_words_result(
     source_id: str | None,
     ocr_summary: dict[str, Any] | None = None,
     tag_fields_as_full_ocr: bool = False,
+    page_profiles: list[PageProfile] | None = None,
+    pipeline_started_at: float | None = None,
+    native_extraction_ms: float = 0.0,
+    pipeline_configuration: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fields = _extract_fields_from_words(words, warnings)
     if tag_fields_as_full_ocr:
+        _calibrate_ocr_field_confidences(fields, words)
         _tag_full_document_ocr_fields(fields)
     return _finalize_parse_result(
         fields=fields,
@@ -742,6 +856,10 @@ def _parse_words_result(
         warnings=warnings,
         source_id=source_id,
         ocr_summary=ocr_summary,
+        page_profiles=page_profiles,
+        pipeline_started_at=pipeline_started_at,
+        native_extraction_ms=native_extraction_ms,
+        pipeline_configuration=pipeline_configuration,
     )
 
 
@@ -752,21 +870,48 @@ def _finalize_parse_result(
     warnings: list[str],
     source_id: str | None,
     ocr_summary: dict[str, Any] | None = None,
+    page_profiles: list[PageProfile] | None = None,
+    pipeline_started_at: float | None = None,
+    native_extraction_ms: float = 0.0,
+    pipeline_configuration: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     missing_required_fields = _missing_required_normalized_fields(fields)
     field_issues = _field_review_issues(fields)
+    validations = validate_invoice_fields(fields)
+    validation_failures = blocking_validation_failures(validations)
     _add_missing_warnings(fields, warnings)
-    needs_review = bool(missing_required_fields or field_issues)
+    for failure in validation_failures:
+        _append_warning_once(warnings, f"Invoice validation failed: {failure}.")
+    needs_review = bool(missing_required_fields or field_issues or validation_failures)
+    tracking = _ocr_tracking_metadata(
+        fields=fields,
+        ocr_summary=ocr_summary,
+        missing_required_fields=missing_required_fields,
+    )
+    total_ms = (
+        (time.perf_counter() - pipeline_started_at) * 1000
+        if pipeline_started_at is not None
+        else 0.0
+    )
+    ocr_diagnostics = _ocr_diagnostics(ocr_summary)
     result = {
         "status": "needs_review" if needs_review else "parsed",
         "parser_version": PARSER_VERSION,
         "fields": fields,
         "pages": pages,
         "warnings": warnings,
-        **_ocr_tracking_metadata(
-            fields=fields,
-            ocr_summary=ocr_summary,
-            missing_required_fields=missing_required_fields,
+        **tracking,
+        "pipeline": pipeline_metadata(
+            profiles=page_profiles or [],
+            ocr_used=bool(tracking["ocr_used"]),
+            validations=validations,
+            timings_ms={
+                "native_extraction": native_extraction_ms,
+                "ocr_and_resolution": max(0.0, total_ms - native_extraction_ms),
+                "total": total_ms,
+            },
+            ocr_diagnostics=ocr_diagnostics,
+            configuration=pipeline_configuration,
         ),
     }
     if needs_review:
@@ -776,9 +921,12 @@ def _finalize_parse_result(
                 "missing_required_normalized_data"
                 if missing_required_fields
                 else "low_confidence_or_ambiguous_fields"
+                if field_issues
+                else "failed_invoice_validation"
             ),
             "missing_fields": missing_required_fields,
             "field_issues": field_issues,
+            "validation_failures": validation_failures,
         }
     if ocr_summary is not None:
         result["ocr"] = ocr_summary
@@ -794,6 +942,14 @@ def _field_review_issues(fields: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(field, dict):
             continue
         _append_field_review_issue(issues, key, field)
+    for index, item in enumerate(fields.get("line_items") or []):
+        if not isinstance(item, dict):
+            continue
+        for role in ("description", "quantity", "amount"):
+            field = item.get(role)
+            if not isinstance(field, dict) or "ocr" not in str(field.get("method") or ""):
+                continue
+            _append_field_review_issue(issues, f"line_items[{index}].{role}", field)
     return issues
 
 
@@ -805,9 +961,15 @@ def _append_field_review_issue(
     confidence = _normalized_confidence(field.get("confidence"))
     reasons = _field_ambiguity_reasons(field)
     material_reasons = [reason for reason in reasons if reason != "weak_geometry"]
+    method = str(field.get("method") or "")
+    threshold = (
+        OCR_CONFIDENCE_THRESHOLD
+        if "ocr" in method
+        else PARSER_REVIEW_CONFIDENCE_THRESHOLD
+    )
     if (
         confidence is not None
-        and confidence >= PARSER_REVIEW_CONFIDENCE_THRESHOLD
+        and confidence >= threshold
         and not material_reasons
     ):
         return
@@ -836,6 +998,63 @@ def _ocr_tracking_metadata(
             missing_required_fields=missing_required_fields,
         ),
         "ocr_failed_parts": missing_required_fields if ocr_used else [],
+    }
+
+
+def _ocr_diagnostics(ocr_summary: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(ocr_summary, dict):
+        return {}
+    full_document = ocr_summary.get("full_document")
+    if not isinstance(full_document, dict):
+        return {}
+    diagnostics = full_document.get("diagnostics")
+    return diagnostics if isinstance(diagnostics, dict) else {}
+
+
+def _pipeline_configuration(
+    *,
+    ocr_confidence_threshold: float,
+    ocr_padding: float,
+    ocr_max_regions: int | None,
+    ocr_max_document_pages: int | None,
+    ocr_render_dpi: int,
+    ocr_refinement_dpi: int,
+    ocr_timeout_seconds: float | None,
+    document_timeout_seconds: float | None,
+) -> dict[str, Any]:
+    return {
+        "ocr_confidence_threshold": round(ocr_confidence_threshold, 3),
+        "ocr_padding": round(ocr_padding, 3),
+        "ocr_max_regions": ocr_max_regions,
+        "ocr_max_document_pages": ocr_max_document_pages,
+        "ocr_render_dpi": ocr_render_dpi,
+        "ocr_refinement_dpi": ocr_refinement_dpi,
+        "ocr_timeout_seconds": ocr_timeout_seconds,
+        "document_timeout_seconds": document_timeout_seconds,
+    }
+
+
+def _pipeline_budget_exhausted(started_at: float, timeout_seconds: float | None) -> bool:
+    return timeout_seconds is not None and time.perf_counter() - started_at >= timeout_seconds
+
+
+def _skipped_region_ocr_summary(
+    *,
+    targeted_fields: list[str],
+    max_regions: int | None,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "reason": reason,
+        "max_regions": max_regions,
+        "candidate_count": len(targeted_fields),
+        "attempted_count": 0,
+        "applied_count": 0,
+        "skipped_count": len(targeted_fields),
+        "failed_count": 0,
+        "capped_region_count": 0,
+        "regions": [],
     }
 
 
@@ -934,6 +1153,54 @@ def _extract_fields_from_words(words: list[Word], warnings: list[str]) -> dict[s
     return _extract_fields(lines=lines, words=words, warnings=warnings)
 
 
+def _merge_full_document_ocr(
+    content: bytes,
+    *,
+    fields: dict[str, Any],
+    pages: list[dict[str, Any]],
+    warnings: list[str],
+    ocr_engine: RegionOcrEngine | None,
+    document_ocr_engine: DocumentOcrEngine | None,
+    escalation_fields: list[str],
+    ocr_max_document_pages: int | None,
+) -> dict[str, Any] | None:
+    missing_before = _missing_required_normalized_fields(fields)
+    selected_pages = _important_ocr_pages(
+        pages,
+        target_fields=escalation_fields,
+        max_pages=ocr_max_document_pages,
+    )
+    full_ocr = _run_full_document_ocr(
+        content,
+        warnings=warnings,
+        ocr_engine=ocr_engine,
+        document_ocr_engine=document_ocr_engine,
+        page_numbers=selected_pages,
+        max_pages=ocr_max_document_pages,
+    )
+    if full_ocr is None:
+        return None
+
+    ocr_result, summary = full_ocr
+    summary["trigger"] = "missing_required_fields" if missing_before else "unresolved_fields"
+    summary["missing_fields_before"] = missing_before
+    summary["target_fields"] = escalation_fields
+    full_ocr_warnings: list[str] = []
+    ocr_words = _ocr_words_to_parser_words(ocr_result)
+    full_ocr_fields = _extract_fields_from_words(ocr_words, full_ocr_warnings)
+    _calibrate_ocr_field_confidences(full_ocr_fields, ocr_words)
+    _tag_full_document_ocr_fields(full_ocr_fields)
+    summary["applied_fields"] = _merge_ocr_fields(
+        fields,
+        full_ocr_fields,
+        target_fields=escalation_fields,
+    )
+    summary["missing_fields_after"] = _missing_required_normalized_fields(fields)
+    for warning in full_ocr_warnings:
+        _append_warning_once(warnings, f"Full-document OCR parse: {warning}")
+    return summary
+
+
 def _run_full_document_ocr(
     content: bytes,
     *,
@@ -973,10 +1240,15 @@ def _run_full_document_ocr(
         "max_pages": max_pages,
         "word_count": len(ocr_result.words),
         "confidence": round(ocr_result.confidence, 3) if ocr_result.confidence is not None else None,
+        "diagnostics": ocr_result.diagnostics,
     }
     if not ocr_result.words:
         summary["reason"] = "no_ocr_words"
         _append_warning_once(warnings, "Full-document OCR did not extract any words.")
+    if ocr_result.diagnostics.get("document_budget_exhausted") is True:
+        summary["status"] = "partial"
+        summary["reason"] = "document_time_budget_exhausted"
+        _append_warning_once(warnings, "Full-document OCR stopped at the document time budget.")
     return ocr_result, summary
 
 
@@ -996,6 +1268,7 @@ def _filter_document_ocr_result(
         words=result_words,
         confidence=(sum(confidences) / len(confidences) if confidences else result.confidence),
         method=result.method,
+        diagnostics=result.diagnostics,
     )
 
 
@@ -1049,6 +1322,36 @@ def _tag_full_document_ocr_fields(value: Any) -> None:
     elif isinstance(value, list):
         for child in value:
             _tag_full_document_ocr_fields(child)
+
+
+def _calibrate_ocr_field_confidences(value: Any, words: list[Word]) -> None:
+    if isinstance(value, dict):
+        bbox = value.get("bbox")
+        page = value.get("page")
+        if (
+            isinstance(bbox, list)
+            and len(bbox) == 4
+            and isinstance(page, int)
+            and isinstance(value.get("confidence"), int | float)
+        ):
+            confidences = sorted(
+                word.confidence
+                for word in words
+                if word.page == page
+                and word.confidence is not None
+                and bbox[0] <= (word.x0 + word.x1) / 2 <= bbox[2]
+                and bbox[1] <= (word.top + word.bottom) / 2 <= bbox[3]
+            )
+            if confidences:
+                percentile_index = min(len(confidences) - 1, max(0, round((len(confidences) - 1) * 0.2)))
+                ocr_confidence = float(confidences[percentile_index])
+                value["confidence"] = round(min(float(value["confidence"]), ocr_confidence), 3)
+                value["ocr_word_confidence"] = round(ocr_confidence, 3)
+        for child in value.values():
+            _calibrate_ocr_field_confidences(child, words)
+    elif isinstance(value, list):
+        for child in value:
+            _calibrate_ocr_field_confidences(child, words)
 
 
 def _merge_ocr_fields(
@@ -1122,6 +1425,53 @@ def _ocr_escalation_fields(
                 targets.append(key)
         elif key == "line_items" and _line_items_need_review(value):
             targets.append(key)
+    return targets
+
+
+def _adaptive_ocr_escalation_fields(
+    fields: dict[str, Any],
+    pages: list[dict[str, Any]],
+    profiles: list[PageProfile],
+) -> list[str]:
+    degraded_pages = any(profile.route != "native_text" for profile in profiles)
+    validation_failures = set(blocking_validation_failures(validate_invoice_fields(fields)))
+    targets: list[str] = []
+    for key in OCR_FALLBACK_FIELDS:
+        value = fields.get(key)
+        missing = not _has_normalized_field(fields, key)
+        if missing:
+            if key in REQUIRED_NORMALIZED_FIELDS or (degraded_pages and _pages_mention_field(pages, key)):
+                targets.append(key)
+            continue
+        if isinstance(value, dict):
+            material_reasons = [
+                reason
+                for reason in _field_ambiguity_reasons(value)
+                if reason != "weak_geometry"
+            ]
+            confidence = _normalized_confidence(value.get("confidence"))
+            if (
+                key in REQUIRED_NORMALIZED_FIELDS or degraded_pages
+            ) and (
+                material_reasons
+                or confidence is None
+                or confidence < PARSER_REVIEW_CONFIDENCE_THRESHOLD
+            ):
+                targets.append(key)
+        elif key == "line_items" and (
+            degraded_pages or "line_item_sum" in validation_failures
+        ):
+            targets.append(key)
+    if "amount_composition" in validation_failures:
+        for key in ("subtotal", "discount", "tax", "shipping", "paid", "balance_due"):
+            if key not in targets:
+                targets.append(key)
+    if "currency_consistency" in validation_failures and "currency" not in targets:
+        targets.append("currency")
+    if "date_order" in validation_failures:
+        for key in ("issue_date", "due_date"):
+            if key not in targets:
+                targets.append(key)
     return targets
 
 
@@ -1314,6 +1664,7 @@ def _extract_fields(
 
     for key in ("invoice_number", "issue_date", "due_date", "purchase_order", "terms"):
         fields[key] = _best_scalar_field(lines, key)
+    _resolve_date_candidates(fields)
 
     fields["seller"] = _party_field(lines, "seller")
     fields["buyer"] = _party_field(lines, "buyer")
@@ -1324,9 +1675,165 @@ def _extract_fields(
         fields[key] = _best_money_field(lines, key, inferred_currency)
 
     fields["line_items"] = _line_items_from_word_tables(words, lines, inferred_currency)
+    _resolve_amount_candidates(fields)
     _add_line_item_total_warnings(fields, warnings)
 
     return fields
+
+
+def _resolve_amount_candidates(fields: dict[str, Any]) -> None:
+    balance_due = fields.get("balance_due")
+    if not isinstance(balance_due, dict):
+        return
+    subtotal = _field_amount(fields.get("subtotal"))
+    if subtotal is None:
+        subtotal = _line_item_amount_sum(fields.get("line_items"))
+    if subtotal is None:
+        return
+
+    expected = (
+        subtotal
+        - abs(_field_amount(fields.get("discount")) or 0.0)
+        + (_field_amount(fields.get("tax")) or 0.0)
+        + (_field_amount(fields.get("shipping")) or 0.0)
+        - (_field_amount(fields.get("paid")) or 0.0)
+    )
+    candidates = [balance_due]
+    alternatives = balance_due.get("alternatives")
+    if isinstance(alternatives, list):
+        candidates.extend(candidate for candidate in alternatives if isinstance(candidate, dict))
+    candidates_with_amounts = [
+        (candidate, amount)
+        for candidate in candidates
+        if (amount := _field_amount(candidate)) is not None
+    ]
+    if not candidates_with_amounts:
+        return
+    selected, selected_amount = min(
+        candidates_with_amounts,
+        key=lambda item: abs(item[1] - expected),
+    )
+    tolerance = max(0.02, abs(expected) * 0.001)
+    if abs(selected_amount - expected) > tolerance:
+        return
+
+    resolved = dict(selected)
+    remaining = [
+        dict(candidate)
+        for candidate, amount in candidates_with_amounts
+        if candidate is not selected and amount != selected_amount
+    ]
+    if remaining:
+        resolved["alternatives"] = remaining[:5]
+    else:
+        resolved.pop("alternatives", None)
+    reasons = [
+        reason
+        for reason in _field_ambiguity_reasons(resolved)
+        if reason not in {"multiple_totals", "weak_geometry"}
+    ]
+    if reasons:
+        resolved["ambiguity_reasons"] = reasons
+    else:
+        resolved.pop("ambiguity_reasons", None)
+    resolved["confidence"] = max(float(resolved.get("confidence") or 0.0), 0.93)
+    resolved["method"] = f"constraint_resolved:{resolved.get('method') or 'candidate'}"
+    resolved["resolution"] = {
+        "rule": "amount_composition",
+        "expected": round(expected, 2),
+    }
+    fields["balance_due"] = resolved
+
+
+def _resolve_date_candidates(fields: dict[str, Any]) -> None:
+    issue_field = fields.get("issue_date")
+    due_field = fields.get("due_date")
+    if not isinstance(issue_field, dict) or not isinstance(due_field, dict):
+        return
+    issue_candidates = _possible_dates(str(issue_field.get("raw") or ""))
+    due_candidates = _possible_dates(str(due_field.get("raw") or ""))
+    if not issue_candidates or not due_candidates:
+        return
+    valid_pairs = [
+        (issue, due)
+        for issue in issue_candidates
+        for due in due_candidates
+        if 0 <= (due - issue).days <= 366
+    ]
+    if not valid_pairs:
+        return
+    issue, due = min(
+        valid_pairs,
+        key=lambda pair: (
+            0 if (pair[1] - pair[0]).days <= 120 else 1,
+            (pair[1] - pair[0]).days,
+        ),
+    )
+    _apply_resolved_date(issue_field, issue, issue_candidates)
+    _apply_resolved_date(due_field, due, due_candidates)
+
+
+def _possible_dates(raw: str) -> list[date]:
+    digits = re.sub(r"\D", "", raw)
+    candidates: list[date] = []
+    if len(digits) == 8 and digits.startswith(("19", "20")):
+        parsed = _safe_date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+        if parsed:
+            candidates.append(parsed)
+    elif len(digits) in {6, 8}:
+        first = int(digits[:2])
+        second = int(digits[2:4])
+        year = int(digits[4:])
+        if len(digits) == 6:
+            year = _normalize_year(year)
+        for month, day in ((second, first), (first, second)):
+            parsed = _safe_date(year, month, day)
+            if parsed and parsed not in candidates:
+                candidates.append(parsed)
+    else:
+        separated = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b", raw)
+        if separated:
+            first, second, year = (int(part) for part in separated.groups())
+            year = _normalize_year(year)
+            for month, day in ((second, first), (first, second)):
+                parsed = _safe_date(year, month, day)
+                if parsed and parsed not in candidates:
+                    candidates.append(parsed)
+    return candidates
+
+
+def _apply_resolved_date(field: dict[str, Any], selected: date, candidates: list[date]) -> None:
+    selected_value = selected.isoformat()
+    alternatives = [candidate.isoformat() for candidate in candidates if candidate != selected]
+    if field.get("value") != selected_value:
+        field["value"] = selected_value
+        field["method"] = f"date_order_resolved:{field.get('method') or 'candidate'}"
+        field["confidence"] = max(float(field.get("confidence") or 0.0), 0.93)
+    if alternatives:
+        field["date_alternatives"] = alternatives
+
+
+def _field_amount(value: Any) -> float | None:
+    if not isinstance(value, dict):
+        return None
+    raw = value.get("amount", value.get("value"))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _line_item_amount_sum(value: Any) -> float | None:
+    if not isinstance(value, list) or not value:
+        return None
+    amounts = [
+        _field_amount(item.get("amount"))
+        for item in value
+        if isinstance(item, dict)
+    ]
+    if len(amounts) != len(value) or any(amount is None for amount in amounts):
+        return None
+    return sum(amount for amount in amounts if amount is not None)
 
 
 def _best_scalar_field(lines: list[Line], key: str) -> dict[str, Any] | None:
@@ -1338,7 +1845,7 @@ def _best_scalar_field(lines: list[Line], key: str) -> dict[str, Any] | None:
             if _is_shadowed_by_longer_known_label(line, match):
                 continue
             if identifier_key:
-                identifier = _identifier_after_label(lines, line, match)
+                identifier = _identifier_after_label(lines, line, match, key=key)
                 if identifier is None:
                     continue
                 raw, value, bbox, method = identifier
@@ -1379,8 +1886,6 @@ def _best_scalar_field(lines: list[Line], key: str) -> dict[str, Any] | None:
                 )
             )
 
-    if identifier_key and len({_field_comparison_value(item) for item in candidates}) > 1:
-        return None
     return _best_candidate(
         candidates,
         ambiguity_reason="multiple_scalar_values",
@@ -1392,6 +1897,8 @@ def _identifier_after_label(
     lines: list[Line],
     line: Line,
     match: LabelMatch,
+    *,
+    key: str,
 ) -> tuple[str, str, list[float] | None, str] | None:
     same_line_words = _words_after_label_before_next_field(line, match)
     identifier = _leading_identifier_word_span(same_line_words)
@@ -1402,14 +1909,37 @@ def _identifier_after_label(
     if same_line_words:
         return None
 
-    candidate = _next_visual_line(lines, line)
-    if candidate is None or _matches_any_known_label(candidate):
+    anchor_x = line.words[match.start].x0
+    nearby: list[tuple[float, float, str, str, tuple[Word, ...]]] = []
+    line_mid = (line.top + line.bottom) / 2
+    for candidate in lines:
+        if candidate is line or candidate.page != line.page or _matches_any_known_label(candidate):
+            continue
+        candidate_mid = (candidate.top + candidate.bottom) / 2
+        vertical_distance = abs(candidate_mid - line_mid)
+        identifier = _nearest_identifier_word_span(candidate.words, anchor_x=anchor_x)
+        if identifier is None:
+            continue
+        raw, value, selected_words = identifier
+        if key == "invoice_number" and re.match(r"^PO[-#/:]", value, re.IGNORECASE):
+            continue
+        nearby.append(
+            (
+                vertical_distance,
+                abs(selected_words[0].x0 - anchor_x),
+                raw,
+                value,
+                selected_words,
+            )
+        )
+    if not nearby:
         return None
-    identifier = _nearest_identifier_word_span(candidate.words, anchor_x=line.words[match.start].x0)
-    if identifier is None:
-        return None
-    raw, value, selected_words = identifier
-    return raw, value, _bbox_for_words(selected_words), "below"
+    _vertical, _horizontal, raw, value, selected_words = min(
+        nearby,
+        key=lambda item: (item[0], item[1]),
+    )
+    method = "nearby_above" if selected_words[0].top < line.top else "nearby_below"
+    return raw, value, _bbox_for_words(selected_words), method
 
 
 def _words_after_label_before_next_field(line: Line, match: LabelMatch) -> tuple[Word, ...]:
@@ -2237,9 +2767,31 @@ def _table_rows_from_header(words: list[Word], header: TableHeader) -> list[Word
                 key=lambda item: (item.top, item.x0),
             )
         )
+        row_words = _trim_overlapping_total_panel_words(row_words, header)
+        if row_words and all(word.x0 >= header.region_x1 - 12.0 for word in row_words):
+            continue
         if row_words:
             rows.append(_make_word_table_row(row_words, header))
     return rows
+
+
+def _trim_overlapping_total_panel_words(
+    words: tuple[Word, ...],
+    header: TableHeader,
+) -> tuple[Word, ...]:
+    if not words:
+        return words
+    ordered = tuple(sorted(words, key=lambda word: word.x0))
+    first_money_index = _first_money_like_word_index(ordered)
+    if first_money_index >= len(ordered):
+        return ordered
+    for start, _end in _total_label_spans(ordered):
+        if start <= first_money_index:
+            continue
+        label_x0 = ordered[start].x0
+        if label_x0 >= header.line.x0 + (header.region_x1 - header.line.x0) * 0.6:
+            return ordered[:start]
+    return ordered
 
 
 def _group_words_by_y(words: Iterable[Word]) -> list[tuple[Word, ...]]:
@@ -2611,7 +3163,11 @@ def _description_words_before_amount(row: WordTableRow) -> tuple[Word, ...]:
 
 
 def _clean_line_item_description(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip(" :-")
+    value = re.sub(r"\s+", " ", text).strip(" :-")
+    tokens = value.split()
+    while tokens and _is_currency_word(tokens[-1]):
+        tokens.pop()
+    return " ".join(tokens).strip(" :-")
 
 
 def _header_role_score(roles: frozenset[str]) -> int:
@@ -3325,6 +3881,21 @@ def _best_candidate(
             reasons = _field_ambiguity_reasons(selected)
             if ambiguity_reason not in reasons:
                 selected["ambiguity_reasons"] = [*reasons, ambiguity_reason]
+        alternatives: list[dict[str, Any]] = []
+        selected_value = _field_comparison_value(selected)
+        for candidate in ranked[1:]:
+            candidate_value = _field_comparison_value(candidate)
+            if not candidate_value or candidate_value == selected_value:
+                continue
+            alternatives.append(
+                {
+                    key: value
+                    for key, value in candidate.items()
+                    if key not in {"alternatives", "ambiguity_reasons"}
+                }
+            )
+        if alternatives:
+            selected["alternatives"] = alternatives[:5]
     return selected
 
 
