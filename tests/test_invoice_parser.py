@@ -12,11 +12,13 @@ from app.invoice_overlay import highlight_boxes_for_mode
 from app.invoice_parser import (
     Word,
     _best_money_field,
+    _best_scalar_field,
     _build_lines,
     _group_words_by_y,
     _infer_currency,
     _infer_table_header,
     _line_items_from_word_tables,
+    _normalize_ocr_scalar_value,
     _parse_amount,
     _parse_date,
     _party_field,
@@ -213,6 +215,81 @@ class ParserPrimitiveTests(unittest.TestCase):
         self.assertEqual(field["amount"], 216.0)
         self.assertEqual(field["raw"], "USD 216.00")
         self.assertGreaterEqual(field["bbox"][0], 300)
+
+    def test_identifier_fields_prefer_header_values_over_later_prose_mentions(self) -> None:
+        words = [
+            _word("Invoice", 300, 10),
+            _word("No.", 340, 10),
+            _word("INV-1042", 365, 10),
+            _word("Purchase", 300, 24),
+            _word("Order", 350, 24),
+            _word("PO-7788", 385, 24),
+            _word("Please", 20, 180),
+            _word("confirm", 55, 180),
+            _word("the", 95, 180),
+            _word("invoice", 115, 180),
+            _word("number", 160, 180),
+            _word("before", 205, 180),
+            _word("step", 245, 180),
+            _word("9001", 275, 180),
+            _word("Purchase", 20, 198),
+            _word("order", 70, 198),
+            _word("validated", 105, 198),
+            _word("during", 160, 198),
+            _word("cleanup", 200, 198),
+            _word("488705354820", 250, 198),
+        ]
+        lines = _build_lines(words)
+
+        invoice_number = _best_scalar_field(lines, "invoice_number")
+        purchase_order = _best_scalar_field(lines, "purchase_order")
+
+        self.assertIsNotNone(invoice_number)
+        self.assertIsNotNone(purchase_order)
+        assert invoice_number is not None and purchase_order is not None
+        self.assertEqual(invoice_number["value"], "INV-1042")
+        self.assertEqual(purchase_order["value"], "PO-7788")
+
+    def test_purchase_order_does_not_skip_intervening_text_to_guess_a_value(self) -> None:
+        lines = _build_lines([
+            _word("Purchase", 20, 10),
+            _word("order", 70, 10),
+            _word("VALIDATED", 115, 10),
+            _word("IMPORT", 170, 10),
+            _word("CLEANUP", 215, 10),
+            _word("AND", 265, 10),
+            _word("RECONCILIATION", 285, 10, 307),
+            _word("488705354820", 310, 10),
+        ])
+
+        purchase_order = _best_scalar_field(lines, "purchase_order")
+
+        self.assertIsNone(purchase_order)
+
+    def test_identifier_can_be_on_the_next_visual_line_without_a_distance_cutoff(self) -> None:
+        number = _word("INV-9001", 25, 300)
+        lines = _build_lines([
+            _word("Invoice", 20, 10),
+            _word("number", 58, 10),
+            number,
+        ])
+
+        invoice_number = _best_scalar_field(lines, "invoice_number")
+
+        self.assertIsNotNone(invoice_number)
+        assert invoice_number is not None
+        self.assertEqual(invoice_number["value"], "INV-9001")
+        self.assertEqual(invoice_number["bbox"], [number.x0, number.top, number.x1, number.bottom])
+
+    def test_ocr_identifier_normalization_rejects_non_adjacent_prose(self) -> None:
+        self.assertIsNone(
+            _normalize_ocr_scalar_value(
+                "purchase_order",
+                "VALIDATED IMPORT CLEANUP AND RECONCILIATION 488705354820",
+            )
+        )
+        self.assertEqual(_normalize_ocr_scalar_value("purchase_order", "PO-7788"), "PO-7788")
+        self.assertEqual(_normalize_ocr_scalar_value("invoice_number", "#1204-26"), "#1204-26")
 
     def test_currency_inference_uses_rmb_before_ambiguous_yen_glyph(self) -> None:
         lines = _build_lines([
@@ -464,8 +541,8 @@ class InvoiceParserTests(unittest.TestCase):
         result = parse_invoice_pdf(_simple_invoice_pdf(), source_id="fixture:manual")
         fields = result["fields"]
 
-        self.assertEqual(result["status"], "needs_review")
-        self.assertEqual(result["review"]["reason"], "low_confidence_or_ambiguous_fields")
+        self.assertEqual(result["status"], "parsed")
+        self.assertNotIn("review", result)
         self.assertEqual(fields["invoice_number"]["value"], "INV-2026-0042")
         self.assertEqual(fields["issue_date"]["value"], "2026-06-10")
         self.assertEqual(fields["due_date"]["value"], "2026-07-10")

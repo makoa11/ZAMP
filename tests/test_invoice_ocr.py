@@ -521,6 +521,31 @@ class InvoiceOcrTests(unittest.TestCase):
         self.assertEqual(applied, "ocr_confidence_below_threshold")
         self.assertEqual(fields["invoice_number"]["value"], "INV-OLD")
 
+    def test_missing_identifier_requires_document_layout_instead_of_broad_region_text(self) -> None:
+        fields = {"invoice_number": {}}
+        candidate = OcrRegionCandidate(
+            path=("invoice_number",),
+            page=1,
+            bbox=(0, 0, 100, 40),
+            padded_bbox=(0, 0, 100, 40),
+            confidence=0.0,
+            reason="missing_field",
+        )
+
+        applied = _replace_field_with_ocr_result(
+            fields,
+            fields["invoice_number"],
+            candidate,
+            RegionOcrText(
+                text="Invoice number mentioned in reconciliation 488705354820",
+                confidence=0.96,
+                method="fake_region",
+            ),
+        )
+
+        self.assertEqual(applied, "ocr_identifier_requires_document_layout")
+        self.assertEqual(fields["invoice_number"], {})
+
     def test_parser_ocr_replacement_rejects_missing_confidence(self) -> None:
         fields = {
             "invoice_number": {
@@ -733,6 +758,27 @@ class InvoiceOcrTests(unittest.TestCase):
 
         self.assertEqual(engine.calls, [([1, 5], 2)])
         self.assertEqual(result["ocr"]["full_document"]["selected_pages"], [1, 5])
+
+    def test_full_document_ocr_scans_every_page_by_default(self) -> None:
+        canvases = []
+        for _index in range(5):
+            canvas = _PdfCanvas(
+                width_pt=210 * MM_TO_PT,
+                height_pt=297 * MM_TO_PT,
+                font_style="system",
+            )
+            canvas.rect(10, 10, 30, 20, fill="#ffffff", stroke="#111827")
+            canvases.append(canvas)
+        engine = PageLimitedOcrEngine()
+
+        result = parse_invoice_pdf(
+            _build_pdf(canvases),
+            document_ocr_engine=engine,
+        )
+
+        self.assertEqual(engine.calls, [([1, 5, 2, 3, 4], None)])
+        self.assertEqual(result["ocr"]["full_document"]["selected_pages"], [1, 5, 2, 3, 4])
+        self.assertIsNone(result["ocr"]["full_document"]["max_pages"])
 
 
 if __name__ == "__main__":

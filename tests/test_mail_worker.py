@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.mail_worker import _handle_job, _renew_subscriptions_safely, _storage_pdf_path
+from app.mail_worker import _handle_job, _parser_revision, _renew_subscriptions_safely, _storage_pdf_path
 
 
 class TestRepo:
@@ -60,6 +60,16 @@ class MailWorkerRenewalTests(unittest.TestCase):
         )
 
         self.assertFalse(_renew_subscriptions_safely(integration))  # type: ignore[arg-type]
+
+    def test_parser_revision_records_unlimited_document_ocr(self) -> None:
+        integration = SimpleNamespace(
+            config=SimpleNamespace(
+                mail_parse_ocr_max_regions=8,
+                mail_parse_ocr_max_document_pages=None,
+            )
+        )
+
+        self.assertIn("ocr-pages=all", _parser_revision(integration))
 
 
 def _field(value: object, *, confidence: float = 0.95) -> dict[str, object]:

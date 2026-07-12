@@ -120,3 +120,13 @@ class ConfigTests(unittest.TestCase):
                 config = load_config(root)
 
         self.assertEqual(config.mail_parse_ocr_max_document_pages, 2)
+
+    def test_mail_parse_ocr_document_pages_are_unlimited_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(root, self._base_env())
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        self.assertIsNone(config.mail_parse_ocr_max_document_pages)
