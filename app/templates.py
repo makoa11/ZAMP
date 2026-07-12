@@ -843,6 +843,72 @@ def invoice_samples_page(
     return page("Invoice variations - ZAMP", body)
 
 
+def invoice_showcase_page(*, documents: list[dict[str, Any]]) -> str:
+    groups: list[str] = []
+    for document in documents:
+        group = str(document["group"])
+        if group not in groups:
+            groups.append(group)
+
+    sections = []
+    for group in groups:
+        cards = []
+        for document in documents:
+            if document["group"] != group:
+                continue
+            tags = "".join(
+                f'<span class="showcase-tag">{_e(str(tag))}</span>'
+                for tag in document["tags"]
+            )
+            slug = _e(str(document["slug"]))
+            title = _e(str(document["title"]))
+            preview_pages = "".join(
+                f'<img class="showcase-page" '
+                f'src="/showcase/{slug}/pages/{page_number}.png" '
+                f'alt="{title}, page {page_number} of {int(document["page_count"])}" '
+                f'loading="lazy">'
+                for page_number in range(1, int(document["page_count"]) + 1)
+            )
+            cards.append(
+                f"""
+      <article class="showcase-card">
+        <header class="showcase-card-header">
+          <div>
+            <p class="showcase-page-count">{int(document["page_count"])} PDF pages</p>
+            <h2>{title}</h2>
+            <p>{_e(str(document["description"]))}</p>
+          </div>
+          <div class="showcase-tags" aria-label="Coverage">{tags}</div>
+        </header>
+        <div class="showcase-preview" aria-label="{title} PDF preview">
+          {preview_pages}
+        </div>
+      </article>"""
+            )
+        sections.append(
+            f"""
+    <section class="showcase-section" aria-labelledby="showcase-{_e(group.lower().replace(' ', '-'))}">
+      <div class="showcase-section-heading">
+        <p class="eyebrow">PDF corpus</p>
+        <h1 id="showcase-{_e(group.lower().replace(' ', '-'))}">{_e(group)}</h1>
+      </div>
+      <div class="showcase-grid">{''.join(cards)}</div>
+    </section>"""
+        )
+
+    body = f"""
+<main class="showcase-shell">
+  <header class="showcase-hero">
+    <p class="eyebrow">Invoice generation coverage</p>
+    <h1>Invoice PDF showcase</h1>
+    <p>One representative PDF for every clean invoice type, accounts payable scenario, rendering stress case, page size, and scan degradation. PDFs load as they enter the viewport.</p>
+  </header>
+  {''.join(sections)}
+</main>
+"""
+    return page("Invoice PDF showcase - ZAMP", body)
+
+
 def _invoice_preview(sample: dict[str, Any]) -> str:
     template = sample["template"]
     paper = sample["paper"]

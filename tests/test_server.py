@@ -161,6 +161,76 @@ class ServerRouteTests(unittest.TestCase):
         self.assertTrue(body.startswith(b"%PDF-1.4"))
         self.assertTrue(body.rstrip().endswith(b"%%EOF"))
 
+    def test_showcase_route_embeds_hidden_invoice_pdf_suites(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = b"GET /showcase HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn(" 200 ", response.splitlines()[0])
+        self.assertIn("Invoice PDF showcase", response)
+        self.assertIn('/showcase/clean-ledger-clean/pages/1.png', response)
+        self.assertIn('/showcase/stress-multipage-continuation/pages/3.png', response)
+        self.assertIn('/showcase/ap-credit_memo_negative_balance/pages/1.png', response)
+        self.assertNotIn("<iframe", response)
+        self.assertNotIn('<a href="/showcase', response)
+        self.assertNotIn("<button", response)
+
+    def test_showcase_page_image_route_returns_png_without_pdf_viewer(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = (
+            b"GET /showcase/clean-ledger-clean/pages/1.png HTTP/1.1\r\n"
+            b"Host: localhost\r\n\r\n"
+        )
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue()
+        header, body = response.split(b"\r\n\r\n", 1)
+
+        self.assertIn(b" 200 ", header.splitlines()[0])
+        self.assertIn(b"Content-Type: image/png", header)
+        self.assertTrue(body.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_showcase_pdf_route_returns_inline_pdf(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = b"GET /showcase/stress-invoice-number-seal-occlusion.pdf HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue()
+        header, body = response.split(b"\r\n\r\n", 1)
+
+        self.assertIn(b" 200 ", header.splitlines()[0])
+        self.assertIn(b"Content-Type: application/pdf", header)
+        self.assertIn(
+            b'Content-Disposition: inline; filename="invoice-showcase-stress-invoice-number-seal-occlusion.pdf"',
+            header,
+        )
+        self.assertTrue(body.startswith(b"%PDF-1.4"))
+        self.assertTrue(body.rstrip().endswith(b"%%EOF"))
+
+    def test_unknown_showcase_pdf_returns_not_found(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = b"GET /showcase/not-a-suite.pdf HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn(" 404 ", response.splitlines()[0])
+        self.assertIn("PDF not found.", response)
+
     def test_dashboard_uses_database_invoice_queue_not_generated_samples(self) -> None:
         class MailIntegration:
             def __init__(self) -> None:

@@ -1124,6 +1124,144 @@ pre {
   align-items: start;
 }
 
+.showcase-shell {
+  width: min(100%, 1480px);
+  margin: 0 auto;
+  padding: 40px 20px 72px;
+}
+
+.showcase-hero {
+  max-width: 760px;
+  margin-bottom: 42px;
+}
+
+.showcase-hero h1 {
+  margin: 4px 0 10px;
+  font-size: clamp(32px, 5vw, 58px);
+  letter-spacing: -0.045em;
+}
+
+.showcase-hero > p:last-child,
+.showcase-card-header > div > p:last-child {
+  color: var(--muted);
+}
+
+.showcase-section + .showcase-section {
+  margin-top: 56px;
+}
+
+.showcase-section-heading {
+  margin-bottom: 18px;
+}
+
+.showcase-section-heading h1 {
+  margin: 3px 0 0;
+  font-size: clamp(24px, 3vw, 34px);
+}
+
+.showcase-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.showcase-card {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+
+.showcase-card-header {
+  min-height: 188px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 20px;
+}
+
+.showcase-card-header h2 {
+  margin: 4px 0 8px;
+  font-size: 20px;
+}
+
+.showcase-card-header p {
+  margin: 0;
+}
+
+.showcase-page-count {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.showcase-tags {
+  flex: 0 0 150px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.showcase-tag {
+  padding: 5px 8px;
+  color: var(--muted);
+  background: var(--panel-muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.showcase-preview {
+  display: grid;
+  gap: 18px;
+  padding: 18px;
+  border-top: 1px solid var(--line);
+  background: #e9e7e2;
+}
+
+.showcase-page {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #fff;
+  border: 1px solid rgba(23, 32, 38, 0.14);
+  box-shadow: 0 10px 30px rgba(23, 32, 38, 0.14);
+}
+
+@media (max-width: 900px) {
+  .showcase-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .showcase-shell {
+    padding: 28px 12px 48px;
+  }
+
+  .showcase-card-header {
+    min-height: 0;
+    display: grid;
+  }
+
+  .showcase-tags {
+    justify-content: flex-start;
+  }
+
+  .showcase-preview {
+    gap: 10px;
+    padding: 10px;
+  }
+}
+
 .invoice-sample {
   min-width: 0;
   background: var(--panel);

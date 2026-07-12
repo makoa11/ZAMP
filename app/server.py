@@ -26,11 +26,24 @@ from .invoice_generator import (
     template_options,
 )
 from .invoice_pdf import render_invoice_pdf
+from .invoice_showcase import (
+    SHOWCASE_DOCUMENTS,
+    render_showcase_page_png,
+    render_showcase_pdf,
+    showcase_document,
+)
 from .mail_service import MailIntegration
 from .mail_store import MailIntegrationError
 from .mail_webhook_auth import WebhookAuthenticationError, verify_google_oidc_token
 from .security import generate_csrf_token, sign_value, unsign_value, valid_signed_pair
-from .templates import dashboard_page, error_page, invoice_samples_page, login_page, signup_page
+from .templates import (
+    dashboard_page,
+    error_page,
+    invoice_samples_page,
+    invoice_showcase_page,
+    login_page,
+    signup_page,
+)
 from .workos_auth import (
     RequestMeta,
     WorkOSAuthService,
@@ -284,6 +297,15 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/settings":
             self._handle_settings_get(parsed.query)
+            return
+        if parsed.path == "/showcase":
+            self._handle_invoice_showcase_get()
+            return
+        if parsed.path.startswith("/showcase/") and parsed.path.endswith(".pdf"):
+            self._handle_invoice_showcase_pdf_get(parsed.path)
+            return
+        if parsed.path.startswith("/showcase/") and "/pages/" in parsed.path and parsed.path.endswith(".png"):
+            self._handle_invoice_showcase_page_image_get(parsed.path)
             return
         if parsed.path == "/invoice-samples":
             self._handle_invoice_samples_get(parsed.query)
@@ -1384,6 +1406,66 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             headers={
                 "Content-Disposition": 'inline; filename="invoice-samples.pdf"',
             },
+        )
+
+    def _handle_invoice_showcase_get(self) -> None:
+        documents = [
+            {
+                "slug": document.slug,
+                "title": document.title,
+                "group": document.group,
+                "description": document.description,
+                "page_count": document.page_count,
+                "tags": document.tags,
+            }
+            for document in SHOWCASE_DOCUMENTS
+        ]
+        self._send_html(
+            HTTPStatus.OK,
+            invoice_showcase_page(documents=documents),
+        )
+
+    def _handle_invoice_showcase_pdf_get(self, path: str) -> None:
+        slug = path.removeprefix("/showcase/").removesuffix(".pdf")
+        document = showcase_document(slug)
+        if document is None:
+            self._send_html(HTTPStatus.NOT_FOUND, error_page(404, "PDF not found."))
+            return
+        content = render_showcase_pdf(slug)
+        self._send_binary(
+            HTTPStatus.OK,
+            content,
+            content_type="application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="invoice-showcase-{slug}.pdf"',
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    def _handle_invoice_showcase_page_image_get(self, path: str) -> None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[0] != "showcase" or parts[2] != "pages":
+            self._send_html(HTTPStatus.NOT_FOUND, error_page(404, "Preview not found."))
+            return
+        slug = parts[1]
+        document = showcase_document(slug)
+        try:
+            page_number = int(parts[3].removesuffix(".png"))
+        except ValueError:
+            page_number = 0
+        if document is None or page_number < 1 or page_number > document.page_count:
+            self._send_html(HTTPStatus.NOT_FOUND, error_page(404, "Preview not found."))
+            return
+        try:
+            content = render_showcase_page_png(slug, page_number)
+        except (RuntimeError, ValueError) as exc:
+            self._send_html(HTTPStatus.INTERNAL_SERVER_ERROR, error_page(500, str(exc)))
+            return
+        self._send_binary(
+            HTTPStatus.OK,
+            content,
+            content_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"},
         )
 
     def _invoice_sample_params(self, query: str) -> dict[str, Any]:
