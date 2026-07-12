@@ -1,51 +1,120 @@
-  # Setup
-  python3 -m venv .venv
-  .venv/bin/python -m pip install -r requirements.txt
+Setup
 
-  # Generate secrets for .env
-  .venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-  .venv/bin/python -c "import secrets; print(secrets.token_urlsafe(32))"
+Create and activate the virtual environment:
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 
-  # Run backend
-  .venv/bin/python main.py
+Generate secrets for `.env`:
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 
-  # Generate the default diverse parser corpus: 150 standard PDFs, 100 stress PDFs, plus manifests
-  .venv/bin/python -m app.generate_test_pdfs
+Run the backend:
+python main.py
 
-.venv/bin/python -m app.generate_test_pdfs --seed 1000 --date 2026-07-10
- .venv/bin/python scripts/seed_company_invoice_data.py --manifest-dir storage/test_pdfs  --batch-id parser-test  
 
-  # Generate a smaller quick corpus when needed
-  .venv/bin/python -m app.generate_test_pdfs --pdf-count 50
+Generate parser test PDFs
 
-  # Generate with custom output/seed/date
-  .venv/bin/python -m app.generate_test_pdfs --output-dir storage/test_pdfs --pdf-count 50 --seed 1000 --date YYYY-MM-DD
+Command:
+python -m app.generate_test_pdfs
 
-  # Generate, parse, plot boxes, normalize, decide, and write JSON/PDF artifacts without database writes
-  .venv/bin/python scripts/run_test_invoice_pipeline.py --generate --input-dir storage/test_pdfs --output-dir storage/test_invoice_pipeline --pdf-count 50 --seed 1000 --date YYYY-MM-DD --boxes all
+Parameters:
+- `output-dir`: directory where PDFs and `.manifest.json` files are written. Default: `storage/test_pdfs`
+- `pdf-count`: total number of PDFs to generate. Default: `250` (`150` standard + `100` stress). Minimum: `2`
+- `seed`: deterministic base seed. Default: `1000`. Must be greater than `0`
+- `date`: anchor date in `YYYY-MM-DD` format. Default: today
 
-  # Parse generated PDFs to JSON and overlay PDFs
-  .venv/bin/python scripts/parse_test_pdfs.py
-  .venv/bin/python scripts/parse_test_pdfs.py --limit 10
-  .venv/bin/python scripts/parse_test_pdfs.py --input-dir storage/test_pdfs --output-dir storage/parsed --boxes parsed
-  .venv/bin/python scripts/parse_test_pdfs.py --input-dir storage/test_pdfs --output-dir storage/parsed --boxes words
-  .venv/bin/python scripts/parse_test_pdfs.py --input-dir storage/test_pdfs --output-dir storage/parsed --boxes all
+Notes:
+- The default corpus writes `250` PDFs and `250` manifests.
+- Standard PDFs cover the normal sample set.
+- Stress PDFs cover parser edge cases.
 
-  # Plot boxes on one PDF
-  .venv/bin/python -m app.invoice_overlay storage/test_pdfs/invoice-sample-0001-a4-ledger-clean.pdf storage/parsed/invoice-sample-0001-a4-ledger-clean.parsed.pdf
-  .venv/bin/python -m app.invoice_overlay storage/test_pdfs/invoice-sample-0001-a4-ledger-clean.pdf storage/parsed/invoice-sample-0001-a4-ledger-clean.words.pdf --boxes words
-  .venv/bin/python -m app.invoice_overlay storage/test_pdfs/invoice-sample-0001-a4-ledger-clean.pdf storage/parsed/invoice-sample-0001-a4-ledger-clean.all.pdf --boxes all
 
-  # Run mail ingestion worker
-  .venv/bin/python -m app.mail_worker
-  .venv/bin/python -m app.mail_worker --once --limit 10
+Seed deterministic company invoice truth data
 
-  # Run tests
-  .venv/bin/python -m unittest
-  .venv/bin/python -m unittest tests.test_invoice_generator
-  .venv/bin/python -m unittest tests.test_generate_test_pdfs
-  .venv/bin/python -m unittest tests.test_invoice_parser
-  .venv/bin/python -m unittest tests.test_invoice_overlay
-  .venv/bin/python -m unittest tests.test_invoice_pdf
+Command:
+python scripts/seed_company_invoice_data.py
 
-  Important: scripts/parse_test_pdfs.py scans every PDF in the input directory, including standard samples and stress fixtures.
+Parameters:
+- `database-url`: PostgreSQL connection string. If omitted, the script uses `DATABASE_URL` from the environment or `.env`
+- `batch-id`: batch label used when replacing and joining seeded truth rows. Default: `default`
+- `manifest-dir`: directory containing `.manifest.json` files to seed directly
+- `pdf-count`: generator-mode corpus size to mirror. Default: same as `app.generate_test_pdfs`
+- `seed`: generator-mode base seed. Default: same as `app.generate_test_pdfs`
+- `date`: generator-mode anchor date in `YYYY-MM-DD` format
+- `dry-run`: print row count and sample rows without writing to the database
+
+Notes:
+- When `manifest-dir` is set, the script ignores `pdf-count`, `seed`, and `date`.
+- A database URL is required unless `dry-run` is used.
+
+
+Run the synthetic invoice pipeline
+
+Command:
+python scripts/run_test_invoice_pipeline.py
+
+Parameters:
+- `input-dir`: directory containing PDFs to process. Default: `storage/test_pdfs`
+- `output-dir`: directory where parsed, normalized, decision, audit, and summary files are written. Default: `storage/test_invoice_pipeline`
+- `limit`: maximum number of PDFs to process
+- `boxes`: overlay box mode. Allowed values: `parsed`, `words`, `all`. Default: `parsed`
+- `generate`: generate a synthetic PDF corpus into `input-dir` before running the pipeline
+- `pdf-count`: number of PDFs to generate when `generate` is set. Default: same as `app.generate_test_pdfs`
+- `seed`: deterministic base seed when `generate` is set. Default: same as `app.generate_test_pdfs`
+- `date`: generation anchor date in `YYYY-MM-DD` format when `generate` is set. Default: today
+
+Notes:
+- This script does not write to PostgreSQL.
+- It writes per-PDF parsed JSON, overlay PDF, normalized JSON, decision JSON, audit JSON, and a final `summary.json`.
+
+
+Parse generated PDFs
+
+Command:
+python scripts/parse_test_pdfs.py
+
+Parameters:
+- `input-dir`: directory containing PDFs to parse. Default: `storage/test_pdfs`
+- `output-dir`: directory where parsed JSON, overlay PDFs, and `summary.json` are written. Default: `storage/parsed`
+- `limit`: maximum number of PDFs to parse
+- `boxes`: overlay box mode. Allowed values: `parsed`, `words`, `all`. Default: `parsed`
+
+Notes:
+- The script scans every PDF in the input directory unless `limit` is set.
+- It writes one `.parsed.json` file per PDF.
+- It writes one overlay PDF per input PDF when overlay rendering succeeds.
+
+
+Render parser overlays for one PDF
+
+Command:
+python -m app.invoice_overlay INPUT_PDF OUTPUT_PDF
+
+Parameters:
+- `input_pdf`: source invoice PDF
+- `output_pdf`: output PDF with highlighted boxes
+- `boxes`: highlight mode. Allowed values: `parsed`, `words`, `all`. Default: `parsed`
+- `opacity`: overlay opacity. Default: `0.32`
+- `padding`: extra box padding. Default: `1.25`
+
+
+Run the mail worker
+
+Command:
+python -m app.mail_worker
+
+Parameters:
+- `once`: claim and process one batch, then exit
+- `limit`: maximum jobs to claim per batch. Default: `10`
+- `poll-seconds`: idle sleep between claim attempts in continuous mode. Default: `10.0`
+- `fallback-seconds`: how often to enqueue Gmail and Outlook fallback polling jobs. Default: `900`
+
+
+Run tests
+
+Command:
+python -m unittest
+
+Optional target:
+- Add a test module path such as `tests.test_generate_test_pdfs` to run one module instead of the full suite
