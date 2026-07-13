@@ -34,6 +34,19 @@ class TestSocket:
 
 
 class ServerRouteTests(unittest.TestCase):
+    def test_hidden_elements_are_not_overridden_by_component_display_styles(self) -> None:
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        request = b"GET /static/styles.css HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn(" 200 ", response.splitlines()[0])
+        self.assertIn("[hidden] {\n  display: none !important;\n}", response)
+
     def test_settings_template_discloses_opt_in_ai_fallback(self) -> None:
         content = dashboard_page(csrf_token="csrf", session={"user": {"email": "ap@example.com"}})
 
@@ -305,6 +318,14 @@ class ServerRouteTests(unittest.TestCase):
         self.assertIn("zamp-sidebar-collapsed", response)
         self.assertIn("zamp-review-queue-scroll-top", response)
         self.assertIn("zamp-review-queue-scroll-left", response)
+        self.assertIn('"zamp-bookmarked-invoice-ids:" + "user-123"', response)
+        self.assertIn("data-bookmark-filter", response)
+        self.assertIn('data-bookmark-toggle data-invoice-id="20"', response)
+        self.assertIn('data-queue-item data-invoice-id="20"', response)
+        self.assertIn('aria-label="Bookmark invoice"', response)
+        self.assertIn("refreshBookmarkUi", response)
+        self.assertIn("data-filtered-evidence-empty", response)
+        self.assertIn("selectedInvoiceIsFilteredOut", response)
         self.assertIn("data-previous-invoice", response)
         self.assertIn("data-next-invoice", response)
         self.assertIn('d="M4 6h16M4 12h16M4 18h16"', response)
@@ -358,6 +379,32 @@ class ServerRouteTests(unittest.TestCase):
         )
         self.assertIn("2</strong> shown", all_response)
         self.assertNotIn('name="review" value="needs_review" checked', all_response)
+
+        bookmarked_request = (
+            b"GET /dashboard?review=all&bookmarked=1&pdf_id=21 HTTP/1.1\r\n"
+            b"Host: localhost\r\n\r\n"
+        )
+        bookmarked_socket = TestSocket(bookmarked_request)
+        Handler(bookmarked_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        bookmarked_response = bookmarked_socket.writer.getvalue().decode("iso-8859-1")
+
+        self.assertIn('value="1" checked data-bookmark-filter', bookmarked_response)
+        self.assertIn("review=all&amp;bookmarked=1&amp;pdf_id=20", bookmarked_response)
+        self.assertIn('data-bookmark-toggle data-invoice-id="21"', bookmarked_response)
+
+        filtered_selection_request = (
+            b"GET /dashboard?review=needs_review&pdf_id=21 HTTP/1.1\r\n"
+            b"Host: localhost\r\n\r\n"
+        )
+        filtered_selection_socket = TestSocket(filtered_selection_request)
+        Handler(filtered_selection_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        filtered_selection_response = filtered_selection_socket.writer.getvalue().decode(
+            "iso-8859-1"
+        )
+
+        self.assertEqual(mail.detail_request, ("user-123", 20))
+        self.assertIn('data-invoice-id="20" data-needs-review="true"', filtered_selection_response)
+        self.assertIn('data-bookmark-toggle data-invoice-id="20"', filtered_selection_response)
 
     def test_invoice_filters_apply_review_and_date_independently(self) -> None:
         items = [

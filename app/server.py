@@ -496,6 +496,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         review_filter = query_values.get("review", ["needs_review"])[-1]
         if review_filter not in {"needs_review", "all"}:
             review_filter = "needs_review"
+        bookmarked_filter = query_values.get("bookmarked", [""])[-1] == "1"
         date_from_value = query_values.get("date_from", [""])[-1]
         date_to_value = query_values.get("date_to", [""])[-1]
         date_from = _query_date(date_from_value)
@@ -516,10 +517,10 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             next(
                 (
                     item
-                    for item in all_items
+                    for item in review_items
                     if str(item.get("pdf_file_id") or "") == selected_pdf_id
                 ),
-                None,
+                review_items[0] if review_items else None,
             )
             if selected_pdf_id
             else review_items[0] if review_items else None
@@ -538,6 +539,8 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
                 mail_notice_kind = "error"
 
         filter_parameters = {"review": review_filter}
+        if bookmarked_filter:
+            filter_parameters["bookmarked"] = "1"
         if date_from_value:
             filter_parameters["date_from"] = date_from_value
         if date_to_value:
@@ -583,6 +586,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             next_url=next_url,
         )
         queue_count = len(review_items)
+        filter_empty_hidden = " hidden" if all_items else ""
         processed_label = "invoice" if processed_count == 1 else "invoices"
         notice_html = (
             f'<div class="queue-notice"><div class="notice notice-{html_lib.escape(mail_notice_kind)}" role="status">'
@@ -618,11 +622,18 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         <p class="queue-summary"><strong>{processed_count}</strong> processed · <strong data-shown-count>{queue_count}</strong> shown</p>
         <form class="queue-filters" method="get" action="/dashboard">
           <input type="hidden" name="review" value="all">
-          <label class="review-filter-toggle">
-            <input type="checkbox" name="review" value="needs_review"{' checked' if review_filter == 'needs_review' else ''} data-review-filter>
-            <span class="toggle-track" aria-hidden="true"><span></span></span>
-            <span>Needs review</span>
-          </label>
+          <div class="queue-toggle-filters">
+            <label class="review-filter-toggle">
+              <input type="checkbox" name="review" value="needs_review"{' checked' if review_filter == 'needs_review' else ''} data-review-filter>
+              <span class="toggle-track" aria-hidden="true"><span></span></span>
+              <span>Needs review</span>
+            </label>
+            <label class="review-filter-toggle bookmark-filter-toggle">
+              <input type="checkbox" value="1"{' checked' if bookmarked_filter else ''} data-bookmark-filter>
+              <span class="toggle-track" aria-hidden="true"><span></span></span>
+              <span>Bookmarked</span>
+            </label>
+          </div>
           <div class="custom-date-filters" role="group" aria-label="Filter by received date">
             <label>
               <span>From</span>
@@ -639,26 +650,79 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
       {notice_html}
       <div class="queue-list">
       {queue_items_html}
+        <div class="empty-state filter-empty-state" data-filter-empty{filter_empty_hidden}>No invoices match these filters.</div>
       </div>
     </aside>
 
     <section class="evidence-pane" aria-label="Invoice evidence">
       {evidence_html}
+      <div class="evidence-empty filtered-evidence-empty" data-filtered-evidence-empty hidden>
+        <div>
+          <p class="eyebrow">Invoice queue</p>
+          <strong>No invoices match these filters.</strong>
+        </div>
+      </div>
     </section>
   </main>
   <script>
     (function () {{
       var form = document.querySelector(".queue-filters");
       var reviewFilter = document.querySelector("[data-review-filter]");
+      var bookmarkFilter = document.querySelector("[data-bookmark-filter]");
+      var bookmarkButton = document.querySelector("[data-bookmark-toggle]");
       var dateFrom = document.querySelector("[data-date-from]");
       var dateTo = document.querySelector("[data-date-to]");
       var shownCount = document.querySelector("[data-shown-count]");
+      var filterEmptyState = document.querySelector("[data-filter-empty]");
+      var filteredEvidenceEmpty = document.querySelector("[data-filtered-evidence-empty]");
+      var selectedEvidence = Array.prototype.slice.call(document.querySelectorAll("[data-selected-evidence]"));
       var items = Array.prototype.slice.call(document.querySelectorAll("[data-queue-item]"));
       var queuePane = document.querySelector(".queue-pane");
       var queueList = document.querySelector(".queue-list");
       var queueScrollTopStorageKey = "zamp-review-queue-scroll-top";
       var queueScrollLeftStorageKey = "zamp-review-queue-scroll-left";
-      if (!form || !reviewFilter || !dateFrom || !dateTo) return;
+      var bookmarksStorageKey = "zamp-bookmarked-invoice-ids:" + {json.dumps(owner_user_id)};
+      var bookmarks = loadBookmarks();
+      if (!form || !reviewFilter || !bookmarkFilter || !dateFrom || !dateTo) return;
+
+      function loadBookmarks() {{
+        try {{
+          var value = JSON.parse(window.localStorage.getItem(bookmarksStorageKey) || "[]");
+          if (Array.isArray(value)) {{
+            return value.reduce(function (result, invoiceId) {{
+              result[String(invoiceId)] = true;
+              return result;
+            }}, {{}});
+          }}
+        }} catch (error) {{}}
+        return {{}};
+      }}
+
+      function saveBookmarks() {{
+        try {{
+          window.localStorage.setItem(bookmarksStorageKey, JSON.stringify(Object.keys(bookmarks)));
+        }} catch (error) {{}}
+      }}
+
+      function isBookmarked(invoiceId) {{
+        return Boolean(invoiceId && bookmarks[String(invoiceId)]);
+      }}
+
+      function refreshBookmarkUi() {{
+        items.forEach(function (item) {{
+          item.classList.toggle("is-bookmarked", isBookmarked(item.dataset.invoiceId));
+        }});
+        if (bookmarkButton) {{
+          var bookmarked = isBookmarked(bookmarkButton.dataset.invoiceId);
+          var label = bookmarked ? "Remove bookmark" : "Bookmark invoice";
+          bookmarkButton.classList.toggle("is-bookmarked", bookmarked);
+          bookmarkButton.setAttribute("aria-pressed", bookmarked ? "true" : "false");
+          bookmarkButton.setAttribute("aria-label", label);
+          bookmarkButton.setAttribute("title", label);
+          var text = bookmarkButton.querySelector("[data-bookmark-label]");
+          if (text) text.textContent = bookmarked ? "Bookmarked" : "Bookmark";
+        }}
+      }}
 
       function persistQueueScroll() {{
         try {{
@@ -701,11 +765,14 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         var visible = 0;
         items.forEach(function (item) {{
           var matchesReview = !reviewFilter.checked || item.dataset.needsReview === "true";
+          var matchesBookmark = !bookmarkFilter.checked || isBookmarked(item.dataset.invoiceId);
           var matchesDate = withinDate(item.dataset.received, dateFrom.value, dateTo.value);
-          var matches = matchesReview && matchesDate;
+          var matches = matchesReview && matchesBookmark && matchesDate;
           item.hidden = !matches;
           var itemUrl = new URL(item.href);
           itemUrl.searchParams.set("review", reviewFilter.checked ? "needs_review" : "all");
+          if (bookmarkFilter.checked) itemUrl.searchParams.set("bookmarked", "1");
+          else itemUrl.searchParams.delete("bookmarked");
           if (dateFrom.value) itemUrl.searchParams.set("date_from", dateFrom.value);
           else itemUrl.searchParams.delete("date_from");
           if (dateTo.value) itemUrl.searchParams.set("date_to", dateTo.value);
@@ -714,9 +781,12 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
           if (matches) visible += 1;
         }});
         if (shownCount) shownCount.textContent = String(visible);
+        if (filterEmptyState) filterEmptyState.hidden = visible !== 0;
 
         var url = new URL(window.location.href);
         url.searchParams.set("review", reviewFilter.checked ? "needs_review" : "all");
+        if (bookmarkFilter.checked) url.searchParams.set("bookmarked", "1");
+        else url.searchParams.delete("bookmarked");
         if (dateFrom.value) url.searchParams.set("date_from", dateFrom.value);
         else url.searchParams.delete("date_from");
         if (dateTo.value) url.searchParams.set("date_to", dateTo.value);
@@ -725,6 +795,19 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
 
         var visibleItems = items.filter(function (item) {{ return !item.hidden; }});
         var activeIndex = visibleItems.findIndex(function (item) {{ return item.classList.contains("active"); }});
+        var selectedInvoiceIsFilteredOut = items.some(function (item) {{
+          return item.classList.contains("active") && item.hidden;
+        }});
+        selectedEvidence.forEach(function (section) {{
+          section.hidden = selectedInvoiceIsFilteredOut && visibleItems.length === 0;
+        }});
+        if (filteredEvidenceEmpty) {{
+          filteredEvidenceEmpty.hidden = !(selectedInvoiceIsFilteredOut && visibleItems.length === 0);
+        }}
+        if (visibleItems.length && activeIndex === -1) {{
+          window.location.replace(visibleItems[0].href);
+          return;
+        }}
         updateNavigation(document.querySelector("[data-previous-invoice]"), activeIndex > 0 ? visibleItems[activeIndex - 1] : null);
         updateNavigation(document.querySelector("[data-next-invoice]"), activeIndex >= 0 && activeIndex < visibleItems.length - 1 ? visibleItems[activeIndex + 1] : null);
       }}
@@ -747,8 +830,20 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         applyFilters();
       }});
       reviewFilter.addEventListener("change", applyFilters);
+      bookmarkFilter.addEventListener("change", applyFilters);
       dateFrom.addEventListener("change", applyFilters);
       dateTo.addEventListener("change", applyFilters);
+      if (bookmarkButton) {{
+        bookmarkButton.addEventListener("click", function () {{
+          var invoiceId = bookmarkButton.dataset.invoiceId;
+          if (!invoiceId) return;
+          if (isBookmarked(invoiceId)) delete bookmarks[invoiceId];
+          else bookmarks[invoiceId] = true;
+          saveBookmarks();
+          refreshBookmarkUi();
+          applyFilters();
+        }});
+      }}
       if (queuePane) {{
         queuePane.addEventListener("scroll", persistQueueScroll, {{ passive: true }});
       }}
@@ -758,6 +853,8 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
       items.forEach(function (item) {{
         item.addEventListener("click", persistQueueScroll);
       }});
+      refreshBookmarkUi();
+      applyFilters();
       window.requestAnimationFrame(restoreQueueScroll);
     }})();
 
@@ -823,7 +920,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         visible_pdf_ids: set[Any],
     ) -> str:
         if not review_items:
-            return '<div class="empty-state">No invoices match these filters.</div>'
+            return ""
         selected_pdf_id = selected_item.get("pdf_file_id") if selected_item else None
         return "\n".join(
             self._review_queue_item_html(
@@ -870,9 +967,12 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         )
         hidden_attr = "" if visible else " hidden"
         return f"""
-        <a class="queue-item{' active' if active else ''}" href="/dashboard?{html_lib.escape(filter_query)}&amp;pdf_id={pdf_file_id}" data-queue-item data-needs-review="{needs_review}" data-received="{received_value}"{hidden_attr}{active_attr}>
+        <a class="queue-item{' active' if active else ''}" href="/dashboard?{html_lib.escape(filter_query)}&amp;pdf_id={pdf_file_id}" data-queue-item data-invoice-id="{pdf_file_id}" data-needs-review="{needs_review}" data-received="{received_value}"{hidden_attr}{active_attr}>
           <div class="queue-header">
             <span class="queue-vendor"><span class="vendor-dot" aria-hidden="true"></span>{html_lib.escape(vendor or "Unknown vendor")}</span>
+            <span class="queue-bookmark-indicator" aria-label="Bookmarked" title="Bookmarked">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.75A1.75 1.75 0 0 1 7.75 3h8.5A1.75 1.75 0 0 1 18 4.75V21l-6-3.5L6 21V4.75Z"/></svg>
+            </span>
             <span class="queue-amount">{html_lib.escape(amount_label)}</span>
           </div>
           <div class="queue-title">{html_lib.escape(title_label)}</div>
@@ -902,7 +1002,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         )
         if not selected_item and not invoice:
             return f"""
-      <div class="evidence-header">
+      <div class="evidence-header" data-selected-evidence>
         <div class="evidence-navigation-left">
           {self._sidebar_toggle_html()}
           {previous_link}
@@ -910,7 +1010,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         <div class="evidence-title"><strong>No invoice selected</strong></div>
         <div class="review-actions">{next_link}</div>
       </div>
-      <div class="evidence-empty">
+      <div class="evidence-empty" data-selected-evidence>
         <div>
           <p class="eyebrow">Invoice preview</p>
           <strong>No invoice selected</strong>
@@ -974,7 +1074,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             else '<div class="evidence-empty" data-document-view="pdf"><strong>Overlay unavailable</strong></div>'
         )
         return f"""
-      <div class="evidence-header">
+      <div class="evidence-header" data-selected-evidence>
         <div class="evidence-navigation-left">
           {self._sidebar_toggle_html()}
           {previous_link}
@@ -986,10 +1086,11 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         <div class="actions review-actions">
           <span class="decision-badge status-{decision_class}">{html_lib.escape(decision_label)}</span>
           {f'<span class="confidence-badge">{html_lib.escape(confidence)} confidence</span>' if confidence else ''}
+          {self._bookmark_button_html(pdf_file_id)}
           {next_link}
         </div>
       </div>
-      <div class="evidence-content">
+      <div class="evidence-content" data-selected-evidence>
         <div class="review-detail-panel">
           {decision_html}
           {checks_html}
@@ -1015,6 +1116,15 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
           </div>
         </div>
       </div>"""
+
+    def _bookmark_button_html(self, pdf_file_id: int | None) -> str:
+        if pdf_file_id is None:
+            return ""
+        return f"""
+          <button class="bookmark-button" type="button" data-bookmark-toggle data-invoice-id="{pdf_file_id}" aria-pressed="false" aria-label="Bookmark invoice" title="Bookmark invoice">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.75A1.75 1.75 0 0 1 7.75 3h8.5A1.75 1.75 0 0 1 18 4.75V21l-6-3.5L6 21V4.75Z"/></svg>
+            <span data-bookmark-label>Bookmark</span>
+          </button>"""
 
     def _sidebar_toggle_html(self) -> str:
         return """
