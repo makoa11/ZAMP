@@ -1073,7 +1073,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
         )
         normalized_html = self._normalized_invoice_html(normalized_invoice, raw_parse, item)
         decision_html = self._decision_summary_html(decision, checks, item)
-        checks_html = self._decision_checks_html(checks)
+        checks_html = self._decision_checks_html(checks, decision=decision_value)
         audit_html = self._audit_reasoning_html(audit, ap_context)
         decision_data_json = html_lib.escape(
             json.dumps(
@@ -1258,7 +1258,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             <div class="disclosure-body">{facts}</div>
           </details>"""
 
-    def _decision_checks_html(self, checks: list[Any]) -> str:
+    def _decision_checks_html(self, checks: list[Any], *, decision: str = "") -> str:
         if not checks:
             return """
           <section class="progress-section" id="decision-steps">
@@ -1303,7 +1303,9 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             else:
                 completed_rows.append(row)
         completed_html = "\n".join(completed_rows) if completed_rows else '<p class="detail-muted">No completed checks yet.</p>'
-        attention_html = "\n".join(attention_rows) if attention_rows else '<div class="all-clear"><span aria-hidden="true">✓</span><p><strong>Nothing else is blocking this invoice.</strong><br>All recorded checks are clear.</p></div>'
+        attention_html = "\n".join(attention_rows)
+        if not attention_html and decision.lower() not in {"approve", "approved"}:
+            attention_html = '<div class="all-clear"><span aria-hidden="true">✓</span><p><strong>Nothing else is blocking this invoice.</strong><br>All recorded checks are clear.</p></div>'
         return f"""
           <section class="progress-section" id="decision-steps">
             <div class="progress-column done-column">
