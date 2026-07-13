@@ -1062,6 +1062,83 @@ class MailRepository:
             ).fetchall()
             return len(rows)
 
+    def enqueue_owner_ai_fallback_jobs(
+        self,
+        *,
+        owner_user_id: str,
+        reprocess_key: str,
+        limit: int = 500,
+    ) -> int:
+        """Requeue existing OCR review results when an owner opts into AI."""
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                """
+                WITH eligible AS (
+                    SELECT DISTINCT ON (attachments.pdf_file_id)
+                        attachments.id AS attachment_id,
+                        attachments.account_id,
+                        attachments.pdf_file_id,
+                        accounts.owner_user_id,
+                        pdf_files.storage_path
+                    FROM mail_attachments AS attachments
+                    JOIN mail_accounts AS accounts ON accounts.id = attachments.account_id
+                    JOIN mail_pdf_files AS pdf_files ON pdf_files.id = attachments.pdf_file_id
+                    JOIN mail_pdf_parse_results AS parse_results
+                        ON parse_results.pdf_file_id = attachments.pdf_file_id
+                    WHERE accounts.owner_user_id = %s
+                      AND parse_results.status = 'needs_review'
+                      AND (
+                          parse_results.result->>'ocr_used' = 'true'
+                          OR jsonb_array_length(
+                              CASE
+                                  WHEN jsonb_typeof(parse_results.result->'ocr_failed_parts') = 'array'
+                                  THEN parse_results.result->'ocr_failed_parts'
+                                  ELSE '[]'::jsonb
+                              END
+                          ) > 0
+                          OR EXISTS (
+                              SELECT 1
+                              FROM jsonb_array_elements_text(
+                                  CASE
+                                      WHEN jsonb_typeof(parse_results.result->'warnings') = 'array'
+                                      THEN parse_results.result->'warnings'
+                                      ELSE '[]'::jsonb
+                                  END
+                              ) AS warning(value)
+                              WHERE warning.value ILIKE '%%full-document OCR%%'
+                          )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM ingestion_jobs AS pending
+                          WHERE pending.type = 'parse_pdf'
+                            AND (pending.payload->>'pdf_file_id')::bigint = attachments.pdf_file_id
+                            AND pending.status IN ('pending', 'running', 'retry')
+                      )
+                    ORDER BY attachments.pdf_file_id, attachments.created_at ASC
+                    LIMIT %s
+                )
+                INSERT INTO ingestion_jobs (type, payload, unique_key, available_at)
+                SELECT
+                    'parse_pdf',
+                    jsonb_build_object(
+                        'attachment_id', eligible.attachment_id,
+                        'pdf_file_id', eligible.pdf_file_id,
+                        'storage_path', eligible.storage_path,
+                        'account_id', eligible.account_id,
+                        'owner_user_id', eligible.owner_user_id,
+                        'ai_reprocess_key', %s::text
+                    ),
+                    'parse-pdf-ai:' || eligible.attachment_id || ':' || %s::text,
+                    now()
+                FROM eligible
+                ON CONFLICT (unique_key) DO NOTHING
+                RETURNING id
+                """,
+                (owner_user_id, limit, reprocess_key, reprocess_key),
+            ).fetchall()
+            return len(rows)
+
     def claim_jobs(self, *, worker_id: str, job_types: Iterable[str], limit: int) -> list[dict[str, Any]]:
         job_types = list(job_types)
         if not job_types:

@@ -13,8 +13,11 @@ from .config import ConfigError, load_config
 from .invoice_decision import decide_invoice
 from .invoice_ai import (
     AiExtractionError,
+    AiInvoiceExtractionClient,
+    GeminiAiExtractionClient,
     HttpJsonAiExtractionClient,
     extracted_text_for_ai,
+    is_gemini_generate_content_endpoint,
     promote_ai_extraction,
     should_run_ai_fallback,
 )
@@ -325,15 +328,22 @@ def _run_ai_fallback_if_enabled(
             model=model,
             status="not_configured",
         )
-    client = HttpJsonAiExtractionClient(
-        endpoint=str(endpoint),
-        model=str(model),
-        api_key=getattr(integration.config, "ai_extraction_api_key", None),
-        timeout_seconds=float(getattr(integration.config, "ai_extraction_timeout_seconds", 60.0)),
-        max_pdf_bytes=int(
+    client_kwargs = {
+        "endpoint": str(endpoint),
+        "model": str(model),
+        "api_key": getattr(integration.config, "ai_extraction_api_key", None),
+        "timeout_seconds": float(
+            getattr(integration.config, "ai_extraction_timeout_seconds", 60.0)
+        ),
+        "max_pdf_bytes": int(
             getattr(integration.config, "ai_extraction_max_pdf_bytes", 20 * 1024 * 1024)
         ),
-    )
+    }
+    client: AiInvoiceExtractionClient
+    if is_gemini_generate_content_endpoint(str(endpoint)):
+        client = GeminiAiExtractionClient(**client_kwargs)
+    else:
+        client = HttpJsonAiExtractionClient(**client_kwargs)
     try:
         extraction = client.extract(
             content,

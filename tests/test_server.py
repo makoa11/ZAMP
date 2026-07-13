@@ -34,6 +34,18 @@ class TestSocket:
 
 
 class ServerRouteTests(unittest.TestCase):
+    def test_approved_invoice_omits_redundant_all_clear_message(self) -> None:
+        handler = ZampRequestHandler.__new__(ZampRequestHandler)
+        checks = [{"id": "amount_match", "status": "pass", "summary": "Amount matches."}]
+
+        approved_html = handler._decision_checks_html(checks, decision="approve")
+        pending_html = handler._decision_checks_html(checks, decision="needs_review")
+
+        self.assertNotIn("Nothing else is blocking this invoice.", approved_html)
+        self.assertNotIn("All recorded checks are clear.", approved_html)
+        self.assertIn("Nothing else is blocking this invoice.", pending_html)
+        self.assertIn("All recorded checks are clear.", pending_html)
+
     def test_hidden_elements_are_not_overridden_by_component_display_styles(self) -> None:
         class Handler(ZampRequestHandler):
             def log_message(self, format: str, *args: object) -> None:

@@ -5,6 +5,7 @@ import json
 import math
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date
@@ -16,6 +17,7 @@ from .invoice_parser import FIELD_KEYS, PARSER_REVIEW_CONFIDENCE_THRESHOLD, REQU
 
 AI_EXTRACTION_SCHEMA_VERSION = "1.0"
 AI_EXTRACTION_CONTRACT_VERSION = "zamp-invoice-extraction-v1"
+GEMINI_API_HOST = "generativelanguage.googleapis.com"
 AI_VALUE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -170,7 +172,13 @@ class HttpJsonAiExtractionClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 raw = response.read(self.max_response_bytes + 1)
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc)
+            suffix = f": {detail}" if detail else ""
+            raise AiExtractionError(
+                f"AI extraction request failed with HTTP {exc.code}{suffix}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise AiExtractionError(f"AI extraction request failed: {exc}") from exc
         if len(raw) > self.max_response_bytes:
             raise AiExtractionError("AI extraction response exceeded the configured size limit.")
@@ -187,6 +195,178 @@ class HttpJsonAiExtractionClient:
             except json.JSONDecodeError as exc:
                 raise AiExtractionError("AI extraction output was not a JSON object.") from exc
         return validate_ai_extraction(output)
+
+
+@dataclass(frozen=True)
+class GeminiAiExtractionClient:
+    """Direct Gemini generateContent transport for invoice extraction."""
+
+    endpoint: str
+    model: str
+    api_key: str | None
+    timeout_seconds: float = 60.0
+    max_pdf_bytes: int = 20 * 1024 * 1024
+    max_response_bytes: int = 2 * 1024 * 1024
+
+    def extract(self, content: bytes, *, filename: str, extracted_text: str = "") -> dict[str, Any]:
+        if not self.api_key:
+            raise AiExtractionError("Gemini API key is not configured.")
+        if not content or len(content) > self.max_pdf_bytes:
+            raise AiExtractionError(
+                f"PDF is empty or exceeds the AI extraction limit of {self.max_pdf_bytes} bytes."
+            )
+
+        prompt = AI_INVOICE_EXTRACTION_PROMPT
+        if extracted_text.strip():
+            prompt += (
+                "\n\nLocally recovered document text is included below as supplemental evidence. "
+                "Prefer the attached PDF whenever the two disagree.\n\n"
+                + extracted_text[:100_000]
+            )
+        request_body = json.dumps(
+            {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": prompt},
+                            {
+                                "inline_data": {
+                                    "mime_type": "application/pdf",
+                                    "data": base64.b64encode(content).decode("ascii"),
+                                }
+                            },
+                        ],
+                    }
+                ],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": _gemini_response_schema(),
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+        request = urllib.request.Request(
+            _gemini_endpoint_for_model(self.endpoint, self.model),
+            data=request_body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                raw = response.read(self.max_response_bytes + 1)
+        except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc)
+            suffix = f": {detail}" if detail else ""
+            raise AiExtractionError(
+                f"Gemini extraction request failed with HTTP {exc.code}{suffix}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise AiExtractionError(f"Gemini extraction request failed: {exc}") from exc
+
+        if len(raw) > self.max_response_bytes:
+            raise AiExtractionError("Gemini extraction response exceeded the configured size limit.")
+        try:
+            envelope = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AiExtractionError("Gemini extraction endpoint returned invalid JSON.") from exc
+        return validate_ai_extraction(_gemini_output(envelope))
+
+
+def is_gemini_generate_content_endpoint(endpoint: str) -> bool:
+    parsed = urllib.parse.urlsplit(endpoint)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == GEMINI_API_HOST
+        and parsed.path.endswith(":generateContent")
+    )
+
+
+def _gemini_endpoint_for_model(endpoint: str, model: str) -> str:
+    if not is_gemini_generate_content_endpoint(endpoint):
+        raise AiExtractionError("Configured Gemini endpoint is not a supported generateContent URL.")
+    parsed = urllib.parse.urlsplit(endpoint)
+    path = re.sub(
+        r"/models/[^/:]+:generateContent$",
+        f"/models/{urllib.parse.quote(model, safe='-._')}:generateContent",
+        parsed.path,
+    )
+    if path == parsed.path and f"/models/{model}:generateContent" not in path:
+        raise AiExtractionError("Configured Gemini endpoint does not contain a model path.")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def _gemini_response_schema() -> dict[str, Any]:
+    """Convert the portable contract to Gemini's supported JSON Schema subset."""
+    schema = json.loads(json.dumps(AI_INVOICE_EXTRACTION_SCHEMA))
+
+    def normalize(value: Any) -> None:
+        if isinstance(value, dict):
+            value.pop("$schema", None)
+            if "const" in value:
+                value["enum"] = [value.pop("const")]
+            for child in value.values():
+                normalize(child)
+        elif isinstance(value, list):
+            for child in value:
+                normalize(child)
+
+    normalize(schema)
+    return schema
+
+
+def _gemini_output(envelope: Any) -> Any:
+    if not isinstance(envelope, dict):
+        raise AiExtractionError("Gemini extraction response must be a JSON object.")
+    candidates = envelope.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        feedback = envelope.get("promptFeedback")
+        reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+        suffix = f" ({reason})" if reason else ""
+        raise AiExtractionError(f"Gemini extraction returned no candidates{suffix}.")
+    candidate = candidates[0]
+    content = candidate.get("content") if isinstance(candidate, dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        raise AiExtractionError("Gemini extraction candidate did not contain response parts.")
+    text = "".join(
+        part["text"]
+        for part in parts
+        if isinstance(part, dict)
+        and isinstance(part.get("text"), str)
+        and part.get("thought") is not True
+    ).strip()
+    if not text:
+        raise AiExtractionError("Gemini extraction candidate did not contain JSON text.")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AiExtractionError("Gemini extraction output was not valid JSON.") from exc
+
+
+def _http_error_detail(error: urllib.error.HTTPError) -> str:
+    try:
+        raw = error.read(16_385)
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    try:
+        payload = json.loads(raw[:16_384].decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return raw[:500].decode("utf-8", errors="replace").strip()
+    provider_error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(provider_error, dict):
+        message = provider_error.get("message")
+        status = provider_error.get("status")
+        if isinstance(message, str):
+            return f"{status}: {message}" if isinstance(status, str) else message
+    return str(payload)[:500]
 
 
 def validate_ai_extraction(value: Any) -> dict[str, Any]:

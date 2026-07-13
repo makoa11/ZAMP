@@ -10,6 +10,7 @@ from app.invoice_ai import (
     AI_EXTRACTION_CONTRACT_VERSION,
     AI_INVOICE_EXTRACTION_PROMPT,
     AiExtractionError,
+    GeminiAiExtractionClient,
     HttpJsonAiExtractionClient,
     promote_ai_extraction,
     should_run_ai_fallback,
@@ -109,6 +110,60 @@ class InvoiceAiContractTests(unittest.TestCase):
         self.assertEqual(payload["document"]["extracted_text"], "OCR text")
         self.assertIn("response_schema", payload)
 
+    def test_gemini_transport_sends_pdf_schema_and_api_key_in_native_format(self) -> None:
+        body = json.dumps(
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": json.dumps(valid_extraction())}]}}
+                ],
+                "usageMetadata": {"totalTokenCount": 123},
+            }
+        ).encode()
+        client = GeminiAiExtractionClient(
+            endpoint=(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "stale-model:generateContent"
+            ),
+            model="gemini-3.1-pro-preview",
+            api_key="gemini-secret",
+        )
+        with patch("urllib.request.urlopen", return_value=FakeResponse(body)) as urlopen:
+            output = client.extract(
+                b"%PDF",
+                filename="invoice.pdf",
+                extracted_text="OCR text",
+            )
+
+        self.assertEqual(output["schema_version"], "1.0")
+        request = urlopen.call_args.args[0]
+        self.assertIn("/models/gemini-3.1-pro-preview:generateContent", request.full_url)
+        self.assertEqual(request.get_header("X-goog-api-key"), "gemini-secret")
+        self.assertIsNone(request.get_header("Authorization"))
+        payload = json.loads(request.data)
+        parts = payload["contents"][0]["parts"]
+        self.assertIn("OCR text", parts[0]["text"])
+        self.assertEqual(parts[1]["inline_data"]["mime_type"], "application/pdf")
+        self.assertEqual(parts[1]["inline_data"]["data"], "JVBERg==")
+        generation_config = payload["generationConfig"]
+        self.assertEqual(generation_config["responseMimeType"], "application/json")
+        schema = generation_config["responseJsonSchema"]
+        self.assertNotIn("$schema", schema)
+        self.assertEqual(schema["properties"]["schema_version"]["enum"], ["1.0"])
+
+    def test_gemini_transport_reports_blocked_or_missing_candidates(self) -> None:
+        body = json.dumps({"promptFeedback": {"blockReason": "SAFETY"}}).encode()
+        client = GeminiAiExtractionClient(
+            endpoint=(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "gemini-3.1-pro-preview:generateContent"
+            ),
+            model="gemini-3.1-pro-preview",
+            api_key="gemini-secret",
+        )
+        with patch("urllib.request.urlopen", return_value=FakeResponse(body)):
+            with self.assertRaisesRegex(AiExtractionError, "no candidates.*SAFETY"):
+                client.extract(b"%PDF", filename="invoice.pdf")
+
     def test_promotion_keeps_provenance_and_gates_low_confidence(self) -> None:
         prior = {
             "status": "needs_review",
@@ -179,6 +234,46 @@ class InvoiceAiContractTests(unittest.TestCase):
             )
         extract.assert_called_once()
         self.assertEqual(promoted["status"], "parsed")
+        self.assertTrue(promoted["ai_used"])
+
+    def test_worker_selects_native_gemini_transport_for_google_endpoint(self) -> None:
+        config = SimpleNamespace(
+            ai_extraction_endpoint=(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "gemini-3.1-pro-preview:generateContent"
+            ),
+            ai_extraction_model="gemini-3.1-pro-preview",
+            ai_extraction_api_key="gemini-secret",
+            ai_extraction_timeout_seconds=10,
+            ai_extraction_max_pdf_bytes=1024,
+        )
+        prior = {
+            "status": "needs_review",
+            "ocr_failed_parts": ["invoice_number"],
+            "warnings": [],
+            "pages": [],
+            "pipeline": {"route": "local_ocr"},
+        }
+        integration = SimpleNamespace(
+            config=config,
+            repo=SimpleNamespace(get_ai_extraction_enabled=lambda **_: True),
+        )
+
+        with patch.object(
+            GeminiAiExtractionClient,
+            "extract",
+            return_value=valid_extraction(),
+        ) as gemini_extract, patch.object(HttpJsonAiExtractionClient, "extract") as gateway_extract:
+            promoted = _run_ai_fallback_if_enabled(
+                integration,
+                result=prior,
+                content=b"%PDF",
+                filename="invoice.pdf",
+                owner_user_id="user-1",
+            )
+
+        gemini_extract.assert_called_once()
+        gateway_extract.assert_not_called()
         self.assertTrue(promoted["ai_used"])
 
 

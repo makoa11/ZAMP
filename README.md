@@ -63,10 +63,20 @@ AI_EXTRACTION_TIMEOUT_SECONDS=60
 AI_EXTRACTION_MAX_PDF_BYTES=20971520
 ```
 
-The endpoint contract is independent of any model vendor. Zamp sends `contract_version`, the
-configured `model`, the extraction `prompt`, `response_schema`, and a `document` containing the
-filename, MIME type, base64 PDF data, and locally recovered text. The endpoint must return exactly
-`{"output": <schema-compliant object>}`; `output` may also be a string containing that JSON object.
+Google Gemini `generateContent` endpoints are supported directly. For Gemini 3.1 Pro, use:
+
+```env
+AI_EXTRACTION_ENDPOINT=https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent
+AI_EXTRACTION_API_KEY=your-google-ai-studio-key
+AI_EXTRACTION_MODEL=gemini-3.1-pro-preview
+```
+
+Zamp sends the PDF as Gemini inline data, requests structured JSON output, and authenticates with
+the `x-goog-api-key` header. Other endpoints use the provider-neutral gateway contract: Zamp sends
+`contract_version`, the configured `model`, the extraction `prompt`, `response_schema`, and a
+`document` containing the filename, MIME type, base64 PDF data, and locally recovered text. The
+endpoint must return exactly `{"output": <schema-compliant object>}`; `output` may also be a string
+containing that JSON object.
 The prompt and Draft 2020-12 schema are exported as `AI_INVOICE_EXTRACTION_PROMPT` and
 `AI_INVOICE_EXTRACTION_SCHEMA` in `app.invoice_ai`. Switch providers by changing the endpoint and
 model, or by putting a provider-specific adapter behind the same contract.

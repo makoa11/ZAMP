@@ -60,6 +60,13 @@ class FakeMailConnection:
             self.database.last_params = params
             return FakeResult(rows=[{"id": index + 1} for index in range(self.database.stale_enqueue_count)])
 
+        if "WITH eligible AS" in sql and "parse-pdf-ai:" in sql:
+            self.database.last_sql = sql
+            self.database.last_params = params
+            return FakeResult(
+                rows=[{"id": index + 1} for index in range(self.database.ai_enqueue_count)]
+            )
+
         if "INSERT INTO ingestion_job_dedupe_keys (unique_key, type)" in sql:
             unique_key, job_type = str(params[0]), str(params[1])
             if unique_key in self.database.dedupe_keys:
@@ -136,6 +143,7 @@ class FakeMailDatabase:
         self.last_sql = ""
         self.last_params: tuple[object, ...] = ()
         self.stale_enqueue_count = 0
+        self.ai_enqueue_count = 0
 
     def connect(self) -> FakeMailConnection:
         return FakeMailConnection(self)
@@ -193,6 +201,23 @@ class MailRepositoryJobQueueTests(unittest.TestCase):
         self.assertIn("parse_results.parser_version IS DISTINCT FROM %s", database.last_sql)
         self.assertIn("'parser_version', %s::text", database.last_sql)
         self.assertIn("'parse-pdf:' || stale.attachment_id || ':' || %s::text", database.last_sql)
+
+    def test_ai_opt_in_requeues_existing_owner_ocr_review_results(self) -> None:
+        database = FakeMailDatabase()
+        database.ai_enqueue_count = 3
+        repo = MailRepository(database)  # type: ignore[arg-type]
+
+        count = repo.enqueue_owner_ai_fallback_jobs(
+            owner_user_id="user-123",
+            reprocess_key="enable-1",
+            limit=25,
+        )
+
+        self.assertEqual(count, 3)
+        self.assertEqual(database.last_params, ("user-123", 25, "enable-1", "enable-1"))
+        self.assertIn("parse_results.status = 'needs_review'", database.last_sql)
+        self.assertIn("parse_results.result->>'ocr_used' = 'true'", database.last_sql)
+        self.assertIn("'parse-pdf-ai:' || eligible.attachment_id", database.last_sql)
 
     def test_completed_durable_job_leaves_queue_and_blocks_reenqueue(self) -> None:
         database = FakeMailDatabase()

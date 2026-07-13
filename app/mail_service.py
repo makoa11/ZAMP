@@ -219,12 +219,19 @@ class MailIntegration:
         }
 
     def update_extraction_settings(self, *, owner_user_id: str, use_ai: bool) -> dict[str, bool]:
-        return {
-            "use_ai": self.repo.set_ai_extraction_enabled(
-                owner_user_id=owner_user_id,
-                enabled=use_ai,
-            ),
-        }
+        was_enabled = self.repo.get_ai_extraction_enabled(owner_user_id=owner_user_id)
+        enabled = self.repo.set_ai_extraction_enabled(
+            owner_user_id=owner_user_id,
+            enabled=use_ai,
+        )
+        if enabled and not was_enabled:
+            enqueue = getattr(self.repo, "enqueue_owner_ai_fallback_jobs", None)
+            if callable(enqueue):
+                enqueue(
+                    owner_user_id=owner_user_id,
+                    reprocess_key=secrets.token_hex(8),
+                )
+        return {"use_ai": enabled}
 
     def suggest_invoice_match_pattern(self, *, filename: str) -> str:
         return suggest_invoice_match_pattern_from_filename(filename)

@@ -191,6 +191,35 @@ class MailIntegrationPkceTests(unittest.TestCase):
 
 
 class MailIntegrationLifecycleTests(unittest.TestCase):
+    def test_enabling_ai_requeues_existing_eligible_review_results_once(self) -> None:
+        integration = MailIntegration(SimpleNamespace())
+        integration._ready = True
+        integration._repo = MagicMock()  # type: ignore[assignment]
+        integration.repo.get_ai_extraction_enabled.return_value = False
+        integration.repo.set_ai_extraction_enabled.return_value = True
+
+        settings = integration.update_extraction_settings(
+            owner_user_id="user-123",
+            use_ai=True,
+        )
+
+        self.assertEqual(settings, {"use_ai": True})
+        integration.repo.enqueue_owner_ai_fallback_jobs.assert_called_once()
+        call = integration.repo.enqueue_owner_ai_fallback_jobs.call_args.kwargs
+        self.assertEqual(call["owner_user_id"], "user-123")
+        self.assertEqual(len(call["reprocess_key"]), 16)
+
+    def test_saving_an_already_enabled_ai_preference_does_not_requeue(self) -> None:
+        integration = MailIntegration(SimpleNamespace())
+        integration._ready = True
+        integration._repo = MagicMock()  # type: ignore[assignment]
+        integration.repo.get_ai_extraction_enabled.return_value = True
+        integration.repo.set_ai_extraction_enabled.return_value = True
+
+        integration.update_extraction_settings(owner_user_id="user-123", use_ai=True)
+
+        integration.repo.enqueue_owner_ai_fallback_jobs.assert_not_called()
+
     def test_close_closes_database_and_resets_ready_state(self) -> None:
         class Database:
             def __init__(self) -> None:
