@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import socket
 import time
 from datetime import UTC, datetime
@@ -13,9 +14,7 @@ from .config import ConfigError, load_config
 from .invoice_decision import decide_invoice
 from .invoice_ai import (
     AiExtractionError,
-    AiInvoiceExtractionClient,
     GeminiAiExtractionClient,
-    HttpJsonAiExtractionClient,
     extracted_text_for_ai,
     is_gemini_generate_content_endpoint,
     promote_ai_extraction,
@@ -30,6 +29,8 @@ from .mail_service import MailIntegration
 
 PDF_PARSE_JOB_TYPES = {"parse_pdf"}
 MAIL_FETCH_JOB_TYPES = MAIL_JOB_TYPES - PDF_PARSE_JOB_TYPES
+
+logger = logging.getLogger(__name__)
 
 
 def run_once(*, limit: int = 10, worker_id: str | None = None) -> int:
@@ -321,38 +322,58 @@ def _run_ai_fallback_if_enabled(
 
     endpoint = getattr(integration.config, "ai_extraction_endpoint", None)
     model = getattr(integration.config, "ai_extraction_model", None)
-    if not endpoint or not model:
+    api_key = getattr(integration.config, "ai_extraction_api_key", None)
+    if not endpoint or not model or not api_key:
         return _record_ai_failure(
             result,
-            "AI fallback is enabled, but AI_EXTRACTION_ENDPOINT or AI_EXTRACTION_MODEL is not configured.",
-            model=model,
+            "AI_EXTRACTION_ENDPOINT, AI_EXTRACTION_MODEL, and AI_EXTRACTION_API_KEY "
+            "must be configured for Gemini extraction.",
+            model=str(model) if model else None,
             status="not_configured",
         )
-    client_kwargs = {
-        "endpoint": str(endpoint),
-        "model": str(model),
-        "api_key": getattr(integration.config, "ai_extraction_api_key", None),
-        "timeout_seconds": float(
+    if not is_gemini_generate_content_endpoint(str(endpoint)):
+        return _record_ai_failure(
+            result,
+            "AI_EXTRACTION_ENDPOINT must be a Google Gemini generateContent URL.",
+            model=str(model),
+            status="not_configured",
+        )
+
+    client = GeminiAiExtractionClient(
+        endpoint=str(endpoint),
+        model=str(model),
+        api_key=str(api_key),
+        timeout_seconds=float(
             getattr(integration.config, "ai_extraction_timeout_seconds", 60.0)
         ),
-        "max_pdf_bytes": int(
+        max_pdf_bytes=int(
             getattr(integration.config, "ai_extraction_max_pdf_bytes", 20 * 1024 * 1024)
         ),
-    }
-    client: AiInvoiceExtractionClient
-    if is_gemini_generate_content_endpoint(str(endpoint)):
-        client = GeminiAiExtractionClient(**client_kwargs)
-    else:
-        client = HttpJsonAiExtractionClient(**client_kwargs)
+    )
+    extracted_text = extracted_text_for_ai(result)
     try:
         extraction = client.extract(
             content,
             filename=filename,
-            extracted_text=extracted_text_for_ai(result),
+            extracted_text=extracted_text,
         )
-        return promote_ai_extraction(result, extraction, model=str(model))
     except AiExtractionError as exc:
-        return _record_ai_failure(result, str(exc), model=str(model), status="failed")
+        logger.warning("Gemini invoice extraction failed for model %s: %s", model, exc)
+        return _record_ai_failure(
+            result,
+            "Gemini extraction request failed.",
+            model=str(model),
+            status="failed",
+        )
+    except Exception:
+        logger.exception("Unexpected Gemini invoice extraction failure for model %s.", model)
+        return _record_ai_failure(
+            result,
+            "Gemini extraction failed unexpectedly.",
+            model=str(model),
+            status="failed",
+        )
+    return promote_ai_extraction(result, extraction, model=str(model))
 
 
 def _record_ai_failure(
@@ -364,7 +385,7 @@ def _record_ai_failure(
 ) -> dict[str, Any]:
     updated = dict(result)
     warnings = [str(item) for item in result.get("warnings", []) if item]
-    warning = f"AI fallback unavailable: {message}"
+    warning = f"Gemini fallback unavailable: {message}"
     if warning not in warnings:
         warnings.append(warning)
     updated["warnings"] = warnings

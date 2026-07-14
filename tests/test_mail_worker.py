@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.invoice_ai import GeminiAiExtractionClient
 from app.mail_worker import (
     _claim_prioritized_jobs,
     _handle_job,
@@ -24,6 +25,10 @@ class TestRepo:
         self.completed: list[int] = []
         self.retries: list[dict[str, object]] = []
         self.ap_context_record: dict[str, object] | None = None
+        self.ai_enabled = False
+
+    def get_ai_extraction_enabled(self, *, owner_user_id: str) -> bool:
+        return self.ai_enabled
 
     def upsert_pdf_parse_result(self, **kwargs: object) -> dict[str, object]:
         self.parse_results.append(kwargs)
@@ -55,6 +60,18 @@ class TestIntegration:
         )
         self.repo = TestRepo()
         self.storage = SimpleNamespace(root=root)
+
+
+def _configure_gemini(integration: TestIntegration) -> None:
+    integration.repo.ai_enabled = True
+    integration.config.ai_extraction_endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3.1-pro-preview:generateContent"
+    )
+    integration.config.ai_extraction_model = "gemini-3.1-pro-preview"
+    integration.config.ai_extraction_api_key = "gemini-secret"
+    integration.config.ai_extraction_timeout_seconds = 1
+    integration.config.ai_extraction_max_pdf_bytes = 1024
 
 
 class MailWorkerRenewalTests(unittest.TestCase):
@@ -333,6 +350,120 @@ class MailWorkerParsePdfTests(unittest.TestCase):
         self.assertEqual(integration.repo.retries[0]["job_id"], 100)
         self.assertEqual(integration.repo.retries[0]["attempts"], 3)
         self.assertIn("parser exploded", str(integration.repo.retries[0]["error"]))
+
+    def test_ai_failure_preserves_local_parse_and_completes_pdf_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Path(root, "invoice.pdf").write_bytes(b"%PDF-1.4\nfixture")
+            integration = TestIntegration(root)
+            _configure_gemini(integration)
+            parser_result = _parsed_invoice_result()
+            parser_result["status"] = "needs_review"
+            parser_result["ocr_used"] = True
+            job = {
+                "id": 103,
+                "type": "parse_pdf",
+                "attempts": 1,
+                "payload": {
+                    "attachment_id": 9,
+                    "pdf_file_id": 44,
+                    "storage_path": "invoice.pdf",
+                    "owner_user_id": "user-123",
+                },
+            }
+
+            with patch("app.mail_worker.parse_invoice_pdf", return_value=parser_result), patch.object(
+                GeminiAiExtractionClient,
+                "extract",
+                side_effect=RuntimeError("unexpected Gemini client failure"),
+            ), patch("app.mail_worker.logger.exception") as logged:
+                _handle_job(integration, job)  # type: ignore[arg-type]
+
+        self.assertEqual(integration.repo.completed, [103])
+        self.assertEqual(integration.repo.retries, [])
+        self.assertEqual(len(integration.repo.parse_results), 1)
+        saved_result = integration.repo.parse_results[0]["result"]
+        self.assertIsInstance(saved_result, dict)
+        self.assertEqual(saved_result["status"], "needs_review")
+        self.assertEqual(saved_result["fields"]["invoice_number"]["value"], "INV-1045")
+        self.assertEqual(saved_result["ai"]["status"], "failed")
+        self.assertFalse(saved_result["ai_used"])
+        self.assertTrue(
+            any("Gemini extraction failed unexpectedly" in warning for warning in saved_result["warnings"])
+        )
+        self.assertFalse(
+            any("unexpected Gemini client failure" in warning for warning in saved_result["warnings"])
+        )
+        logged.assert_called_once()
+        self.assertEqual(len(integration.repo.extractions), 1)
+        self.assertEqual(len(integration.repo.decisions), 1)
+
+    def test_ai_preference_failure_retries_pdf_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Path(root, "invoice.pdf").write_bytes(b"%PDF-1.4\nfixture")
+            integration = TestIntegration(root)
+            _configure_gemini(integration)
+            parser_result = _parsed_invoice_result()
+            parser_result["status"] = "needs_review"
+            parser_result["ocr_used"] = True
+            job = {
+                "id": 104,
+                "type": "parse_pdf",
+                "attempts": 2,
+                "payload": {
+                    "pdf_file_id": 45,
+                    "storage_path": "invoice.pdf",
+                    "owner_user_id": "user-123",
+                },
+            }
+
+            with patch("app.mail_worker.parse_invoice_pdf", return_value=parser_result), patch.object(
+                integration.repo,
+                "get_ai_extraction_enabled",
+                side_effect=RuntimeError("preference database unavailable"),
+            ):
+                _handle_job(integration, job)  # type: ignore[arg-type]
+
+        self.assertEqual(integration.repo.completed, [])
+        self.assertEqual(integration.repo.parse_results, [])
+        self.assertEqual(integration.repo.retries[0]["job_id"], 104)
+        self.assertIn("preference database unavailable", str(integration.repo.retries[0]["error"]))
+
+    def test_ai_promotion_failure_retries_pdf_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Path(root, "invoice.pdf").write_bytes(b"%PDF-1.4\nfixture")
+            integration = TestIntegration(root)
+            _configure_gemini(integration)
+            parser_result = _parsed_invoice_result()
+            parser_result["status"] = "needs_review"
+            parser_result["ocr_used"] = True
+            job = {
+                "id": 105,
+                "type": "parse_pdf",
+                "attempts": 1,
+                "payload": {
+                    "pdf_file_id": 46,
+                    "storage_path": "invoice.pdf",
+                    "owner_user_id": "user-123",
+                },
+            }
+
+            with patch("app.mail_worker.parse_invoice_pdf", return_value=parser_result), patch.object(
+                GeminiAiExtractionClient,
+                "extract",
+                return_value={},
+            ), patch(
+                "app.mail_worker.promote_ai_extraction",
+                side_effect=RuntimeError("promotion bug"),
+            ):
+                _handle_job(integration, job)  # type: ignore[arg-type]
+
+        self.assertEqual(integration.repo.completed, [])
+        self.assertEqual(integration.repo.parse_results, [])
+        self.assertEqual(integration.repo.retries[0]["job_id"], 105)
+        self.assertIn("promotion bug", str(integration.repo.retries[0]["error"]))
 
     def test_storage_pdf_path_rejects_paths_outside_storage_root(self) -> None:
         with self.assertRaises(RuntimeError):

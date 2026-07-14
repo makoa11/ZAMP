@@ -7,11 +7,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.invoice_ai import (
-    AI_EXTRACTION_CONTRACT_VERSION,
     AI_INVOICE_EXTRACTION_PROMPT,
     AiExtractionError,
     GeminiAiExtractionClient,
-    HttpJsonAiExtractionClient,
     promote_ai_extraction,
     should_run_ai_fallback,
     validate_ai_extraction,
@@ -96,20 +94,6 @@ class InvoiceAiContractTests(unittest.TestCase):
         with self.assertRaisesRegex(AiExtractionError, "valid YYYY-MM-DD"):
             validate_ai_extraction(extraction)
 
-    def test_http_transport_sends_contract_and_requires_output_envelope(self) -> None:
-        body = json.dumps({"output": valid_extraction()}).encode()
-        client = HttpJsonAiExtractionClient(endpoint="https://ai.example/extract", model="model-a")
-        with patch("urllib.request.urlopen", return_value=FakeResponse(body)) as urlopen:
-            output = client.extract(b"%PDF", filename="invoice.pdf", extracted_text="OCR text")
-
-        self.assertEqual(output["schema_version"], "1.0")
-        request = urlopen.call_args.args[0]
-        payload = json.loads(request.data)
-        self.assertEqual(payload["contract_version"], AI_EXTRACTION_CONTRACT_VERSION)
-        self.assertEqual(payload["model"], "model-a")
-        self.assertEqual(payload["document"]["extracted_text"], "OCR text")
-        self.assertIn("response_schema", payload)
-
     def test_gemini_transport_sends_pdf_schema_and_api_key_in_native_format(self) -> None:
         body = json.dumps(
             {
@@ -192,9 +176,12 @@ class InvoiceAiContractTests(unittest.TestCase):
 
     def test_worker_requires_user_opt_in_before_sending_pdf(self) -> None:
         config = SimpleNamespace(
-            ai_extraction_endpoint="https://ai.example/extract",
-            ai_extraction_model="model-a",
-            ai_extraction_api_key=None,
+            ai_extraction_endpoint=(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "gemini-3.1-pro-preview:generateContent"
+            ),
+            ai_extraction_model="gemini-3.1-pro-preview",
+            ai_extraction_api_key="gemini-secret",
             ai_extraction_timeout_seconds=10,
             ai_extraction_max_pdf_bytes=1024,
         )
@@ -209,7 +196,7 @@ class InvoiceAiContractTests(unittest.TestCase):
             config=config,
             repo=SimpleNamespace(get_ai_extraction_enabled=lambda **_: False),
         )
-        with patch.object(HttpJsonAiExtractionClient, "extract") as extract:
+        with patch.object(GeminiAiExtractionClient, "extract") as extract:
             unchanged = _run_ai_fallback_if_enabled(
                 disabled,
                 result=prior,
@@ -224,7 +211,11 @@ class InvoiceAiContractTests(unittest.TestCase):
             config=config,
             repo=SimpleNamespace(get_ai_extraction_enabled=lambda **_: True),
         )
-        with patch.object(HttpJsonAiExtractionClient, "extract", return_value=valid_extraction()) as extract:
+        with patch.object(
+            GeminiAiExtractionClient,
+            "extract",
+            return_value=valid_extraction(),
+        ) as extract:
             promoted = _run_ai_fallback_if_enabled(
                 enabled,
                 result=prior,
@@ -236,7 +227,7 @@ class InvoiceAiContractTests(unittest.TestCase):
         self.assertEqual(promoted["status"], "parsed")
         self.assertTrue(promoted["ai_used"])
 
-    def test_worker_selects_native_gemini_transport_for_google_endpoint(self) -> None:
+    def test_worker_uses_native_gemini_transport(self) -> None:
         config = SimpleNamespace(
             ai_extraction_endpoint=(
                 "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -263,7 +254,7 @@ class InvoiceAiContractTests(unittest.TestCase):
             GeminiAiExtractionClient,
             "extract",
             return_value=valid_extraction(),
-        ) as gemini_extract, patch.object(HttpJsonAiExtractionClient, "extract") as gateway_extract:
+        ) as gemini_extract:
             promoted = _run_ai_fallback_if_enabled(
                 integration,
                 result=prior,
@@ -273,8 +264,108 @@ class InvoiceAiContractTests(unittest.TestCase):
             )
 
         gemini_extract.assert_called_once()
-        gateway_extract.assert_not_called()
         self.assertTrue(promoted["ai_used"])
+
+    def test_worker_rejects_non_gemini_endpoint_without_sending_pdf(self) -> None:
+        config = SimpleNamespace(
+            ai_extraction_endpoint="https://ai.example/extract",
+            ai_extraction_model="model-a",
+            ai_extraction_api_key="secret",
+            ai_extraction_timeout_seconds=10,
+            ai_extraction_max_pdf_bytes=1024,
+        )
+        prior = {
+            "status": "needs_review",
+            "ocr_failed_parts": ["invoice_number"],
+            "warnings": [],
+        }
+        integration = SimpleNamespace(
+            config=config,
+            repo=SimpleNamespace(get_ai_extraction_enabled=lambda **_: True),
+        )
+
+        with patch.object(GeminiAiExtractionClient, "extract") as extract:
+            result = _run_ai_fallback_if_enabled(
+                integration,
+                result=prior,
+                content=b"%PDF",
+                filename="invoice.pdf",
+                owner_user_id="user-1",
+            )
+
+        extract.assert_not_called()
+        self.assertEqual(result["ai"]["status"], "not_configured")
+        self.assertFalse(result["ai"]["attempted"])
+
+    def test_worker_reports_missing_gemini_configuration(self) -> None:
+        config = SimpleNamespace(
+            ai_extraction_endpoint=None,
+            ai_extraction_model=None,
+            ai_extraction_api_key=None,
+            ai_extraction_timeout_seconds=10,
+            ai_extraction_max_pdf_bytes=1024,
+        )
+        prior = {
+            "status": "needs_review",
+            "ocr_failed_parts": ["invoice_number"],
+            "warnings": [],
+        }
+        integration = SimpleNamespace(
+            config=config,
+            repo=SimpleNamespace(get_ai_extraction_enabled=lambda **_: True),
+        )
+
+        with patch.object(GeminiAiExtractionClient, "extract") as extract:
+            result = _run_ai_fallback_if_enabled(
+                integration,
+                result=prior,
+                content=b"%PDF",
+                filename="invoice.pdf",
+                owner_user_id="user-1",
+            )
+
+        extract.assert_not_called()
+        self.assertEqual(result["ai"]["status"], "not_configured")
+        self.assertFalse(result["ai"]["attempted"])
+
+    def test_worker_sanitizes_known_gemini_failure(self) -> None:
+        config = SimpleNamespace(
+            ai_extraction_endpoint=(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "gemini-3.1-pro-preview:generateContent"
+            ),
+            ai_extraction_model="gemini-3.1-pro-preview",
+            ai_extraction_api_key="gemini-secret",
+            ai_extraction_timeout_seconds=10,
+            ai_extraction_max_pdf_bytes=1024,
+        )
+        prior = {
+            "status": "needs_review",
+            "ocr_failed_parts": ["invoice_number"],
+            "warnings": [],
+        }
+        integration = SimpleNamespace(
+            config=config,
+            repo=SimpleNamespace(get_ai_extraction_enabled=lambda **_: True),
+        )
+
+        with patch.object(
+            GeminiAiExtractionClient,
+            "extract",
+            side_effect=AiExtractionError("provider detail must stay internal"),
+        ), patch("app.mail_worker.logger.warning") as warning:
+            result = _run_ai_fallback_if_enabled(
+                integration,
+                result=prior,
+                content=b"%PDF",
+                filename="invoice.pdf",
+                owner_user_id="user-1",
+            )
+
+        self.assertEqual(result["ai"]["status"], "failed")
+        self.assertNotIn("provider detail must stay internal", " ".join(result["warnings"]))
+        warning.assert_called_once()
+        self.assertIn("provider detail must stay internal", str(warning.call_args))
 
 
 if __name__ == "__main__":

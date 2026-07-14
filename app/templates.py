@@ -403,14 +403,14 @@ def dashboard_page(
     <div class="panel-heading">
       <div>
         <p class="label">Last-resort extraction</p>
-        <h2 id="ai-extraction-title">AI fallback</h2>
+        <h2 id="ai-extraction-title">Gemini fallback</h2>
       </div>
     </div>
     <label class="ai-consent-control" for="use-ai-extraction">
       <input id="use-ai-extraction" data-use-ai-extraction type="checkbox">
       <span>
-        <strong>Use AI when local full-page OCR fails</strong>
-        <small>The invoice PDF will be sent to the AI endpoint configured by your administrator. Static extraction and local OCR always run first.</small>
+        <strong>Use Gemini when local full-page OCR fails</strong>
+        <small>The invoice PDF will be sent to Google Gemini using the credentials configured by your administrator. Static extraction and local OCR always run first.</small>
       </span>
     </label>
     <div class="mail-status" data-ai-extraction-status role="status"></div>

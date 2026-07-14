@@ -38,11 +38,11 @@ Then run:
 
 The invoice parser uses a local adaptive extraction pipeline. It profiles each page as native text, hybrid, or scanned; keeps competing static candidates; validates dates, currencies, totals, and line-item sums; and runs local OCR only when required evidence is missing, contradictory, or degraded. Production OCR renders selected pages once, applies OpenCV orientation/deskew/contrast/threshold preprocessing, parses the full page, and reserves high-resolution region OCR for unresolved fields. Results that remain incomplete, ambiguous, inconsistent, or over budget are marked `needs_review`. Install the system `tesseract` binary as well as the Python requirements to enable OCR.
 
-If a user explicitly enables **Use AI when local full-page OCR fails** in Settings, a
-`needs_review` result that exhausted local OCR can use a last-resort AI extractor. No AI SDK is
-installed. Zamp sends a provider-neutral JSON request to an administrator-configured endpoint,
-strictly validates its response, reruns invoice consistency checks, and only promotes a valid
-result. Transport, schema, or model failures remain `needs_review`.
+If a user explicitly enables **Use Gemini when local full-page OCR fails** in Settings, a
+`needs_review` result that exhausted local OCR can use Google Gemini as a last-resort extractor.
+No AI SDK is installed. Zamp calls the Gemini `generateContent` API directly, strictly validates
+its response, reruns invoice consistency checks, and only promotes a valid result. Transport,
+schema, or model failures preserve the local `needs_review` result.
 
 Adaptive OCR settings are optional:
 
@@ -53,33 +53,22 @@ MAIL_PARSE_OCR_TIMEOUT_SECONDS=15
 MAIL_PARSE_DOCUMENT_TIMEOUT_SECONDS=90
 ```
 
-Optional AI fallback settings:
-
-```env
-AI_EXTRACTION_ENDPOINT=https://your-ai-gateway.example/v1/invoice-extract
-AI_EXTRACTION_API_KEY=
-AI_EXTRACTION_MODEL=your-model-name
-AI_EXTRACTION_TIMEOUT_SECONDS=60
-AI_EXTRACTION_MAX_PDF_BYTES=20971520
-```
-
-Google Gemini `generateContent` endpoints are supported directly. For Gemini 3.1 Pro, use:
+Optional Gemini fallback settings:
 
 ```env
 AI_EXTRACTION_ENDPOINT=https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent
 AI_EXTRACTION_API_KEY=your-google-ai-studio-key
 AI_EXTRACTION_MODEL=gemini-3.1-pro-preview
+AI_EXTRACTION_TIMEOUT_SECONDS=60
+AI_EXTRACTION_MAX_PDF_BYTES=20971520
 ```
 
 Zamp sends the PDF as Gemini inline data, requests structured JSON output, and authenticates with
-the `x-goog-api-key` header. Other endpoints use the provider-neutral gateway contract: Zamp sends
-`contract_version`, the configured `model`, the extraction `prompt`, `response_schema`, and a
-`document` containing the filename, MIME type, base64 PDF data, and locally recovered text. The
-endpoint must return exactly `{"output": <schema-compliant object>}`; `output` may also be a string
-containing that JSON object.
+the `x-goog-api-key` header. `AI_EXTRACTION_ENDPOINT` must be an HTTPS
+`generativelanguage.googleapis.com` URL ending in `:generateContent`; other AI providers and
+provider-neutral gateway endpoints are not supported.
 The prompt and Draft 2020-12 schema are exported as `AI_INVOICE_EXTRACTION_PROMPT` and
-`AI_INVOICE_EXTRACTION_SCHEMA` in `app.invoice_ai`. Switch providers by changing the endpoint and
-model, or by putting a provider-specific adapter behind the same contract.
+`AI_INVOICE_EXTRACTION_SCHEMA` in `app.invoice_ai`.
 
 Open `http://127.0.0.1:8000/login`.
 

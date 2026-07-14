@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Protocol
+from typing import Any
 
 from .invoice_pipeline import blocking_validation_failures, validate_invoice_fields
 from .invoice_parser import FIELD_KEYS, PARSER_REVIEW_CONFIDENCE_THRESHOLD, REQUIRED_NORMALIZED_FIELDS
@@ -126,75 +126,6 @@ Rules:
 
 class AiExtractionError(RuntimeError):
     """Raised when the AI transport or its strict response contract fails."""
-
-
-class AiInvoiceExtractionClient(Protocol):
-    model: str
-
-    def extract(self, content: bytes, *, filename: str, extracted_text: str = "") -> dict[str, Any]: ...
-
-
-@dataclass(frozen=True)
-class HttpJsonAiExtractionClient:
-    """Provider-neutral client for a Zamp-compatible JSON extraction endpoint."""
-
-    endpoint: str
-    model: str
-    api_key: str | None = None
-    timeout_seconds: float = 60.0
-    max_pdf_bytes: int = 20 * 1024 * 1024
-    max_response_bytes: int = 2 * 1024 * 1024
-
-    def extract(self, content: bytes, *, filename: str, extracted_text: str = "") -> dict[str, Any]:
-        if not content or len(content) > self.max_pdf_bytes:
-            raise AiExtractionError(
-                f"PDF is empty or exceeds the AI extraction limit of {self.max_pdf_bytes} bytes."
-            )
-        request_body = json.dumps(
-            {
-                "contract_version": AI_EXTRACTION_CONTRACT_VERSION,
-                "model": self.model,
-                "prompt": AI_INVOICE_EXTRACTION_PROMPT,
-                "response_schema": AI_INVOICE_EXTRACTION_SCHEMA,
-                "document": {
-                    "filename": filename,
-                    "mime_type": "application/pdf",
-                    "base64": base64.b64encode(content).decode("ascii"),
-                    "extracted_text": extracted_text[:100_000],
-                },
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        request = urllib.request.Request(self.endpoint, data=request_body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                raw = response.read(self.max_response_bytes + 1)
-        except urllib.error.HTTPError as exc:
-            detail = _http_error_detail(exc)
-            suffix = f": {detail}" if detail else ""
-            raise AiExtractionError(
-                f"AI extraction request failed with HTTP {exc.code}{suffix}"
-            ) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise AiExtractionError(f"AI extraction request failed: {exc}") from exc
-        if len(raw) > self.max_response_bytes:
-            raise AiExtractionError("AI extraction response exceeded the configured size limit.")
-        try:
-            envelope = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise AiExtractionError("AI extraction endpoint returned invalid JSON.") from exc
-        if not isinstance(envelope, dict) or set(envelope) != {"output"}:
-            raise AiExtractionError("AI extraction endpoint must return exactly an 'output' property.")
-        output = envelope["output"]
-        if isinstance(output, str):
-            try:
-                output = json.loads(output)
-            except json.JSONDecodeError as exc:
-                raise AiExtractionError("AI extraction output was not a JSON object.") from exc
-        return validate_ai_extraction(output)
 
 
 @dataclass(frozen=True)
@@ -425,7 +356,7 @@ def promote_ai_extraction(
     warnings.extend(item for item in extraction["warnings"] if item not in warnings)
     document_type = str(extraction["document_type"])
     if document_type == "not_invoice":
-        warnings.append("AI fallback classified the document as not an invoice.")
+        warnings.append("Gemini fallback classified the document as not an invoice.")
         result["warnings"] = warnings
         result["ai"] = {"attempted": True, "status": "completed", "model": model, "promoted": False}
         result["ai_used"] = True

@@ -63,7 +63,7 @@ class ServerRouteTests(unittest.TestCase):
         content = dashboard_page(csrf_token="csrf", session={"user": {"email": "ap@example.com"}})
 
         self.assertIn("data-use-ai-extraction", content)
-        self.assertIn("Use AI when local full-page OCR fails", content)
+        self.assertIn("Use Gemini when local full-page OCR fails", content)
         self.assertIn("invoice PDF will be sent", content)
         self.assertIn("/api/mail/extraction-settings", content)
 

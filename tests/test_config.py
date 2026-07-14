@@ -178,9 +178,12 @@ class ConfigTests(unittest.TestCase):
                 root,
                 {
                     **self._base_env(),
-                    "AI_EXTRACTION_ENDPOINT": "https://ai.example/extract",
+                    "AI_EXTRACTION_ENDPOINT": (
+                        "https://generativelanguage.googleapis.com/v1beta/models/"
+                        "gemini-3.1-pro-preview:generateContent"
+                    ),
                     "AI_EXTRACTION_API_KEY": "secret",
-                    "AI_EXTRACTION_MODEL": "model-a",
+                    "AI_EXTRACTION_MODEL": "gemini-3.1-pro-preview",
                     "AI_EXTRACTION_TIMEOUT_SECONDS": "45",
                     "AI_EXTRACTION_MAX_PDF_BYTES": "123456",
                 },
@@ -189,8 +192,12 @@ class ConfigTests(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 config = load_config(root)
 
-        self.assertEqual(config.ai_extraction_endpoint, "https://ai.example/extract")
+        self.assertEqual(
+            config.ai_extraction_endpoint,
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-3.1-pro-preview:generateContent",
+        )
         self.assertEqual(config.ai_extraction_api_key, "secret")
-        self.assertEqual(config.ai_extraction_model, "model-a")
+        self.assertEqual(config.ai_extraction_model, "gemini-3.1-pro-preview")
         self.assertEqual(config.ai_extraction_timeout_seconds, 45.0)
         self.assertEqual(config.ai_extraction_max_pdf_bytes, 123456)
