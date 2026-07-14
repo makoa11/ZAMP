@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.server import ZampHTTPServer, ZampRequestHandler, _filter_invoice_items
+from app.mail_store import PdfStorageNotFoundError, PdfStorageUnavailableError
 from app.templates import dashboard_page, login_page, signup_page
 
 
@@ -511,8 +512,7 @@ class ServerRouteTests(unittest.TestCase):
 
     def test_mail_pdf_endpoint_serves_owned_stored_pdf(self) -> None:
         class MailIntegration:
-            def __init__(self, pdf_path: Path) -> None:
-                self.pdf_path = pdf_path
+            def __init__(self) -> None:
                 self.owner_user_id: str | None = None
                 self.pdf_file_id: int | None = None
 
@@ -521,35 +521,77 @@ class ServerRouteTests(unittest.TestCase):
             ) -> dict[str, object]:
                 self.owner_user_id = owner_user_id
                 self.pdf_file_id = pdf_file_id
-                return {"path": self.pdf_path, "filename": "invoice.pdf"}
+                return {
+                    "content": b"%PDF-1.4\nfrom-s3\n%%EOF",
+                    "filename": "invoice.pdf",
+                }
 
-        with tempfile.TemporaryDirectory() as tmp:
-            pdf_path = Path(tmp, "invoice.pdf")
-            pdf_path.write_bytes(b"%PDF-1.4\nfrom-db\n%%EOF")
-            mail = MailIntegration(pdf_path)
+        mail = MailIntegration()
 
-            class Handler(ZampRequestHandler):
-                mail_integration = mail  # type: ignore[assignment]
+        class Handler(ZampRequestHandler):
+            mail_integration = mail  # type: ignore[assignment]
 
-                def log_message(self, format: str, *args: object) -> None:
-                    pass
+            def log_message(self, format: str, *args: object) -> None:
+                pass
 
-                def _authenticated_api_user(self) -> tuple[str, list[str]]:
-                    return "user-123", ["zamp_session=refreshed; Path=/"]
+            def _authenticated_api_user(self) -> tuple[str, list[str]]:
+                return "user-123", ["zamp_session=refreshed; Path=/"]
 
-            request = b"GET /api/mail/pdfs/20 HTTP/1.1\r\nHost: localhost\r\n\r\n"
-            test_socket = TestSocket(request)
-            Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
-            response = test_socket.writer.getvalue()
+        request = b"GET /api/mail/pdfs/20 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        test_socket = TestSocket(request)
+        Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+        response = test_socket.writer.getvalue()
 
         header, body = response.split(b"\r\n\r\n", 1)
         self.assertIn(b" 200 ", header.splitlines()[0])
         self.assertIn(b"Content-Type: application/pdf", header)
         self.assertIn(b'Content-Disposition: inline; filename="invoice.pdf"', header)
         self.assertIn(b"Set-Cookie: zamp_session=refreshed; Path=/", header)
-        self.assertEqual(body, b"%PDF-1.4\nfrom-db\n%%EOF")
+        self.assertEqual(body, b"%PDF-1.4\nfrom-s3\n%%EOF")
         self.assertEqual(mail.owner_user_id, "user-123")
         self.assertEqual(mail.pdf_file_id, 20)
+
+    def test_mail_pdf_endpoint_returns_controlled_storage_errors(self) -> None:
+        class MailIntegration:
+            def __init__(self, error: Exception) -> None:
+                self.error = error
+
+            def get_invoice_pdf_file(
+                self, *, owner_user_id: str, pdf_file_id: int
+            ) -> dict[str, object]:
+                raise self.error
+
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def _authenticated_api_user(self) -> tuple[str, list[str]]:
+                return "user-123", []
+
+        cases = (
+            (
+                PdfStorageNotFoundError("PDF object was not found."),
+                404,
+                "PDF file is missing from storage.",
+            ),
+            (
+                PdfStorageUnavailableError("provider endpoint credential detail"),
+                503,
+                "PDF storage is temporarily unavailable.",
+            ),
+        )
+        for error, status, message in cases:
+            with self.subTest(status=status):
+                Handler.mail_integration = MailIntegration(error)  # type: ignore[assignment]
+                request = b"GET /api/mail/pdfs/20 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                test_socket = TestSocket(request)
+                Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+                response = test_socket.writer.getvalue().decode("iso-8859-1")
+                _, body = response.split("\r\n\r\n", 1)
+
+                self.assertIn(f" {status} ", response.splitlines()[0])
+                self.assertEqual(json.loads(body)["error"], message)
+                self.assertNotIn("credential detail", body)
 
     def test_mail_invoices_api_returns_authenticated_queue_rows(self) -> None:
         class MailIntegration:
@@ -669,6 +711,47 @@ class ServerRouteTests(unittest.TestCase):
             mail.request,
             {"owner_user_id": "user-123", "pdf_file_id": 42, "box_mode": "all"},
         )
+
+    def test_mail_invoice_overlay_api_returns_controlled_storage_errors(self) -> None:
+        class MailIntegration:
+            def __init__(self, error: Exception) -> None:
+                self.error = error
+
+            def invoice_overlay_pdf(
+                self, *, owner_user_id: str, pdf_file_id: int, box_mode: str = "parsed"
+            ) -> bytes:
+                raise self.error
+
+        class Handler(ZampRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def _authenticated_api_user(self) -> tuple[str, list[str]]:
+                return "user-123", []
+
+        cases = (
+            (PdfStorageNotFoundError("missing"), 404, "Invoice PDF is missing from storage."),
+            (
+                PdfStorageUnavailableError("provider endpoint credential detail"),
+                503,
+                "PDF storage is temporarily unavailable.",
+            ),
+        )
+        for error, status, message in cases:
+            with self.subTest(status=status):
+                Handler.mail_integration = MailIntegration(error)  # type: ignore[assignment]
+                request = (
+                    b"GET /api/mail/invoices/42/overlay.pdf HTTP/1.1\r\n"
+                    b"Host: localhost\r\n\r\n"
+                )
+                test_socket = TestSocket(request)
+                Handler(test_socket, ("127.0.0.1", 12345), SimpleNamespace())
+                response = test_socket.writer.getvalue().decode("iso-8859-1")
+                _, body = response.split("\r\n\r\n", 1)
+
+                self.assertIn(f" {status} ", response.splitlines()[0])
+                self.assertEqual(json.loads(body)["error"], message)
+                self.assertNotIn("credential detail", body)
 
     def test_gmail_webhook_accepts_header_secret(self) -> None:
         class MailIntegration:

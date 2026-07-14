@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app.invoice_ai import GeminiAiExtractionClient
 from app.mail_worker import (
@@ -13,8 +13,8 @@ from app.mail_worker import (
     _handle_job,
     _parser_revision,
     _renew_subscriptions_safely,
-    _storage_pdf_path,
 )
+from app.mail_store import PdfStorage, PdfStorageUnavailableError
 
 
 class TestRepo:
@@ -59,7 +59,7 @@ class TestIntegration:
             mail_parse_ocr_max_document_pages=3,
         )
         self.repo = TestRepo()
-        self.storage = SimpleNamespace(root=root)
+        self.storage = PdfStorage(root)
 
 
 def _configure_gemini(integration: TestIntegration) -> None:
@@ -224,9 +224,16 @@ class MailWorkerParsePdfTests(unittest.TestCase):
                 "warnings": ["missing tax"],
             }
 
-            with patch("app.mail_worker.parse_invoice_pdf", return_value=parser_result) as parser:
+            with patch.object(
+                integration.storage,
+                "read_pdf",
+                wraps=integration.storage.read_pdf,
+            ) as storage_read, patch(
+                "app.mail_worker.parse_invoice_pdf", return_value=parser_result
+            ) as parser:
                 _handle_job(integration, job)  # type: ignore[arg-type]
 
+        storage_read.assert_called_once_with("invoice.pdf")
         parser.assert_called_once_with(
             b"%PDF-1.4\nfixture",
             source_id="mail_pdf_file:42",
@@ -465,11 +472,33 @@ class MailWorkerParsePdfTests(unittest.TestCase):
         self.assertEqual(integration.repo.retries[0]["job_id"], 105)
         self.assertIn("promotion bug", str(integration.repo.retries[0]["error"]))
 
-    def test_storage_pdf_path_rejects_paths_outside_storage_root(self) -> None:
-        with self.assertRaises(RuntimeError):
-            _storage_pdf_path("/tmp/mail-pdfs", "../invoice.pdf")
-        with self.assertRaises(RuntimeError):
-            _storage_pdf_path("/tmp/mail-pdfs", "/tmp/invoice.pdf")
+    def test_parse_pdf_job_retries_when_storage_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            integration = TestIntegration(Path(tmp))
+            integration.storage = SimpleNamespace(
+                read_pdf=MagicMock(
+                    side_effect=PdfStorageUnavailableError(
+                        "PDF storage is temporarily unavailable."
+                    )
+                )
+            )
+            job = {
+                "id": 104,
+                "type": "parse_pdf",
+                "attempts": 2,
+                "payload": {"pdf_file_id": 45, "storage_path": "invoice.pdf"},
+            }
+
+            _handle_job(integration, job)  # type: ignore[arg-type]
+
+        self.assertEqual(integration.repo.completed, [])
+        self.assertEqual(integration.repo.parse_results, [])
+        self.assertEqual(integration.repo.retries[0]["job_id"], 104)
+        self.assertEqual(integration.repo.retries[0]["attempts"], 2)
+        self.assertEqual(
+            integration.repo.retries[0]["error"],
+            "PDF storage is temporarily unavailable.",
+        )
 
 
 if __name__ == "__main__":

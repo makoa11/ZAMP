@@ -4,8 +4,9 @@ import hashlib
 import hmac
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Dict
+from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
 
@@ -116,7 +117,15 @@ class AppConfig:
     mail_db_pool_min_size: int
     mail_db_pool_max_size: int
     mail_token_encryption_key: str | None
+    mail_storage_backend: str
     mail_pdf_storage_dir: str
+    mail_s3_bucket: str | None
+    mail_s3_endpoint: str | None
+    mail_s3_access_key_id: str | None
+    mail_s3_secret_access_key: str | None
+    mail_s3_region: str
+    mail_s3_addressing_style: str
+    mail_s3_prefix: str
     mail_frontend_redirect_url: str
     google_oauth_client_id: str | None
     google_oauth_client_secret: str | None
@@ -233,6 +242,65 @@ def load_config(root: Path | None = None) -> AppConfig:
                 "print(Fernet.generate_key().decode())\""
             ) from exc
 
+    mail_storage_backend = (
+        _env("MAIL_STORAGE_BACKEND", env_file_values, "local") or "local"
+    ).strip().lower()
+    if mail_storage_backend not in {"local", "s3"}:
+        raise ConfigError("MAIL_STORAGE_BACKEND must be either 'local' or 's3'.")
+
+    mail_s3_bucket = _env("MAIL_S3_BUCKET", env_file_values)
+    mail_s3_endpoint = _env("MAIL_S3_ENDPOINT", env_file_values)
+    mail_s3_access_key_id = _env("MAIL_S3_ACCESS_KEY_ID", env_file_values)
+    mail_s3_secret_access_key = _env("MAIL_S3_SECRET_ACCESS_KEY", env_file_values)
+    mail_s3_region = (_env("MAIL_S3_REGION", env_file_values, "auto") or "auto").strip()
+    mail_s3_addressing_style = (
+        _env("MAIL_S3_ADDRESSING_STYLE", env_file_values, "virtual") or "virtual"
+    ).strip().lower()
+    mail_s3_prefix = (_env("MAIL_S3_PREFIX", env_file_values, "mail-pdfs/") or "").strip()
+
+    if mail_storage_backend == "s3":
+        missing_s3 = [
+            name
+            for name, value in {
+                "MAIL_S3_BUCKET": mail_s3_bucket,
+                "MAIL_S3_ENDPOINT": mail_s3_endpoint,
+                "MAIL_S3_ACCESS_KEY_ID": mail_s3_access_key_id,
+                "MAIL_S3_SECRET_ACCESS_KEY": mail_s3_secret_access_key,
+            }.items()
+            if not value or not str(value).strip()
+        ]
+        if missing_s3:
+            raise ConfigError(
+                "Missing required S3 storage environment variables: "
+                + ", ".join(missing_s3)
+                + "."
+            )
+        endpoint = urlsplit(str(mail_s3_endpoint))
+        if (
+            endpoint.scheme not in {"http", "https"}
+            or not endpoint.netloc
+            or endpoint.username is not None
+            or endpoint.password is not None
+            or endpoint.query
+            or endpoint.fragment
+        ):
+            raise ConfigError(
+                "MAIL_S3_ENDPOINT must be an http:// or https:// URL without "
+                "credentials, query parameters, or a fragment."
+            )
+        if mail_s3_addressing_style not in {"auto", "virtual", "path"}:
+            raise ConfigError(
+                "MAIL_S3_ADDRESSING_STYLE must be 'auto', 'virtual', or 'path'."
+            )
+        normalized_prefix = mail_s3_prefix.replace("\\", "/")
+        prefix_parts = normalized_prefix.split("/")
+        if (
+            normalized_prefix.startswith("/")
+            or PureWindowsPath(mail_s3_prefix).drive
+            or any(part == ".." for part in prefix_parts)
+        ):
+            raise ConfigError("MAIL_S3_PREFIX must be a relative object-key prefix without '..'.")
+
     return AppConfig(
         workos_api_key=str(api_key),
         workos_client_id=str(client_id),
@@ -271,8 +339,16 @@ def load_config(root: Path | None = None) -> AppConfig:
         mail_db_pool_min_size=mail_db_pool_min_size,
         mail_db_pool_max_size=mail_db_pool_max_size,
         mail_token_encryption_key=mail_token_encryption_key,
+        mail_storage_backend=mail_storage_backend,
         mail_pdf_storage_dir=_env("MAIL_PDF_STORAGE_DIR", env_file_values, "./storage/mail_pdfs")
         or "./storage/mail_pdfs",
+        mail_s3_bucket=mail_s3_bucket,
+        mail_s3_endpoint=mail_s3_endpoint,
+        mail_s3_access_key_id=mail_s3_access_key_id,
+        mail_s3_secret_access_key=mail_s3_secret_access_key,
+        mail_s3_region=mail_s3_region,
+        mail_s3_addressing_style=mail_s3_addressing_style,
+        mail_s3_prefix=mail_s3_prefix,
         mail_frontend_redirect_url=_env(
             "MAIL_FRONTEND_REDIRECT_URL",
             env_file_values,

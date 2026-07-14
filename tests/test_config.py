@@ -72,6 +72,119 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIn("MAIL_DB_POOL_MAX_SIZE", str(error.exception))
 
+    def test_pdf_storage_defaults_to_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(root, self._base_env())
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        self.assertEqual(config.mail_storage_backend, "local")
+        self.assertEqual(config.mail_pdf_storage_dir, "./storage/mail_pdfs")
+        self.assertEqual(config.mail_s3_region, "auto")
+        self.assertEqual(config.mail_s3_addressing_style, "virtual")
+        self.assertEqual(config.mail_s3_prefix, "mail-pdfs/")
+
+    def test_complete_s3_storage_configuration_is_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {
+                    **self._base_env(),
+                    "MAIL_STORAGE_BACKEND": "s3",
+                    "MAIL_S3_BUCKET": "zamp-private",
+                    "MAIL_S3_ENDPOINT": "https://storage.example.test",
+                    "MAIL_S3_ACCESS_KEY_ID": "access-id",
+                    "MAIL_S3_SECRET_ACCESS_KEY": "secret-key",
+                    "MAIL_S3_REGION": "us-east-1",
+                    "MAIL_S3_ADDRESSING_STYLE": "path",
+                    "MAIL_S3_PREFIX": "production/mail-pdfs/",
+                },
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(root)
+
+        self.assertEqual(config.mail_storage_backend, "s3")
+        self.assertEqual(config.mail_s3_bucket, "zamp-private")
+        self.assertEqual(config.mail_s3_endpoint, "https://storage.example.test")
+        self.assertEqual(config.mail_s3_access_key_id, "access-id")
+        self.assertEqual(config.mail_s3_secret_access_key, "secret-key")
+        self.assertEqual(config.mail_s3_region, "us-east-1")
+        self.assertEqual(config.mail_s3_addressing_style, "path")
+        self.assertEqual(config.mail_s3_prefix, "production/mail-pdfs/")
+
+    def test_s3_storage_requires_complete_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {
+                    **self._base_env(),
+                    "MAIL_STORAGE_BACKEND": "s3",
+                    "MAIL_S3_BUCKET": "zamp-private",
+                    "MAIL_S3_ENDPOINT": "https://storage.example.test",
+                },
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ConfigError) as error:
+                    load_config(root)
+
+        self.assertIn("MAIL_S3_ACCESS_KEY_ID", str(error.exception))
+        self.assertIn("MAIL_S3_SECRET_ACCESS_KEY", str(error.exception))
+
+    def test_unknown_pdf_storage_backend_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_env(
+                root,
+                {**self._base_env(), "MAIL_STORAGE_BACKEND": "filesystem"},
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(ConfigError) as error:
+                    load_config(root)
+
+        self.assertIn("MAIL_STORAGE_BACKEND", str(error.exception))
+
+    def test_s3_endpoint_and_addressing_style_are_validated(self) -> None:
+        base = {
+            **self._base_env(),
+            "MAIL_STORAGE_BACKEND": "s3",
+            "MAIL_S3_BUCKET": "zamp-private",
+            "MAIL_S3_ACCESS_KEY_ID": "access-id",
+            "MAIL_S3_SECRET_ACCESS_KEY": "secret-key",
+        }
+        for override, expected in (
+            ({"MAIL_S3_ENDPOINT": "storage.example.test"}, "MAIL_S3_ENDPOINT"),
+            (
+                {
+                    "MAIL_S3_ENDPOINT": "https://storage.example.test",
+                    "MAIL_S3_ADDRESSING_STYLE": "invalid",
+                },
+                "MAIL_S3_ADDRESSING_STYLE",
+            ),
+            (
+                {
+                    "MAIL_S3_ENDPOINT": "https://storage.example.test",
+                    "MAIL_S3_PREFIX": "../mail-pdfs/",
+                },
+                "MAIL_S3_PREFIX",
+            ),
+        ):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_env(root, {**base, **override})
+
+                with patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaises(ConfigError) as error:
+                        load_config(root)
+
+                self.assertIn(expected, str(error.exception))
+
     def test_mail_parse_ocr_region_limit_is_loaded_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

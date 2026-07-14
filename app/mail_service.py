@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import secrets
 import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -28,6 +28,9 @@ from .mail_providers import (
     token_expires_at,
 )
 from .mail_store import MailDatabase, MailIntegrationError, MailRepository, PdfStorage, TokenCipher
+
+
+logger = logging.getLogger(__name__)
 
 
 class MailIntegration:
@@ -96,6 +99,7 @@ class MailIntegration:
             repo.initialize_schema()
             cipher = TokenCipher.from_config(self.config)
             storage = PdfStorage.from_config(self.config)
+            logger.info("PDF storage backend selected: %s", storage.backend)
             gmail = GmailClient(self.config)
             outlook = OutlookClient(self.config)
             token_manager = TokenManager(repo=repo, cipher=cipher, gmail=gmail, outlook=outlook)
@@ -201,7 +205,7 @@ class MailIntegration:
             "filename": str(row.get("filename") or f"invoice-{pdf_file_id}.pdf"),
             "sha256": str(row.get("sha256") or ""),
             "byte_size": int(row.get("byte_size") or 0),
-            "path": _storage_pdf_path(self.storage.root, storage_path),
+            "content": self.storage.read_pdf(storage_path),
         }
 
     def get_invoice_match_patterns(self, *, owner_user_id: str) -> list[str]:
@@ -270,9 +274,8 @@ class MailIntegration:
         storage_path = source.get("storage_path")
         if not isinstance(storage_path, str):
             return None
-        pdf_path = _storage_pdf_path(self.storage.root, storage_path)
         return render_invoice_parse_overlay_pdf(
-            pdf_path.read_bytes(),
+            self.storage.read_pdf(storage_path),
             source.get("raw_parse_result") if isinstance(source.get("raw_parse_result"), dict) else {},
             box_mode=box_mode,
         )
@@ -745,13 +748,6 @@ def _raw_parse_summary(row: dict[str, Any]) -> dict[str, Any]:
         "field_keys": sorted(fields.keys()),
         "warnings": row.get("raw_parse_warnings") if isinstance(row.get("raw_parse_warnings"), list) else [],
     }
-
-
-def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
-    relative_path = Path(storage_path)
-    if not storage_path or relative_path.is_absolute() or ".." in relative_path.parts:
-        raise MailIntegrationError("PDF storage path must be relative to MAIL_PDF_STORAGE_DIR.")
-    return Path(root) / relative_path
 
 
 def _serialize_public_value(value: Any) -> Any:

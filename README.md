@@ -11,7 +11,7 @@ This is a small Python backend using the installed `workos` SDK. It supports:
 - Login, signup, dashboard, logout, and `/api/session` routes.
 - Gmail and Outlook OAuth connection for invoice PDF ingestion.
 - Event-driven mail webhooks with polling fallback jobs.
-- Local PDF file storage with PostgreSQL metadata and job dedupe.
+- Local or private S3-compatible PDF storage with PostgreSQL metadata and job dedupe.
 
 ## Setup
 
@@ -169,6 +169,7 @@ DATABASE_URL=postgresql://zamp:password@127.0.0.1:5432/zamp
 MAIL_DB_POOL_MIN_SIZE=1
 MAIL_DB_POOL_MAX_SIZE=10
 MAIL_TOKEN_ENCRYPTION_KEY=
+MAIL_STORAGE_BACKEND=local
 MAIL_PDF_STORAGE_DIR=./storage/mail_pdfs
 MAIL_FRONTEND_REDIRECT_URL=http://127.0.0.1:8000/dashboard
 
@@ -184,6 +185,44 @@ MICROSOFT_CLIENT_ID=
 MICROSOFT_CLIENT_SECRET=
 MICROSOFT_TENANT_ID=common
 ```
+
+`MAIL_STORAGE_BACKEND` defaults to `local`. Local development stores PDFs beneath
+`MAIL_PDF_STORAGE_DIR`. For a private S3-compatible bucket, configure:
+
+```env
+MAIL_STORAGE_BACKEND=s3
+MAIL_S3_BUCKET=your-private-bucket
+MAIL_S3_ENDPOINT=https://storage.example.com
+MAIL_S3_ACCESS_KEY_ID=
+MAIL_S3_SECRET_ACCESS_KEY=
+MAIL_S3_REGION=auto
+MAIL_S3_ADDRESSING_STYLE=virtual
+MAIL_S3_PREFIX=mail-pdfs/
+```
+
+The bucket stays private. Zamp stores only logical SHA-256 filenames in PostgreSQL and applies
+`MAIL_S3_PREFIX` internally. Authenticated raw-PDF and overlay requests continue to be proxied
+through the web service; no public or presigned URLs are used.
+
+For Railway, add one Bucket to the project and give both the `ZAMP` web service and the
+`mail-worker` service references to the same bucket variables. If the bucket service is named
+`Bucket`, the service variables are:
+
+```env
+MAIL_STORAGE_BACKEND=s3
+MAIL_S3_BUCKET=${{Bucket.BUCKET}}
+MAIL_S3_ENDPOINT=${{Bucket.ENDPOINT}}
+MAIL_S3_ACCESS_KEY_ID=${{Bucket.ACCESS_KEY_ID}}
+MAIL_S3_SECRET_ACCESS_KEY=${{Bucket.SECRET_ACCESS_KEY}}
+MAIL_S3_REGION=${{Bucket.REGION}}
+MAIL_S3_ADDRESSING_STYLE=virtual
+MAIL_S3_PREFIX=mail-pdfs/
+```
+
+Do not set `MAIL_PDF_STORAGE_DIR` on those S3-backed services. Railway Buckets are private and
+currently use virtual-hosted URLs by default; an older bucket may require the URL style shown in
+its Credentials tab. See Railway's [Storage Buckets](https://docs.railway.com/storage-buckets)
+and [reference variables](https://docs.railway.com/variables#reference-variables) documentation.
 
 Generate the mail token key with:
 
@@ -216,7 +255,18 @@ Run the ingestion worker:
 .venv/bin/python -m app.mail_worker
 ```
 
-The worker claims provider jobs, refreshes OAuth tokens when needed, renews Gmail watches and Outlook subscriptions hourly, and enqueues polling fallback jobs every 15 minutes by default. PDFs are saved when no dashboard regex patterns are configured; once patterns are added, a pattern must match the PDF filename, subject, or body/snippet. The dashboard can generate a regex from a sample filename or dropped local PDF name. PDFs are stored under `MAIL_PDF_STORAGE_DIR` as SHA-256-named files; Postgres stores account, message, attachment, file, webhook event, active/retry/failed job state, lightweight job dedupe keys, invoice matching metadata, parse results, normalized extractions, decisions, and simulated AP context records. Saved PDFs enqueue `parse_pdf` jobs that run the static text-layer invoice parser, targeted OCR for low-confidence parsed boxes, full-document OCR fallback when required normalized fields are missing, normalize the result, match DB-backed AP context, decide, and persist the review payload. Results route to `needs_review` when OCR still cannot complete required fields. `MAIL_PARSE_OCR_MAX_REGIONS` caps the number of targeted regions attempted per PDF.
+The worker claims provider jobs, refreshes OAuth tokens when needed, renews Gmail watches and Outlook subscriptions hourly, and enqueues polling fallback jobs every 15 minutes by default. PDFs are saved when no dashboard regex patterns are configured; once patterns are added, a pattern must match the PDF filename, subject, or body/snippet. The dashboard can generate a regex from a sample filename or dropped local PDF name. PDFs are stored as SHA-256-named files in the selected local or S3 backend; Postgres stores account, message, attachment, file, webhook event, active/retry/failed job state, lightweight job dedupe keys, invoice matching metadata, parse results, normalized extractions, decisions, and simulated AP context records. Saved PDFs enqueue `parse_pdf` jobs that run the static text-layer invoice parser, targeted OCR for low-confidence parsed boxes, full-document OCR fallback when required normalized fields are missing, normalize the result, match DB-backed AP context, decide, and persist the review payload. Results route to `needs_review` when OCR still cannot complete required fields. `MAIL_PARSE_OCR_MAX_REGIONS` caps the number of targeted regions attempted per PDF.
+
+### Railway S3 rollout
+
+1. Keep Gmail disconnected while deploying if PostgreSQL and the bucket are empty.
+2. Add the same bucket references to `ZAMP` and `mail-worker`, set
+   `MAIL_STORAGE_BACKEND=s3`, and omit `MAIL_PDF_STORAGE_DIR`.
+3. Deploy both services, then verify the web health check and idle worker.
+4. Reconnect Gmail so the initial fallback populates PostgreSQL and the bucket.
+5. Confirm an object exists, invoice JSON loads, the authenticated raw PDF opens, and the
+   overlay viewer renders.
+6. Keep the bucket private and retain one worker replica initially.
 
 To seed local simulated AP context from generated manifests:
 

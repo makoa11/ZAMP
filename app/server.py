@@ -33,7 +33,12 @@ from .invoice_showcase import (
     showcase_document,
 )
 from .mail_service import MailIntegration
-from .mail_store import MailIntegrationError
+from .mail_store import (
+    MailIntegrationError,
+    PdfStorageNotFoundError,
+    PdfStoragePathError,
+    PdfStorageUnavailableError,
+)
 from .mail_webhook_auth import WebhookAuthenticationError, verify_google_oidc_token
 from .security import generate_csrf_token, sign_value, unsign_value, valid_signed_pair
 from .templates import (
@@ -1712,6 +1717,24 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
                 owner_user_id=owner_user_id,
                 pdf_file_id=pdf_file_id,
             )
+        except PdfStorageNotFoundError:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "PDF file is missing from storage."},
+                cookies=cookies,
+            )
+            return
+        except PdfStorageUnavailableError:
+            self.log_message("PDF storage read failed: backend unavailable")
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "PDF storage is temporarily unavailable."},
+                cookies=cookies,
+            )
+            return
+        except PdfStoragePathError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+            return
         except (ConfigError, MailIntegrationError) as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
             return
@@ -1719,12 +1742,7 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "PDF file not found."}, cookies=cookies)
             return
 
-        pdf_path = pdf_file["path"]
-        try:
-            content = pdf_path.read_bytes()
-        except FileNotFoundError:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "PDF file is missing from storage."}, cookies=cookies)
-            return
+        content = pdf_file["content"]
 
         filename = str(pdf_file.get("filename") or f"invoice-{pdf_file_id}.pdf").replace('"', "")
         self._send_binary(
@@ -1785,6 +1803,24 @@ class ZampRequestHandler(BaseHTTPRequestHandler):
                     pdf_file_id=pdf_file_id,
                     box_mode=box_mode,
                 )
+            except PdfStorageNotFoundError:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "Invoice PDF is missing from storage."},
+                    cookies=cookies,
+                )
+                return
+            except PdfStorageUnavailableError:
+                self.log_message("PDF storage read failed: backend unavailable")
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"error": "PDF storage is temporarily unavailable."},
+                    cookies=cookies,
+                )
+                return
+            except PdfStoragePathError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
+                return
             except (ConfigError, MailIntegrationError, ValueError) as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)}, cookies=cookies)
                 return

@@ -1,4 +1,5 @@
 workos
+boto3
 google-auth
 requests
 psycopg[binary,pool]

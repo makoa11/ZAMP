@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from difflib import SequenceMatcher
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Iterable
 
 from cryptography.fernet import Fernet
@@ -29,6 +29,22 @@ REVIEW_QUEUE_DECISIONS = (
 
 class MailIntegrationError(RuntimeError):
     """Raised when mail ingestion cannot continue with current configuration."""
+
+
+class PdfStorageError(RuntimeError):
+    """Base class for sanitized PDF storage failures."""
+
+
+class PdfStorageNotFoundError(PdfStorageError):
+    """Raised when a logical PDF path does not exist in the selected backend."""
+
+
+class PdfStorageUnavailableError(PdfStorageError):
+    """Raised when the selected PDF storage backend cannot complete an operation."""
+
+
+class PdfStoragePathError(PdfStorageError):
+    """Raised when a logical PDF path is absolute or contains traversal segments."""
 
 
 def utc_now() -> datetime:
@@ -79,42 +95,208 @@ def _uses_durable_dedupe(job_type: str) -> bool:
 class PdfStorage:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
+        self.backend = "local"
 
     @classmethod
     def from_config(cls, config: AppConfig) -> "PdfStorage":
+        if getattr(config, "mail_storage_backend", "local") == "s3":
+            return S3PdfStorage(
+                bucket=str(config.mail_s3_bucket),
+                endpoint=str(config.mail_s3_endpoint),
+                access_key_id=str(config.mail_s3_access_key_id),
+                secret_access_key=str(config.mail_s3_secret_access_key),
+                region=config.mail_s3_region,
+                addressing_style=config.mail_s3_addressing_style,
+                prefix=config.mail_s3_prefix,
+            )
         return cls(config.mail_pdf_storage_dir)
 
     def save_pdf(self, content: bytes) -> StoredPdf:
         digest = hashlib.sha256(content).hexdigest()
         relative_path = f"{digest}.pdf"
-        destination = self.root / relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-
-        if destination.exists():
-            return StoredPdf(digest, len(content), relative_path)
-
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{digest}.",
-            suffix=".tmp",
-            dir=str(destination.parent),
-        )
         try:
-            with os.fdopen(fd, "wb") as tmp_file:
-                tmp_file.write(content)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
+            destination = self._local_path(relative_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+
+            if destination.exists():
+                return StoredPdf(digest, len(content), relative_path)
+
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{digest}.",
+                suffix=".tmp",
+                dir=str(destination.parent),
+            )
             try:
-                os.link(tmp_name, destination)
-                os.unlink(tmp_name)
-            except FileExistsError:
-                os.unlink(tmp_name)
-            except OSError:
-                os.replace(tmp_name, destination)
-        finally:
-            if os.path.exists(tmp_name):
-                os.unlink(tmp_name)
+                with os.fdopen(fd, "wb") as tmp_file:
+                    tmp_file.write(content)
+                    tmp_file.flush()
+                    os.fsync(tmp_file.fileno())
+                try:
+                    os.link(tmp_name, destination)
+                    os.unlink(tmp_name)
+                except FileExistsError:
+                    os.unlink(tmp_name)
+                except OSError:
+                    os.replace(tmp_name, destination)
+            finally:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+        except OSError as exc:
+            raise PdfStorageUnavailableError("PDF storage is temporarily unavailable.") from exc
 
         return StoredPdf(digest, len(content), relative_path)
+
+    def read_pdf(self, storage_path: str) -> bytes:
+        path = self._local_path(storage_path)
+        try:
+            return path.read_bytes()
+        except FileNotFoundError as exc:
+            raise PdfStorageNotFoundError("PDF object was not found.") from exc
+        except OSError as exc:
+            raise PdfStorageUnavailableError("PDF storage is temporarily unavailable.") from exc
+
+    def _local_path(self, storage_path: str) -> Path:
+        normalized = _normalize_storage_path(storage_path)
+        return self.root.joinpath(*PurePosixPath(normalized).parts)
+
+
+class S3PdfStorage(PdfStorage):
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        endpoint: str,
+        access_key_id: str,
+        secret_access_key: str,
+        region: str = "auto",
+        addressing_style: str = "virtual",
+        prefix: str = "mail-pdfs/",
+        client: Any | None = None,
+    ) -> None:
+        self.backend = "s3"
+        self.bucket = bucket
+        self.prefix = _normalize_s3_prefix(prefix)
+        self._client = client or _new_s3_client(
+            endpoint=endpoint,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            region=region,
+            addressing_style=addressing_style,
+        )
+
+    def save_pdf(self, content: bytes) -> StoredPdf:
+        digest = hashlib.sha256(content).hexdigest()
+        relative_path = f"{digest}.pdf"
+        try:
+            # S3 objects are private by default; omitting ACL also supports providers
+            # that expose private buckets but do not implement object ACLs.
+            self._client.put_object(
+                Bucket=self.bucket,
+                Key=self._object_key(relative_path),
+                Body=content,
+                ContentType="application/pdf",
+            )
+        except Exception as exc:
+            raise PdfStorageUnavailableError("PDF storage is temporarily unavailable.") from exc
+        return StoredPdf(digest, len(content), relative_path)
+
+    def read_pdf(self, storage_path: str) -> bytes:
+        key = self._object_key(storage_path)
+        try:
+            response = self._client.get_object(Bucket=self.bucket, Key=key)
+            body = response["Body"]
+            try:
+                content = body.read()
+            finally:
+                close = getattr(body, "close", None)
+                if callable(close):
+                    close()
+            if not isinstance(content, bytes):
+                content = bytes(content)
+            return content
+        except Exception as exc:
+            if _is_missing_s3_object_error(exc):
+                raise PdfStorageNotFoundError("PDF object was not found.") from exc
+            raise PdfStorageUnavailableError("PDF storage is temporarily unavailable.") from exc
+
+    def _object_key(self, storage_path: str) -> str:
+        logical_path = _normalize_storage_path(storage_path)
+        return f"{self.prefix}{logical_path}"
+
+
+def _normalize_storage_path(storage_path: str) -> str:
+    if (
+        not isinstance(storage_path, str)
+        or not storage_path.strip()
+        or "\x00" in storage_path
+    ):
+        raise PdfStoragePathError("PDF storage path must be a non-empty relative path.")
+    normalized = storage_path.replace("\\", "/")
+    posix_path = PurePosixPath(normalized)
+    windows_path = PureWindowsPath(storage_path)
+    if (
+        normalized.startswith("/")
+        or posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or posix_path.as_posix() == "."
+        or ".." in posix_path.parts
+    ):
+        raise PdfStoragePathError(
+            "PDF storage path must be relative and may not contain '..'."
+        )
+    return posix_path.as_posix()
+
+
+def _normalize_s3_prefix(prefix: str) -> str:
+    if not prefix:
+        return ""
+    normalized = prefix.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (
+        "\x00" in prefix
+        or normalized.startswith("/")
+        or path.is_absolute()
+        or PureWindowsPath(prefix).drive
+        or ".." in path.parts
+    ):
+        raise PdfStoragePathError("S3 prefix must be relative and may not contain '..'.")
+    value = path.as_posix().strip("/")
+    return f"{value}/" if value and value != "." else ""
+
+
+def _new_s3_client(
+    *,
+    endpoint: str,
+    access_key_id: str,
+    secret_access_key: str,
+    region: str,
+    addressing_style: str,
+) -> Any:
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+    except ImportError as exc:  # pragma: no cover - dependency validation covers this
+        raise PdfStorageUnavailableError("S3 storage support is not installed.") from exc
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name=region,
+        config=BotoConfig(s3={"addressing_style": addressing_style}),
+    )
+
+
+def _is_missing_s3_object_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error")
+    if not isinstance(error, dict):
+        return False
+    return str(error.get("Code") or "") in {"NoSuchKey", "NoSuchObject", "NotFound", "404"}
 
 
 SCHEMA_SQL = """

@@ -6,7 +6,7 @@ import logging
 import socket
 import time
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 from .ap_context import load_db_procurement_context, summarize_procurement_context
@@ -177,7 +177,6 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
     pdf_file_id = int(payload["pdf_file_id"])
     storage_path = str(payload["storage_path"])
     attachment_id = _optional_int(payload.get("attachment_id"))
-    pdf_path = _storage_pdf_path(integration.storage.root, storage_path)
     parse_kwargs: dict[str, Any] = {
         "source_id": f"mail_pdf_file:{pdf_file_id}",
         "ocr_max_regions": integration.config.mail_parse_ocr_max_regions,
@@ -195,14 +194,14 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
     }.items():
         if hasattr(integration.config, config_name):
             parse_kwargs[parser_name] = getattr(integration.config, config_name)
-    pdf_content = pdf_path.read_bytes()
+    pdf_content = integration.storage.read_pdf(storage_path)
     result = parse_invoice_pdf(pdf_content, **parse_kwargs)
     owner_user_id = _owner_user_id_for_parse_job(integration, payload)
     result = _run_ai_fallback_if_enabled(
         integration,
         result=result,
         content=pdf_content,
-        filename=pdf_path.name,
+        filename=PurePosixPath(storage_path.replace("\\", "/")).name,
         owner_user_id=owner_user_id,
     )
     parser_revision = _parser_revision(integration)
@@ -258,13 +257,6 @@ def _handle_parse_pdf_job(integration: MailIntegration, payload: dict[str, Any])
         pdf_file_id=pdf_file_id,
         decision_result=decision,
     )
-
-
-def _storage_pdf_path(root: str | Path, storage_path: str) -> Path:
-    relative_path = Path(storage_path)
-    if relative_path.is_absolute() or ".." in relative_path.parts:
-        raise RuntimeError("PDF storage path must be relative to MAIL_PDF_STORAGE_DIR.")
-    return Path(root) / relative_path
 
 
 def _parser_revision(integration: MailIntegration) -> str:

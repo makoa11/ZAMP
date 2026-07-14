@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -8,7 +9,13 @@ from cryptography.fernet import Fernet
 
 from app.mail_providers import pkce_code_challenge
 from app.mail_service import MailIntegration, _require_granted_scopes
-from app.mail_store import MailIntegrationError, TokenCipher
+from app.mail_store import (
+    MailIntegrationError,
+    PdfStorage,
+    PdfStoragePathError,
+    S3PdfStorage,
+    TokenCipher,
+)
 
 
 class TestRepo:
@@ -18,6 +25,7 @@ class TestRepo:
         self.jobs: list[dict[str, object]] = []
         self.review_items: list[dict[str, object]] = []
         self.pdf_row: dict[str, object] | None = None
+        self.overlay_source: dict[str, object] | None = None
 
     def create_oauth_state(
         self,
@@ -70,6 +78,11 @@ class TestRepo:
     ) -> dict[str, object] | None:
         return self.pdf_row
 
+    def get_mail_invoice_overlay_source(
+        self, *, owner_user_id: str, pdf_file_id: int
+    ) -> dict[str, object] | None:
+        return self.overlay_source
+
     def enqueue_job(self, **kwargs: object) -> bool:
         if any(job["unique_key"] == kwargs["unique_key"] for job in self.jobs):
             return False
@@ -114,7 +127,8 @@ class CapturingMailIntegration(MailIntegration):
         self._cipher = TokenCipher(Fernet.generate_key().decode("ascii"))  # type: ignore[assignment]
         self._gmail = TestGmail()  # type: ignore[assignment]
         self._outlook = TestOutlook()  # type: ignore[assignment]
-        self._storage = SimpleNamespace(root="/tmp")  # type: ignore[assignment]
+        self._storage = MagicMock()  # type: ignore[assignment]
+        self._storage.read_pdf.return_value = b"%PDF-1.4\nfrom storage"
         self.completed_gmail: dict[str, str | None] = {}
 
     def _complete_gmail_oauth(
@@ -459,7 +473,7 @@ class InvoiceReviewQueueTests(unittest.TestCase):
         self.assertEqual(items[0]["pdf_url"], "/api/mail/invoices/20/overlay.pdf?boxes=all")
         self.assertEqual(items[0]["warnings"], ["missing tax"])
 
-    def test_get_invoice_pdf_file_resolves_relative_storage_path(self) -> None:
+    def test_get_invoice_pdf_file_reads_relative_path_through_storage(self) -> None:
         integration = CapturingMailIntegration()
         integration.repo.pdf_row = {
             "pdf_file_id": 20,
@@ -475,7 +489,8 @@ class InvoiceReviewQueueTests(unittest.TestCase):
         )
 
         self.assertEqual(pdf_file["filename"], "invoice.pdf")
-        self.assertEqual(str(pdf_file["path"]), "/tmp/abc.pdf")
+        self.assertEqual(pdf_file["content"], b"%PDF-1.4\nfrom storage")
+        integration.storage.read_pdf.assert_called_once_with("abc.pdf")
 
     def test_get_invoice_pdf_file_rejects_absolute_storage_path(self) -> None:
         integration = CapturingMailIntegration()
@@ -484,9 +499,47 @@ class InvoiceReviewQueueTests(unittest.TestCase):
             "filename": "invoice.pdf",
             "storage_path": "/tmp/abc.pdf",
         }
+        integration._storage = PdfStorage("/tmp")
 
-        with self.assertRaises(MailIntegrationError):
+        with self.assertRaises(PdfStoragePathError):
             integration.get_invoice_pdf_file(owner_user_id="user-123", pdf_file_id=20)
+
+    def test_invoice_overlay_reads_source_pdf_from_s3_storage(self) -> None:
+        integration = CapturingMailIntegration()
+        integration.repo.overlay_source = {
+            "storage_path": "abc.pdf",
+            "raw_parse_result": {"status": "parsed", "fields": {}},
+        }
+        client = MagicMock()
+        client.get_object.return_value = {"Body": io.BytesIO(b"%PDF-1.4\nfrom s3")}
+        integration._storage = S3PdfStorage(
+            bucket="private-invoices",
+            endpoint="https://storage.example.test",
+            access_key_id="access-id",
+            secret_access_key="secret-key",
+            client=client,
+        )
+
+        with patch(
+            "app.mail_service.render_invoice_parse_overlay_pdf",
+            return_value=b"%PDF-1.4\noverlay",
+        ) as render:
+            content = integration.invoice_overlay_pdf(
+                owner_user_id="user-123",
+                pdf_file_id=20,
+                box_mode="all",
+            )
+
+        self.assertEqual(content, b"%PDF-1.4\noverlay")
+        client.get_object.assert_called_once_with(
+            Bucket="private-invoices",
+            Key="mail-pdfs/abc.pdf",
+        )
+        render.assert_called_once_with(
+            b"%PDF-1.4\nfrom s3",
+            {"status": "parsed", "fields": {}},
+            box_mode="all",
+        )
 
 
 class ScopeValidationTests(unittest.TestCase):
